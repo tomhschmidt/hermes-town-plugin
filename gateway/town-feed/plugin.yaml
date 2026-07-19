@@ -1,0 +1,7 @@
+name: town-feed
+version: 1.0.1
+description: "Curated Need-to-Know feed backed by Hermes sessions, cron outcomes, memory changes, and Kanban."
+author: Tom Schmidt
+kind: standalone
+provides_tools:
+  - town_feed_curate

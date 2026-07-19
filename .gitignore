@@ -1,0 +1,6 @@
+.claude/
+CLAUDE.local.md
+node_modules/
+dist/
+__pycache__/
+*.pyc

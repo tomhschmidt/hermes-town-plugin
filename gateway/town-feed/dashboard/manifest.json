@@ -1,0 +1,13 @@
+{
+  "name": "town-feed",
+  "label": "Town Feed",
+  "description": "Need-to-Know feed and Kanban bridge for Hermes Town",
+  "icon": "Newspaper",
+  "version": "1.0.0",
+  "tab": {
+    "path": "/town-feed",
+    "hidden": true
+  },
+  "entry": "dist/index.js",
+  "api": "plugin_api.py"
+}
