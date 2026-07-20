@@ -466,6 +466,13 @@ def _scan_sessions(now: float) -> tuple[list[dict[str, Any]], list[str]]:
                 if created and now - created > RECENT_SECONDS:
                     continue
                 session_id = str(meta.get("id") or "")
+                # Cron/subagent/tool run sessions are machinery, not user
+                # activity — Recents' cron lane and run history own that
+                # surface (same exclusion set as the host sidebar). The id
+                # prefix covers listers that omit a source field.
+                meta_source = str(meta.get("source") or "").strip().casefold()
+                if meta_source in {"cron", "subagent", "tool"} or session_id.startswith("cron_"):
+                    continue
                 title = str(meta.get("title") or meta.get("preview") or "Recent Hermes session")
                 first_prompt = str(meta.get("preview") or "")
                 if _references_curator(title) or _references_curator(first_prompt):
@@ -991,7 +998,7 @@ def _open_loop_key(account: Any, thread_id: Any) -> str:
 
 def _heuristic_score(candidate: dict[str, Any], now: float) -> float:
     age_hours = max(0.0, (now - float(candidate["created_at_ts"])) / 3600.0)
-    recency = 42.0 * math.exp(-age_hours / 96.0)
+    recency = 42.0 * math.exp(-age_hours / 48.0)
     text = f"{candidate['headline']} {candidate['summary']}"
     score = 20.0 + recency
     if _ERROR_RE.search(text):
