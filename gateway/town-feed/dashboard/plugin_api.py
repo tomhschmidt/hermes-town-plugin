@@ -535,6 +535,18 @@ def _scan_sessions(now: float) -> tuple[list[dict[str, Any]], list[str]]:
     return candidates, errors
 
 
+def _latest_cron_output_time(output_root: Path, job_id: str) -> Optional[float]:
+    job_dir = output_root / job_id
+    try:
+        latest = max(
+            (path.stat().st_mtime for path in job_dir.glob("*.md") if path.is_file()),
+            default=None,
+        )
+    except OSError:
+        return None
+    return float(latest) if latest else None
+
+
 def _latest_cron_output(output_root: Path, job_id: str) -> str:
     job_dir = output_root / job_id
     try:
@@ -797,6 +809,32 @@ def _scan_cron(
                 )
                 if health_item:
                     candidates.append(health_item)
+
+            # Silent-streak guard (2026-07-20 incident): an orphaned gateway
+            # process ran town-calendar-scan "completed" for 16h with no
+            # payload. Runs completing while the newest output doc goes stale
+            # is invisible to the failure path above — surface it.
+            if folded_name.startswith("town-") and not is_town_failure:
+                doc_ts = _latest_cron_output_time(output_root, job_id)
+                if (
+                    last_run
+                    and now - last_run < 45 * 60
+                    and (doc_ts is None or last_run - doc_ts > 2 * 3600)
+                ):
+                    newest = _relative_age(doc_ts, now) if doc_ts else "never"
+                    health_item = _candidate(
+                        source=f"cron:{job_id}",
+                        headline=f"{name} running but producing no data",
+                        summary=(
+                            f"Runs are completing but no output has been written "
+                            f"(newest data: {newest}). A stale or orphaned gateway "
+                            f"process may be executing this job — restart the "
+                            f"gateway LaunchAgent and the desktop app."
+                        ),
+                        created_at=now,
+                    )
+                    if health_item:
+                        candidates.append(health_item)
 
             output = _latest_cron_output(output_root, job_id)
             scan_candidates = _town_scan_candidates(output)
