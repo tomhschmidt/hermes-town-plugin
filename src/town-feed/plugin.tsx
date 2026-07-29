@@ -34,12 +34,14 @@ interface FeedItem {
   source: string
   score: number
   createdAt: number | null
+  actionHint: string | null
 }
 
 interface NextEvent {
   account: string
   startAt: number
   summary: string
+  location: string | null
 }
 
 interface ScheduleEvent {
@@ -48,6 +50,29 @@ interface ScheduleEvent {
   endAt: number
   startAt: number
   summary: string
+  location: string | null
+  conference: string | null
+  attendees: string[]
+  attendeeCount: number | null
+  multiDay: boolean
+}
+
+interface DayBriefCallout {
+  kind: string
+  text: string
+}
+
+interface DayBriefTrip {
+  label: string
+  dayN: number | null
+  totalDays: number | null
+}
+
+interface DayBrief {
+  daySummary: string
+  callouts: DayBriefCallout[]
+  trip: DayBriefTrip | null
+  generatedAt: number | null
 }
 
 type SuggestionKind = 'followup' | 'digest' | 'maintenance'
@@ -62,6 +87,7 @@ interface Suggestion {
 interface FeedState {
   curatedAt: number | null
   curating: boolean
+  dayBrief: DayBrief | null
   error: string | null
   items: FeedItem[]
   loading: boolean
@@ -178,6 +204,7 @@ interface TownFeedBridge {
 const $feed = atom({
   curatedAt: null,
   curating: false,
+  dayBrief: null,
   error: null,
   items: [],
   loading: true,
@@ -312,15 +339,71 @@ function normalizeSchedule(value: unknown): ScheduleEvent[] {
     }
 
     if (schedule.length < 20) {
-      schedule.push({ account, allDay, endAt, startAt, summary })
+      const attendeeRows = Array.isArray(event.attendees) ? event.attendees : []
+      const attendees = attendeeRows.flatMap(attendeeRow => {
+        const attendee = asRecord(attendeeRow)
+        if (!attendee || attendee.self === true) {
+          return []
+        }
+        const display = stringValue(attendee.name).trim() || stringValue(attendee.email).trim()
+        return display ? [display] : []
+      }).slice(0, 8)
+      const rawCount = event.attendee_count
+      schedule.push({
+        account,
+        allDay,
+        endAt,
+        startAt,
+        summary,
+        location: stringValue(event.location).trim() || null,
+        conference: stringValue(event.conference).trim() || null,
+        attendees,
+        attendeeCount: typeof rawCount === 'number' && Number.isFinite(rawCount) ? rawCount : null,
+        multiDay: event.multi_day === true
+      })
     }
   }
 
   return schedule
 }
 
+function normalizeDayBrief(value: unknown): DayBrief | null {
+  const brief = asRecord(value)
+  const daySummary = stringValue(brief?.day_summary ?? brief?.daySummary).trim()
+  if (!brief || !daySummary) {
+    return null
+  }
+
+  const calloutRows = Array.isArray(brief.callouts) ? brief.callouts : []
+  const callouts = calloutRows.slice(0, 4).flatMap(row => {
+    const callout = asRecord(row)
+    const kind = stringValue(callout?.kind).trim()
+    const text = stringValue(callout?.text).trim()
+    return callout && kind && text ? [{ kind, text }] : []
+  })
+  const tripRecord = asRecord(brief.trip)
+  const tripLabel = stringValue(tripRecord?.label).trim()
+  const tripDayN = tripRecord?.day_n ?? tripRecord?.dayN
+  const tripTotal = tripRecord?.total_days ?? tripRecord?.totalDays
+  const trip = tripRecord && tripLabel
+    ? {
+        label: tripLabel,
+        dayN: typeof tripDayN === 'number' && Number.isFinite(tripDayN) ? tripDayN : null,
+        totalDays: typeof tripTotal === 'number' && Number.isFinite(tripTotal) ? tripTotal : null
+      }
+    : null
+
+  return {
+    daySummary,
+    callouts,
+    trip,
+    generatedAt: timestampValue(brief.generated_at ?? brief.generatedAt)
+  }
+}
+
 function normalizeFeed(value: unknown): {
   curatedAt: number | null
+  dayBrief: DayBrief | null
   items: FeedItem[]
   nextEvent: NextEvent | null
   schedule: ScheduleEvent[]
@@ -352,7 +435,8 @@ function normalizeFeed(value: unknown): {
         summary: stringValue(record.summary),
         source: stringValue(record.source) || 'Hermes',
         score: typeof record.score === 'number' && Number.isFinite(record.score) ? record.score : 0,
-        createdAt: timestampValue(record.created_at)
+        createdAt: timestampValue(record.created_at),
+        actionHint: stringValue(record.action_hint).trim() || null
       }
     ]
   })
@@ -376,11 +460,17 @@ function normalizeFeed(value: unknown): {
   const nextEventStart = timestampValue(nextEventRecord?.start_iso)
   const nextEventAccount = stringValue(nextEventRecord?.account)
   const nextEvent = nextEventRecord && nextEventSummary && nextEventStart !== null && nextEventAccount
-    ? { account: nextEventAccount, startAt: nextEventStart, summary: nextEventSummary }
+    ? {
+        account: nextEventAccount,
+        startAt: nextEventStart,
+        summary: nextEventSummary,
+        location: stringValue(nextEventRecord.location).trim() || null
+      }
     : null
 
   return {
     curatedAt: timestampValue(response?.curated_at),
+    dayBrief: normalizeDayBrief(response?.day_brief),
     items,
     nextEvent,
     schedule: normalizeSchedule(response?.schedule),
@@ -512,6 +602,7 @@ async function refreshFeed(): Promise<void> {
       $feed.set({
         ...$feed.get(),
         curatedAt: normalized.curatedAt,
+        dayBrief: normalized.dayBrief,
         error: null,
         items: visibleItems(),
         loading: false,
@@ -1076,8 +1167,17 @@ function NeedToKnowPane() {
               return (
                 <article className="group -mx-2 rounded-lg px-2 py-2.5 transition-colors duration-150 hover:bg-(--ui-row-hover-background)" key={item.id}>
                   <h3 className="text-sm font-medium leading-5 text-(--ui-text-primary)">{item.headline}</h3>
-                  <p className="mt-1 truncate text-xs text-(--ui-text-secondary)" title={summary}>{summary}</p>
+                  <p
+                    className="mt-1 text-xs leading-4 text-(--ui-text-secondary)"
+                    style={{ display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}
+                    title={summary}
+                  >
+                    {summary}
+                  </p>
                   <div className="mt-1 flex flex-wrap items-center gap-1.5">
+                    {item.actionHint ? (
+                      <span className="text-xs font-medium text-(--ui-accent)">{item.actionHint}</span>
+                    ) : null}
                     <FeedSourcePill item={item} />
                     <span className="text-xs text-(--ui-text-tertiary)">{created}</span>
                   </div>

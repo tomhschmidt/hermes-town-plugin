@@ -32,6 +32,11 @@ CHAT_ID = 372430020
 LOOKBACK = timedelta(hours=48)
 MAX_CANDIDATES = 15
 STATE_VERSION = 1
+# The operator's display name as Telegram renders it; used to attribute
+# "you spoke last" (mirrors the hardcoded owner in telegram-action-items-v2).
+OWNER_NAME = os.environ.get("TOWN_OWNER_NAME", "Tom Schmidt").strip()
+MAX_BODY_MESSAGES = 12
+MAX_BODY_CHARS = 1200
 
 # Keep this collection policy in sync with the live source of truth:
 # ~/.hermes/scripts/telegram-action-items-v2.py. It is mirrored here rather
@@ -235,6 +240,33 @@ def _iso_timestamp(timestamp: int) -> str:
     )
 
 
+def _thread_body(chat_name: str, messages: list[dict[str, Any]]) -> tuple[str, list[str]]:
+    """Bounded conversation context for the curator's judgment layer.
+
+    " | " separates messages because the curator's whitespace compaction
+    collapses newlines; the separator must survive it.
+    """
+    lines: list[str] = []
+    senders: list[str] = []
+    for message in messages[-MAX_BODY_MESSAGES:]:
+        gist = _gist(message.get("text"), 180)
+        if not gist:
+            continue
+        sender = _gist(message.get("sender_name") or "Unknown", 40)
+        if sender not in senders:
+            senders.append(sender)
+        lines.append(f"{sender}: {gist}")
+    while lines and len(" | ".join(lines)) > MAX_BODY_CHARS:
+        lines.pop(0)
+    if not lines:
+        return "", senders
+    header = (
+        f"[chat: {chat_name}; participants: {', '.join(senders[:6])}; "
+        f"the user is: {OWNER_NAME}]"
+    )
+    return f"{header} {' | '.join(lines)}", senders
+
+
 def _candidate(
     chat_id: int, chat_name: str, messages: list[dict[str, Any]]
 ) -> dict[str, Any] | None:
@@ -253,13 +285,29 @@ def _candidate(
         sender = _gist(message.get("sender_name") or "Unknown")
         recent_gists.append(f"{sender}: {gist}")
 
-    return {
-        "headline": f"{chat_name}: {last_gist}",
+    last_sender = _gist(newest.get("sender_name") or "Unknown", 40)
+    user_spoke_last = bool(OWNER_NAME) and last_sender.casefold() == OWNER_NAME.casefold()
+    # Attribute the actual speaker: "Hunter Horsley: I'm free tomorrow" when
+    # Tom wrote it misattributes the quote to the chat's namesake.
+    if last_sender and last_sender.casefold() != chat_name.casefold():
+        headline = f"{chat_name} — {last_sender}: {last_gist}"
+    else:
+        headline = f"{chat_name}: {last_gist}"
+    body, _senders = _thread_body(chat_name, messages)
+
+    candidate: dict[str, Any] = {
+        "headline": headline,
         "summary": "\n".join(recent_gists),
         "source": f"telegram:{chat_id}",
         "created_at": _iso_timestamp(last_timestamp),
         "content_hash": _content_hash(chat_id, last_message_id),
+        "chat_name": chat_name,
+        "last_sender": last_sender,
+        "user_spoke_last": user_spoke_last,
     }
+    if body:
+        candidate["body"] = body
+    return candidate
 
 
 def _scan() -> tuple[list[dict[str, Any]], dict[str, str]]:

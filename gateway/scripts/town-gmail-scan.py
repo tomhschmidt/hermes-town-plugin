@@ -66,6 +66,7 @@ def _bounded_text(value: Any, limit: int) -> str:
 def _empty_payload() -> dict[str, Any]:
     return {
         "candidates": [],
+        "known_contacts": [],
         "awaiting_reply": [],
         "open_loops": [],
         "labeling": {"applied": 0, "skipped": [], "errors": []},
@@ -490,8 +491,29 @@ def _run(
                 enriched["town_label"] = town_label
                 enriched["town_label_confidence"] = town_label_confidence
                 enriched_candidates.append(enriched)
+            known_contacts: list[str] = []
+            raw_known = state.get("known_correspondents")
+            if isinstance(raw_known, dict):
+                seen_known: set[str] = set()
+                for raw_account_cache in raw_known.values():
+                    if not isinstance(raw_account_cache, dict):
+                        continue
+                    for raw_address, raw_entry in raw_account_cache.items():
+                        address = str(raw_address or "").strip().casefold()
+                        if (
+                            address
+                            and address not in seen_known
+                            and isinstance(raw_entry, dict)
+                            and raw_entry.get("known") is True
+                        ):
+                            seen_known.add(address)
+                            known_contacts.append(address)
+
             payload = {
                 "candidates": enriched_candidates,
+                # Addresses the user has previously written to — the grounded
+                # basis for any "no prior contact" claim downstream.
+                "known_contacts": sorted(known_contacts)[:1000],
                 "awaiting_reply": [
                     dict(item)
                     for item in labeling_result.get("awaiting_reply", [])
