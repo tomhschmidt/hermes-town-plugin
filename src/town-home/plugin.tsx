@@ -353,6 +353,7 @@ interface TownFeedItem {
   summary: string
   source: string
   createdAt: number | null
+  actionHint: string | null
 }
 
 interface RecentlyDismissedEntry {
@@ -382,6 +383,27 @@ interface TownScheduleEvent {
   endAt: number
   startAt: number
   summary: string
+  location: string | null
+  conference: string | null
+  attendees: string[]
+  multiDay: boolean
+}
+
+interface TownDayBriefCallout {
+  kind: string
+  text: string
+}
+
+interface TownDayBriefTrip {
+  label: string
+  dayN: number | null
+  totalDays: number | null
+}
+
+interface TownDayBrief {
+  daySummary: string
+  callouts: TownDayBriefCallout[]
+  trip: TownDayBriefTrip | null
 }
 
 type TownSuggestionKind = 'followup' | 'digest' | 'maintenance'
@@ -396,6 +418,7 @@ interface TownSuggestion {
 interface TownFeedState {
   curatedAt: number | null
   curating: boolean
+  dayBrief: TownDayBrief | null
   error: string | null
   items: TownFeedItem[]
   loading: boolean
@@ -681,11 +704,62 @@ function normalizeTownSchedule(value: unknown): TownScheduleEvent[] {
     }
 
     if (schedule.length < 20) {
-      schedule.push({ account, allDay, endAt, startAt, summary })
+      const attendeeRows = Array.isArray(event.attendees) ? event.attendees : []
+      const attendees = attendeeRows.flatMap(row => {
+        if (typeof row === 'string') {
+          return row.trim() ? [row.trim()] : []
+        }
+        const attendee = asRecord(row)
+        if (!attendee || attendee.self === true) {
+          return []
+        }
+        const display = stringValue(attendee.name).trim() || stringValue(attendee.email).trim()
+        return display ? [display] : []
+      }).slice(0, 8)
+      schedule.push({
+        account,
+        allDay,
+        endAt,
+        startAt,
+        summary,
+        location: stringValue(event.location).trim() || null,
+        conference: stringValue(event.conference).trim() || null,
+        attendees,
+        multiDay: event.multiDay === true || event.multi_day === true
+      })
     }
   }
 
   return schedule
+}
+
+function normalizeTownDayBrief(value: unknown): TownDayBrief | null {
+  const brief = asRecord(value)
+  const daySummary = stringValue(brief?.daySummary ?? brief?.day_summary).trim()
+  if (!brief || !daySummary) {
+    return null
+  }
+
+  const calloutRows = Array.isArray(brief.callouts) ? brief.callouts : []
+  const callouts = calloutRows.slice(0, 4).flatMap(row => {
+    const callout = asRecord(row)
+    const kind = stringValue(callout?.kind).trim()
+    const text = stringValue(callout?.text).trim()
+    return callout && kind && text ? [{ kind, text }] : []
+  })
+  const tripRecord = asRecord(brief.trip)
+  const tripLabel = stringValue(tripRecord?.label).trim()
+  const tripDayN = tripRecord?.dayN ?? tripRecord?.day_n
+  const tripTotal = tripRecord?.totalDays ?? tripRecord?.total_days
+  const trip = tripRecord && tripLabel
+    ? {
+        label: tripLabel,
+        dayN: typeof tripDayN === 'number' && Number.isFinite(tripDayN) ? tripDayN : null,
+        totalDays: typeof tripTotal === 'number' && Number.isFinite(tripTotal) ? tripTotal : null
+      }
+    : null
+
+  return { daySummary, callouts, trip }
 }
 
 function normalizeTownFeedState(value: unknown): TownFeedState {
@@ -704,7 +778,8 @@ function normalizeTownFeedState(value: unknown): TownFeedState {
       headline,
       summary: stringValue(item.summary),
       source: stringValue(item.source) || 'Hermes',
-      createdAt: timestampValue(item.createdAt)
+      createdAt: timestampValue(item.createdAt),
+      actionHint: stringValue(item.actionHint ?? item.action_hint).trim() || null
     }]
   })
   const suggestionRows = Array.isArray(state?.suggestions) ? state.suggestions : []
@@ -731,6 +806,7 @@ function normalizeTownFeedState(value: unknown): TownFeedState {
   return {
     curatedAt: timestampValue(state?.curatedAt ?? state?.curated_at),
     curating: state?.curating === true,
+    dayBrief: normalizeTownDayBrief(state?.dayBrief ?? state?.day_brief),
     error: typeof state?.error === 'string' ? state.error : null,
     items,
     loading: state?.loading === true,
@@ -1650,23 +1726,37 @@ function ScheduleDialog({ schedule }: { schedule: TownScheduleEvent[] }) {
                   {scheduleDayLabel(group.events[0].startAt, now)}
                 </h3>
                 <div className="space-y-1">
-                  {group.events.map((event, index) => (
-                    <div className="flex items-center gap-3 rounded-md px-2 py-1.5" key={`${event.startAt}-${event.endAt}-${event.account}-${index}`}>
-                      <div className="w-28 shrink-0 text-xs text-(--ui-text-tertiary)">
-                        {event.allDay ? (
-                          <Badge size="xs" variant="muted">All day</Badge>
-                        ) : (
-                          <span>{scheduleTime(event.startAt)} – {scheduleTime(event.endAt)}</span>
-                        )}
+                  {group.events.map((event, index) => {
+                    const detailParts = [
+                      event.conference,
+                      event.location,
+                      event.attendees.length > 0 ? `with ${event.attendees.slice(0, 3).join(', ')}${event.attendees.length > 3 ? ` +${event.attendees.length - 3}` : ''}` : null
+                    ].filter((part): part is string => Boolean(part))
+                    const details = detailParts.join(' · ')
+
+                    return (
+                      <div className="flex items-start gap-3 rounded-md px-2 py-1.5" key={`${event.startAt}-${event.endAt}-${event.account}-${index}`}>
+                        <div className="w-28 shrink-0 pt-0.5 text-xs text-(--ui-text-tertiary)">
+                          {event.allDay ? (
+                            <Badge size="xs" variant="muted">All day</Badge>
+                          ) : (
+                            <span>{scheduleTime(event.startAt)} – {scheduleTime(event.endAt)}</span>
+                          )}
+                        </div>
+                        <div className="min-w-0 flex-1">
+                          <p className="truncate text-sm text-(--ui-text-primary)" title={event.summary}>
+                            {event.summary}
+                          </p>
+                          {details ? (
+                            <p className="truncate text-xs text-(--ui-text-tertiary)" title={details}>{details}</p>
+                          ) : null}
+                        </div>
+                        {showAccounts ? (
+                          <Badge size="xs" variant="muted">{scheduleAccountName(event.account)}</Badge>
+                        ) : null}
                       </div>
-                      <span className="min-w-0 flex-1 truncate text-sm text-(--ui-text-primary)" title={event.summary}>
-                        {event.summary}
-                      </span>
-                      {showAccounts ? (
-                        <Badge size="xs" variant="muted">{scheduleAccountName(event.account)}</Badge>
-                      ) : null}
-                    </div>
-                  ))}
+                    )
+                  })}
                 </div>
               </section>
             ))}
@@ -2529,7 +2619,16 @@ function NeedToKnowCard({ cron }: { cron: RpcState<unknown> }) {
                 key={item.id}
               >
                 <h3 className="text-sm font-medium leading-5 text-(--ui-text-primary)">{item.headline}</h3>
-                <p className="mt-1 truncate text-xs text-(--ui-text-secondary)" title={summary}>{summary}</p>
+                <p
+                  className="mt-1 text-xs leading-4 text-(--ui-text-secondary)"
+                  style={{ display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}
+                  title={summary}
+                >
+                  {summary}
+                </p>
+                {item.actionHint ? (
+                  <p className="mt-1 truncate text-xs font-medium text-(--ui-accent)" title={item.actionHint}>{item.actionHint}</p>
+                ) : null}
                 <div className="mt-1 flex min-w-0 items-center gap-2 text-xs text-(--ui-text-tertiary)">
                   {sessionId || gmail ? (
                     <button
@@ -2622,6 +2721,25 @@ function NeedToKnowCard({ cron }: { cron: RpcState<unknown> }) {
       )}
     </SectionCard>
   )
+}
+
+function dayBriefCalloutIcon(kind: string): string {
+  switch (kind) {
+    case 'conflict':
+      return 'warning'
+    case 'travel':
+      return 'location'
+    case 'timezone':
+      return 'globe'
+    case 'prep':
+      return 'person'
+    case 'deadline':
+      return 'clock'
+    case 'trip':
+      return 'calendar'
+    default:
+      return 'info'
+  }
 }
 
 function suggestionInitials(label: string): string | null {
@@ -3298,7 +3416,9 @@ function TownHome() {
   const waitingItems = attentionItems(activeRows, sessionRows, markers, activeSessionId)
   const now = new Date(nowTimestamp)
   const hour = now.getHours()
-  const greetingBase = hour < 12 ? 'Good morning' : hour < 18 ? 'Good afternoon' : 'Good evening'
+  const greetingBase = hour < 12
+    ? now.getDay() === 1 ? 'Happy Monday' : 'Good morning'
+    : hour < 18 ? 'Good afternoon' : 'Good evening'
   const greeting = preferences.userName ? `${greetingBase}, ${preferences.userName}.` : `${greetingBase}.`
   const today = new Intl.DateTimeFormat(undefined, { day: 'numeric', month: 'long', weekday: 'long' }).format(now)
   const cronAvailable = !cron.error && !payloadError(cron.data)
@@ -3307,13 +3427,16 @@ function TownHome() {
         .filter(row => row.enabled && row.state !== 'paused' && row.nextRunAt !== null && row.nextRunAt >= now.getTime())
         .sort((a, b) => (a.nextRunAt ?? Number.POSITIVE_INFINITY) - (b.nextRunAt ?? Number.POSITIVE_INFINITY))[0]
     : undefined
-  const contextLine = feed?.nextEvent
-    ? `Next: ${feed.nextEvent.summary} · ${relativeTime(feed.nextEvent.startAt, nowTimestamp)}`
-    : waitingItems.length > 0
-      ? `${waitingItems.length} ${waitingItems.length === 1 ? 'item' : 'items'} waiting on you`
-      : nextRoutine?.nextRunAt !== null && nextRoutine?.nextRunAt !== undefined
-        ? `Next routine: ${nextRoutine.name} · ${relativeTime(nextRoutine.nextRunAt, nowTimestamp)}`
-        : null
+  const dayBrief = feed?.dayBrief ?? null
+  const contextLine = dayBrief?.daySummary
+    ? dayBrief.daySummary
+    : feed?.nextEvent
+      ? `Next: ${feed.nextEvent.summary} · ${relativeTime(feed.nextEvent.startAt, nowTimestamp)}`
+      : waitingItems.length > 0
+        ? `${waitingItems.length} ${waitingItems.length === 1 ? 'item' : 'items'} waiting on you`
+        : nextRoutine?.nextRunAt !== null && nextRoutine?.nextRunAt !== undefined
+          ? `Next routine: ${nextRoutine.name} · ${relativeTime(nextRoutine.nextRunAt, nowTimestamp)}`
+          : null
   const accentColor = profileColor(profile)
   const gatewayTone = gateway === 'open' ? 'good' : gateway === 'connecting' ? 'warn' : 'muted'
   const gatewayLabel = gateway === 'open' ? 'Gateway online' : `Gateway ${gateway || 'idle'}`
@@ -3342,6 +3465,14 @@ function TownHome() {
                 />
                 <div className="mb-2 flex items-center gap-2 text-sm text-(--ui-text-secondary)">
                   <p>{today}</p>
+                  {dayBrief?.trip ? (
+                    <Badge size="xs" variant="muted">
+                      {dayBrief.trip.label}
+                      {dayBrief.trip.dayN !== null
+                        ? ` · day ${dayBrief.trip.dayN}${dayBrief.trip.totalDays !== null ? ` of ${dayBrief.trip.totalDays}` : ''}`
+                        : ''}
+                    </Badge>
+                  ) : null}
                   {schedule.length > 0 ? (
                     <Button
                       className="h-6 gap-1.5 rounded-full px-2 text-xs transition-colors duration-150"
@@ -3361,7 +3492,24 @@ function TownHome() {
                 >
                   {greeting}
                 </h1>
-                {contextLine ? <p className="mt-2 truncate text-sm text-(--ui-text-tertiary)">{contextLine}</p> : null}
+                {contextLine ? <p className="mt-2 truncate text-sm text-(--ui-text-tertiary)" title={contextLine}>{contextLine}</p> : null}
+                {dayBrief && dayBrief.callouts.length > 0 ? (
+                  <div className="mt-3 flex flex-col gap-1.5">
+                    {dayBrief.callouts.slice(0, 3).map((callout, index) => (
+                      <button
+                        className="flex min-w-0 cursor-pointer items-start gap-2 text-left text-xs text-(--ui-text-secondary) transition-colors duration-150 hover:text-(--ui-text-primary)"
+                        key={`${callout.kind}-${index}`}
+                        type="button"
+                        onClick={openScheduleDialog}
+                      >
+                        <span className="mt-0.5 flex size-4 shrink-0 items-center justify-center rounded-full text-(--ui-accent)" style={{ background: 'var(--town-tint)' }}>
+                          <Codicon name={dayBriefCalloutIcon(callout.kind)} size="0.6875rem" />
+                        </span>
+                        <span className="min-w-0">{callout.text}</span>
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
               </div>
               <div className="flex min-w-0 flex-wrap items-center gap-2">
                 <div className="inline-flex items-center gap-2 rounded-md border border-(--ui-stroke-secondary) px-2.5 py-1.5 text-xs text-(--ui-text-secondary)">

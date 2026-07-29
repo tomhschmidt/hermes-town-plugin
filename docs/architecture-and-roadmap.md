@@ -75,6 +75,15 @@ off direct Ollama onto `call_llm(task="monitor")`.
 **G6R-d** (in flight) — skills packaging (suggestion-flow scheduling), README
 rewrite, docs sweep.
 
+**CHARACTER C1–C7** ✅ IMPLEMENTED 2026-07-28 (deploy pending) — context &
+character pack (`specs/CHARACTER.md`): C1 event-context plumbing, C2
+deterministic `schedule_context`, C3 LLM day brief (header narrative +
+callouts + trip badge, hash/date/hourly regeneration gating), C4 telegram
+thread bodies + attribution + user_spoke_last, C5 NTK action_hint +
+takeaway summaries, C6 day-aware suggestions + grounded first-contact via
+gmail `known_contacts`, C7 TOWN_VOICE. Feed-state v6. The day brief is a
+second `town_curator`-lane call, ~1/hour steady-state.
+
 **G5** *(deferred)* — reply + scheduling drafts: agent-mode, delegation
 fan-out, drafts-only envelope.
 

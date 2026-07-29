@@ -28,7 +28,7 @@ from hermes_constants import get_hermes_home
 
 router = APIRouter()
 
-STATE_VERSION = 5
+STATE_VERSION = 6
 MAX_FEED_ITEMS = 10
 # Retention exceeds display so aging actionable items survive fresh noise
 # and stay available for suggestion re-raises (Town keeps deep thread memory).
@@ -47,7 +47,13 @@ MAX_OPEN_LOOP_SIGNALS = 15
 MAX_OPEN_LOOP_SUPPRESSIONS = 100
 MAX_ORDER_SIGNALS = 6
 MAX_EVENT_SIGNALS = 8
+MAX_CHAT_AWAITING_SIGNALS = 5
+MAX_KNOWN_CONTACTS = 2000
+DAY_BRIEF_MAX_CALLOUTS = 4
+DAY_BRIEF_STALE_SECONDS = 3 * 60 * 60
+DAY_BRIEF_REFRESH_SECONDS = 60 * 60
 SUGGESTION_KINDS = {"followup", "digest", "maintenance"}
+DAY_BRIEF_CALLOUT_KINDS = {"conflict", "travel", "timezone", "prep", "deadline", "trip"}
 BOARD_COLUMNS = (
     "triage",
     "todo",
@@ -133,7 +139,8 @@ def _empty_state() -> dict[str, Any]:
         "label_stats": {},
         "last_labeling_summary": None,
         "next_event": None,
-        "schedule": {"events": [], "generated_at": None},
+        "schedule": {"events": [], "generated_at": None, "context": None},
+        "day_brief": None,
         "open_loop_suppressed": [],
     }
 
@@ -238,12 +245,15 @@ def _read_state_unlocked() -> dict[str, Any]:
     if not isinstance(raw_schedule, dict):
         raw_schedule = {}
     schedule_generated_at = _parse_timestamp(raw_schedule.get("generated_at"))
+    raw_context = raw_schedule.get("context")
     state["schedule"] = {
         "events": _normalize_schedule_events(raw_schedule.get("events")),
         "generated_at": (
             _iso_timestamp(schedule_generated_at) if schedule_generated_at else None
         ),
+        "context": dict(raw_context) if isinstance(raw_context, dict) else None,
     }
+    state["day_brief"] = _normalize_day_brief(state.get("day_brief"))
     return state
 
 
@@ -295,11 +305,40 @@ def _normalize_next_event(value: Any) -> Optional[dict[str, str]]:
     start_timestamp = _parse_timestamp(start_iso)
     if not summary or not start_timestamp or not account:
         return None
-    return {
+    normalized = {
         "summary": summary,
         "start_iso": _iso_timestamp(start_timestamp),
         "account": account,
     }
+    location = str(value.get("location") or "").strip()
+    if location:
+        normalized["location"] = _compact(location, 240)
+    return normalized
+
+
+def _normalize_event_attendees(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    attendees: list[dict[str, Any]] = []
+    for raw in value[:8]:
+        if not isinstance(raw, dict):
+            continue
+        email = str(raw.get("email") or "").strip().casefold()
+        name = str(raw.get("name") or "").strip()
+        if not email and not name:
+            continue
+        entry: dict[str, Any] = {}
+        if email:
+            entry["email"] = email[:120]
+        if name:
+            entry["name"] = _compact(name, 80)
+        response = str(raw.get("response") or "").strip()
+        if response:
+            entry["response"] = response[:24]
+        if raw.get("self") is True:
+            entry["self"] = True
+        attendees.append(entry)
+    return attendees
 
 
 def _normalize_schedule_events(value: Any) -> list[dict[str, Any]]:
@@ -322,18 +361,88 @@ def _normalize_schedule_events(value: Any) -> list[dict[str, Any]]:
             or not account
         ):
             continue
-        events.append(
-            {
-                "summary": summary,
-                "start_iso": _iso_timestamp(start_timestamp),
-                "end_iso": _iso_timestamp(end_timestamp),
-                "all_day": all_day,
-                "account": account,
-            }
-        )
+        event = {
+            "summary": summary,
+            "start_iso": _iso_timestamp(start_timestamp),
+            "end_iso": _iso_timestamp(end_timestamp),
+            "all_day": all_day,
+            "account": account,
+        }
+        location = str(raw_event.get("location") or "").strip()
+        if location:
+            event["location"] = _compact(location, 240)
+        attendees = _normalize_event_attendees(raw_event.get("attendees"))
+        if attendees:
+            event["attendees"] = attendees
+            try:
+                event["attendee_count"] = max(
+                    len(attendees), int(raw_event.get("attendee_count") or 0)
+                )
+            except (TypeError, ValueError):
+                event["attendee_count"] = len(attendees)
+        description = str(raw_event.get("description_excerpt") or "").strip()
+        if description:
+            event["description_excerpt"] = _compact(description, 500)
+        organizer = str(raw_event.get("organizer") or "").strip()
+        if organizer:
+            event["organizer"] = _compact(organizer, 120)
+        conference = str(raw_event.get("conference") or "").strip()
+        if conference:
+            event["conference"] = conference[:40]
+        event_tz = str(raw_event.get("event_tz") or "").strip()
+        if event_tz:
+            event["event_tz"] = event_tz[:64]
+        if raw_event.get("multi_day") is True:
+            event["multi_day"] = True
+        if raw_event.get("lodging_hint") is True:
+            event["lodging_hint"] = True
+        events.append(event)
         if len(events) >= MAX_SCHEDULE_EVENTS:
             break
     return events
+
+
+def _normalize_day_brief(value: Any) -> Optional[dict[str, Any]]:
+    if not isinstance(value, dict):
+        return None
+    day_summary = _compact(str(value.get("day_summary") or ""), 220)
+    if not day_summary:
+        return None
+    callouts: list[dict[str, str]] = []
+    raw_callouts = value.get("callouts")
+    if isinstance(raw_callouts, list):
+        for raw in raw_callouts[:DAY_BRIEF_MAX_CALLOUTS]:
+            if not isinstance(raw, dict):
+                continue
+            kind = str(raw.get("kind") or "").strip().casefold()
+            text = _compact(str(raw.get("text") or ""), 240)
+            if kind in DAY_BRIEF_CALLOUT_KINDS and text:
+                callouts.append({"kind": kind, "text": text})
+    trip: Optional[dict[str, Any]] = None
+    raw_trip = value.get("trip")
+    if isinstance(raw_trip, dict):
+        label = _compact(str(raw_trip.get("label") or ""), 40)
+        if label:
+            trip = {"label": label}
+            for field in ("day_n", "total_days"):
+                try:
+                    number = int(raw_trip.get(field))
+                except (TypeError, ValueError):
+                    continue
+                if number >= 1:
+                    trip[field] = number
+    generated_at = _parse_timestamp(value.get("generated_at"))
+    normalized: dict[str, Any] = {
+        "day_summary": day_summary,
+        "callouts": callouts,
+        "trip": trip,
+        "generated_at": _iso_timestamp(generated_at) if generated_at else None,
+    }
+    for field in ("input_hash", "local_date"):
+        text = str(value.get(field) or "").strip()
+        if text:
+            normalized[field] = text
+    return normalized
 
 
 def _source_activity_timestamp(item: dict[str, Any], default: float = 0.0) -> float:
@@ -756,6 +865,21 @@ def _town_scan_next_event(output: str) -> Optional[dict[str, str]]:
     return _normalize_next_event(payload.get("next_event"))
 
 
+def _town_scan_known_contacts(output: str) -> Optional[set[str]]:
+    payload = _town_scan_payload(output)
+    if payload is None or "known_contacts" not in payload:
+        return None
+    raw = payload.get("known_contacts")
+    if not isinstance(raw, list):
+        return set()
+    contacts: set[str] = set()
+    for value in raw[:MAX_KNOWN_CONTACTS]:
+        address = str(value or "").strip().casefold()
+        if address and "@" in address:
+            contacts.add(address)
+    return contacts
+
+
 def _town_scan_schedule_events(output: str) -> Optional[list[dict[str, Any]]]:
     payload = _town_scan_payload(output)
     if payload is None or "events" not in payload:
@@ -772,6 +896,7 @@ def _scan_cron(
     list[dict[str, Any]],
     list[dict[str, Any]],
     list[dict[str, Any]],
+    set[str],
     bool,
 ]:
     candidates: list[dict[str, Any]] = []
@@ -780,6 +905,7 @@ def _scan_cron(
     schedule_events: list[dict[str, Any]] = []
     awaiting_reply: list[dict[str, Any]] = []
     open_loops: list[dict[str, Any]] = []
+    known_contacts: set[str] = set()
     has_enriched_contract = False
     try:
         from cron.jobs import get_cron_output_dir, list_jobs
@@ -856,6 +982,9 @@ def _scan_cron(
             scan_open_loops = _town_scan_open_loops(output)
             if scan_open_loops is not None:
                 open_loops.extend(scan_open_loops)
+            scan_known_contacts = _town_scan_known_contacts(output)
+            if scan_known_contacts is not None:
+                known_contacts.update(scan_known_contacts)
             next_event = _town_scan_next_event(output)
             if next_event:
                 next_events.append(next_event)
@@ -897,6 +1026,7 @@ def _scan_cron(
         schedule_events[:MAX_SCHEDULE_EVENTS],
         awaiting_reply[:MAX_AWAITING_REPLY_SIGNALS],
         open_loops[:MAX_OPEN_LOOP_SIGNALS],
+        known_contacts,
         has_enriched_contract,
     )
 
@@ -1047,6 +1177,207 @@ def _relative_future(timestamp: float, now: float) -> str:
     return f"in {days} days"
 
 
+def _local_timezone() -> Any:
+    return datetime.now(timezone.utc).astimezone().tzinfo
+
+
+def _schedule_context(
+    schedule_events: list[dict[str, Any]], now: float
+) -> Optional[dict[str, Any]]:
+    """Deterministic day-shape facts computed from the normalized schedule.
+
+    Pure interval math — the day-brief LLM narrates these facts but cannot
+    invent them (the G6R sensing/judgment split, applied to synthesis).
+    """
+    if not schedule_events:
+        return None
+    local_tz = _local_timezone()
+    local_now = datetime.fromtimestamp(now, tz=local_tz)
+    today = local_now.date()
+
+    timed: list[dict[str, Any]] = []
+    all_day: list[dict[str, Any]] = []
+    for event in schedule_events:
+        start_ts = _parse_timestamp(event.get("start_iso"))
+        end_ts = _parse_timestamp(event.get("end_iso"))
+        if not start_ts or not end_ts or end_ts <= start_ts:
+            continue
+        row = dict(event)
+        row["_start_ts"] = start_ts
+        row["_end_ts"] = end_ts
+        row["_start_local"] = datetime.fromtimestamp(start_ts, tz=local_tz)
+        (all_day if event.get("all_day") else timed).append(row)
+    timed.sort(key=lambda row: (row["_start_ts"], row["_end_ts"]))
+
+    conflicts: list[dict[str, Any]] = []
+    for index, first in enumerate(timed):
+        for second in timed[index + 1 :]:
+            if second["_start_ts"] >= first["_end_ts"]:
+                break
+            overlap = min(first["_end_ts"], second["_end_ts"]) - second["_start_ts"]
+            if overlap <= 0:
+                continue
+            conflicts.append(
+                {
+                    "a": first["summary"],
+                    "b": second["summary"],
+                    "a_start_iso": first["start_iso"],
+                    "b_start_iso": second["start_iso"],
+                    "overlap_minutes": int(overlap // 60),
+                }
+            )
+            if len(conflicts) >= 6:
+                break
+        if len(conflicts) >= 6:
+            break
+
+    start_clusters: list[dict[str, Any]] = []
+    cluster: list[dict[str, Any]] = []
+    for row in timed:
+        if cluster and row["_start_ts"] - cluster[-1]["_start_ts"] <= 45 * 60:
+            cluster.append(row)
+            continue
+        if len(cluster) >= 2 and len(start_clusters) < 3:
+            start_clusters.append(cluster)
+        cluster = [row]
+    if len(cluster) >= 2 and len(start_clusters) < 3:
+        start_clusters.append(cluster)
+    cluster_rows = [
+        {
+            "summaries": [row["summary"] for row in group[:4]],
+            "starts_iso": [row["start_iso"] for row in group[:4]],
+            "evening": group[0]["_start_local"].hour >= 17,
+        }
+        for group in start_clusters
+    ]
+
+    back_to_back: list[list[str]] = []
+    chain: list[dict[str, Any]] = []
+    for row in timed:
+        if chain and 0 <= row["_start_ts"] - chain[-1]["_end_ts"] <= 10 * 60:
+            chain.append(row)
+            continue
+        if len(chain) >= 2 and len(back_to_back) < 3:
+            back_to_back.append([entry["summary"] for entry in chain[:5]])
+        chain = [row]
+    if len(chain) >= 2 and len(back_to_back) < 3:
+        back_to_back.append([entry["summary"] for entry in chain[:5]])
+
+    tz_skew: list[dict[str, Any]] = []
+    for row in timed:
+        event_tz_name = str(row.get("event_tz") or "").strip()
+        if not event_tz_name or len(tz_skew) >= 5:
+            continue
+        try:
+            from zoneinfo import ZoneInfo
+
+            event_tz = ZoneInfo(event_tz_name)
+        except Exception:
+            continue
+        moment = datetime.fromtimestamp(row["_start_ts"], tz=timezone.utc)
+        if moment.astimezone(event_tz).utcoffset() != moment.astimezone(local_tz).utcoffset():
+            tz_skew.append(
+                {
+                    "summary": row["summary"],
+                    "event_tz": event_tz_name,
+                    "start_iso": row["start_iso"],
+                }
+            )
+
+    trips: list[dict[str, Any]] = []
+    for row in all_day:
+        if not (row.get("multi_day") or row.get("lodging_hint")):
+            continue
+        start_date = row["_start_local"].date()
+        end_date = datetime.fromtimestamp(row["_end_ts"], tz=local_tz).date()
+        total_days = max(1, (end_date - start_date).days)
+        day_n = min(max(1, (today - start_date).days + 1), total_days)
+        trip = {
+            "summary": row["summary"],
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+            "day_n": day_n,
+            "total_days": total_days,
+        }
+        if row.get("location"):
+            trip["location"] = row["location"]
+        trips.append(trip)
+        if len(trips) >= 2:
+            break
+
+    today_rows = [row for row in timed if row["_start_local"].date() == today]
+    booked_minutes = sum(
+        int((row["_end_ts"] - row["_start_ts"]) // 60) for row in today_rows
+    )
+    largest_gap = 0
+    for previous, following in zip(today_rows, today_rows[1:]):
+        gap = int((following["_start_ts"] - previous["_end_ts"]) // 60)
+        largest_gap = max(largest_gap, gap)
+    load: dict[str, Any] = {
+        "events_today": len(today_rows),
+        "booked_minutes_today": booked_minutes,
+    }
+    if today_rows:
+        load["first_start_iso"] = today_rows[0]["start_iso"]
+        load["last_end_iso"] = max(row["_end_ts"] for row in today_rows)
+        load["last_end_iso"] = _iso_timestamp(load["last_end_iso"])
+        load["largest_gap_minutes"] = largest_gap
+
+    venue_changes: list[dict[str, Any]] = []
+    for previous, following in zip(today_rows, today_rows[1:]):
+        from_location = str(previous.get("location") or "").strip()
+        to_location = str(following.get("location") or "").strip()
+        gap_minutes = int((following["_start_ts"] - previous["_end_ts"]) // 60)
+        if (
+            from_location
+            and to_location
+            and from_location.casefold() != to_location.casefold()
+            and gap_minutes <= 90
+        ):
+            venue_changes.append(
+                {
+                    "from_summary": previous["summary"],
+                    "from_location": from_location,
+                    "to_summary": following["summary"],
+                    "to_location": to_location,
+                    "gap_minutes": max(0, gap_minutes),
+                }
+            )
+        if len(venue_changes) >= 4:
+            break
+
+    return {
+        "local_tz": str(getattr(local_tz, "key", None) or local_now.tzname() or "local"),
+        "date": today.isoformat(),
+        "conflicts": conflicts,
+        "start_clusters": cluster_rows,
+        "back_to_back": back_to_back,
+        "tz_skew": tz_skew,
+        "trips": trips,
+        "load": load,
+        "venue_changes": venue_changes,
+    }
+
+
+def _day_brief_input_hash(
+    schedule_events: list[dict[str, Any]], schedule_context: Optional[dict[str, Any]]
+) -> str:
+    identity = {
+        "events": [
+            [
+                str(event.get("summary") or ""),
+                str(event.get("start_iso") or ""),
+                str(event.get("end_iso") or ""),
+                str(event.get("location") or ""),
+            ]
+            for event in schedule_events
+        ],
+        "context": schedule_context or {},
+    }
+    canonical = json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def _suggestion_signal_groups(
     candidates: list[dict[str, Any]],
     awaiting_reply: list[dict[str, Any]],
@@ -1055,7 +1386,9 @@ def _suggestion_signal_groups(
     next_event: Optional[dict[str, str]],
     schedule_events: list[dict[str, Any]],
     now: float,
-) -> dict[str, list[dict[str, Any]]]:
+    known_contacts: Optional[set[str]] = None,
+    schedule_context: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
     action_mail: list[dict[str, Any]] = []
     orders: list[dict[str, Any]] = []
     for candidate in candidates:
@@ -1145,6 +1478,27 @@ def _suggestion_signal_groups(
         for entry in awaiting_reply[:MAX_AWAITING_REPLY_SIGNALS]
     ]
 
+    chat_awaiting: list[dict[str, Any]] = []
+    for candidate in candidates:
+        if not str(candidate.get("source") or "").startswith("telegram:"):
+            continue
+        if candidate.get("user_spoke_last") is not True:
+            continue
+        chat_name = str(candidate.get("chat_name") or "").strip()
+        if not chat_name:
+            continue
+        created_at = float(candidate["created_at_ts"])
+        chat_awaiting.append(
+            {
+                "person": _compact(chat_name, 80),
+                "last_message": _compact(str(candidate.get("headline") or ""), 160),
+                "sent_at": _iso_timestamp(created_at),
+                "sent_ago": _relative_age(created_at, now),
+            }
+        )
+        if len(chat_awaiting) >= MAX_CHAT_AWAITING_SIGNALS:
+            break
+
     event_signals: list[dict[str, Any]] = []
     seen_events: set[tuple[str, str]] = set()
     event_rows: list[dict[str, Any]] = list(schedule_events)
@@ -1159,23 +1513,65 @@ def _suggestion_signal_groups(
         if not summary or event_key in seen_events:
             continue
         seen_events.add(event_key)
-        event_signals.append(
-            {
-                "summary": _compact(summary, 180),
-                "start_at": event_key[1],
-                "starts_in": _relative_future(start_timestamp, now),
-                "account": str(event.get("account") or "").strip(),
-                "all_day": event.get("all_day") if isinstance(event.get("all_day"), bool) else None,
-            }
-        )
+        signal = {
+            "summary": _compact(summary, 180),
+            "start_at": event_key[1],
+            "starts_in": _relative_future(start_timestamp, now),
+            "account": str(event.get("account") or "").strip(),
+            "all_day": event.get("all_day") if isinstance(event.get("all_day"), bool) else None,
+        }
+        location = str(event.get("location") or "").strip()
+        if location:
+            signal["location"] = _compact(location, 120)
+        conference = str(event.get("conference") or "").strip()
+        if conference:
+            signal["conference"] = conference
+        organizer = str(event.get("organizer") or "").strip()
+        if organizer:
+            signal["organizer"] = _compact(organizer, 80)
+        attendees = event.get("attendees")
+        if isinstance(attendees, list) and attendees:
+            display: list[str] = []
+            first_contact: list[str] = []
+            for attendee in attendees[:6]:
+                if not isinstance(attendee, dict) or attendee.get("self") is True:
+                    continue
+                email = str(attendee.get("email") or "").strip().casefold()
+                name = str(attendee.get("name") or "").strip()
+                if name or email:
+                    display.append(name or email)
+                if known_contacts and email and email not in known_contacts:
+                    first_contact.append(email)
+            if display:
+                signal["attendees"] = display
+            count = event.get("attendee_count")
+            if isinstance(count, int) and count > len(display):
+                signal["attendee_count"] = count
+            # Grounded first-contact: claimable only against the sent-mail
+            # correspondent set — absent that set, no claim is possible.
+            if first_contact:
+                signal["first_contact_attendees"] = first_contact
+        description = str(event.get("description_excerpt") or "").strip()
+        if description:
+            signal["details"] = _compact(description, 240)
+        event_signals.append(signal)
         if len(event_signals) >= MAX_EVENT_SIGNALS:
             break
+
+    schedule_pressure: dict[str, Any] = {}
+    if isinstance(schedule_context, dict):
+        for key in ("conflicts", "start_clusters", "venue_changes", "tz_skew", "trips"):
+            value = schedule_context.get(key)
+            if isinstance(value, list) and value:
+                schedule_pressure[key] = value
 
     return {
         "action_mail": action_mail[: MAX_ACTION_SIGNALS + MAX_OPEN_LOOP_SIGNALS],
         "awaiting_replies": awaiting_signals,
+        "awaiting_replies_chat": chat_awaiting,
         "orders_with_amounts": orders[:MAX_ORDER_SIGNALS],
         "events_next_48h": event_signals,
+        "schedule_pressure": schedule_pressure,
     }
 
 
@@ -1210,6 +1606,49 @@ def _normalize_suggestions(value: Any) -> list[dict[str, str]]:
     return suggestions
 
 
+# C7: the one voice, injected into every Town LLM lane (ranking + day brief).
+TOWN_VOICE = (
+    "Voice: you write for one operator, in second person, as a sharp chief of "
+    "staff. Name people, never email addresses, when a name is available. Use "
+    "concrete numbers, amounts, dates, and times. Verdicts and recommendations "
+    "are welcome; hedging is not. Warm but direct; no exclamation marks. Never "
+    "use generic scheduler or system phrasing such as 'Cron job', 'scheduled "
+    "run', 'system update', or 'session update', and never mention the curator, "
+    "scheduler mechanics, or the curation task itself. Use zero operations "
+    "jargon: never say 'verify auth state', 'check config', or 'review logs' "
+    "unless the item genuinely concerns infrastructure the user owns. "
+)
+
+_RANKING_RULES = (
+    "Rank timely Need-to-Know updates for one operator. Favor recent failures, "
+    "deadlines, decisions, and actionable outcomes. For each selected item, use "
+    "its input key unchanged. Every headline must lead with the concrete entity, "
+    "person, project, or device involved (for example, 'Kasa smart plug setup — "
+    "unresolved'). Call out any source deadline or date explicitly. For mail, "
+    "extract concrete specifics from the body—amounts, quantities, dates, "
+    "deadlines, and names—and never echo a vague snippet. For an orders message "
+    "with an amount of at least $100, lead the headline with the amount and "
+    "merchant. For chat threads (telegram sources), never echo raw message "
+    "lines: use the supplied body to say what happened and what the user must "
+    "do, attributing every statement to its sender by name. When "
+    "user_spoke_last is true the newest message is the user's own — phrase the "
+    "item as an open loop ('You told Hunter you're free tomorrow and offered to "
+    "bring dinner; waiting on his confirm'), never as news from the other "
+    "person. Summaries are the takeaway plus its implication or next step, "
+    "never a restatement of the source; when a source states a deadline and a "
+    "consequence, carry both ('trial ends Jul 29 — routines lock'). Summaries "
+    "must be concrete and at most two sentences. For an item with an obvious "
+    "next action, also return action_hint: an imperative verb phrase of at most "
+    "48 characters naming that action ('Reply about tomorrow night', 'Confirm "
+    "by Thu'); omit action_hint otherwise. "
+)
+
+_CLOSING_RULES = (
+    "Write only factual concise headlines, summaries, and suggestions, score "
+    "0-100, do not invent facts, and return only items worth showing."
+)
+
+
 def _llm_rank(
     candidates: list[dict[str, Any]],
     llm: Any,
@@ -1221,6 +1660,8 @@ def _llm_rank(
     next_event: Optional[dict[str, str]] = None,
     schedule_events: Optional[list[dict[str, Any]]] = None,
     now: Optional[float] = None,
+    known_contacts: Optional[set[str]] = None,
+    schedule_context: Optional[dict[str, Any]] = None,
     has_enriched_contract: bool = False,
 ) -> tuple[dict[str, dict[str, Any]], list[dict[str, str]], Optional[str]]:
     schema = {
@@ -1234,6 +1675,7 @@ def _llm_rank(
                         "key": {"type": "string"},
                         "headline": {"type": "string"},
                         "summary": {"type": "string"},
+                        "action_hint": {"type": "string", "maxLength": 60},
                         "score": {"type": "number", "minimum": 0, "maximum": 100},
                     },
                     "required": ["key", "headline", "summary", "score"],
@@ -1277,40 +1719,36 @@ def _llm_rank(
             row["town_label"] = item.get("town_label")
         if "town_label_confidence" in item:
             row["town_label_confidence"] = item.get("town_label_confidence")
+        source = str(item.get("source") or "")
         if (
             index < 15
-            and str(item.get("source") or "").startswith("gmail:")
+            and source.startswith(("gmail:", "telegram:"))
             and str(item.get("body") or "").strip()
         ):
             row["body"] = _bounded_compact(str(item["body"]), 1500)
+        if source.startswith("telegram:"):
+            for field in ("chat_name", "last_sender"):
+                if str(item.get(field) or "").strip():
+                    row[field] = _compact(str(item[field]), 80)
+            if isinstance(item.get("user_spoke_last"), bool):
+                row["user_spoke_last"] = item["user_spoke_last"]
         payload.append(row)
 
     legacy_instructions = (
-        "Rank timely Need-to-Know updates for one operator. Favor recent failures, "
-        "deadlines, decisions, and actionable outcomes. For each selected item, use "
-        "its input key unchanged. Every headline must lead with the concrete entity, "
-        "person, project, or device involved (for example, 'Kasa smart plug setup — "
-        "unresolved'). Call out any deadline or date explicitly when the source "
-        "contains one. For mail, extract concrete specifics from the body—amounts, "
-        "quantities, dates, deadlines, and names—and never echo a vague snippet. For "
-        "an orders message with an amount of at least $100, lead the headline with "
-        "the amount and merchant. Never use generic scheduler or system phrasing such as 'Cron "
-        "job', 'scheduled run', 'system update', or 'session update', and never surface "
-        "the curator or its scheduling mechanics. Summaries must be concrete, contain "
-        "no hedging, and be no more than two sentences. Also return 3-5 contextual "
-        "suggestions fully grounded in the items you return and, whenever possible, "
-        "derived from the top-ranked items. Write every chip label as a conversational, "
-        "verb-led imperative of at most 70 characters. For a follow-up, name the person; "
-        "for a next concrete step, name the event. Use a natural mix of followup, digest, "
-        "and maintenance kinds rather than repeating one kind. Each suggestion needs a "
-        "unique stable id, a complete ready-to-send task prompt, and a best-fit kind. Use "
-        "zero operations or system jargon: never say 'verify auth state', 'check config', "
-        "or 'review logs' unless the item genuinely concerns infrastructure the user owns. "
-        "Suggestions must name the concrete subject they act on, must not be generic, and "
-        "must never refer to the Town Feed curator, scheduler mechanics, or the curation "
-        "task itself. "
-        "Write only factual concise headlines, summaries, and suggestions, score 0-100, "
-        "and do not invent facts. Return only items worth showing."
+        TOWN_VOICE
+        + _RANKING_RULES
+        + (
+            "Also return 3-5 contextual suggestions fully grounded in the items you "
+            "return and, whenever possible, derived from the top-ranked items. Write "
+            "every chip label as a conversational, verb-led imperative of at most 70 "
+            "characters. For a follow-up, name the person; for a next concrete step, "
+            "name the event. Use a natural mix of followup, digest, and maintenance "
+            "kinds rather than repeating one kind. Each suggestion needs a unique "
+            "stable id, a complete ready-to-send task prompt, and a best-fit kind. "
+            "Suggestions must name the concrete subject they act on and must not be "
+            "generic. "
+        )
+        + _CLOSING_RULES
     )
     instructions = legacy_instructions
     llm_input: Any = payload
@@ -1323,6 +1761,8 @@ def _llm_rank(
             next_event,
             schedule_events or [],
             time.time() if now is None else now,
+            known_contacts=known_contacts,
+            schedule_context=schedule_context,
         )
         llm_input = {
             "ranking_candidates": payload,
@@ -1330,51 +1770,54 @@ def _llm_rank(
             "suggestion_fallback_candidates": payload[:MAX_SUGGESTIONS],
         }
         instructions = (
-            "Rank timely Need-to-Know updates for one operator. Favor recent failures, "
-            "deadlines, decisions, and actionable outcomes. Preserve the supplied Town "
-            "label signal: 'action needed' is strong headline evidence, 'new sender' is "
-            "moderate evidence, and 'awaiting reply' is mild evidence; orders, travel, "
-            "and updates are strongly demoted from headline status unless their content "
-            "shows a separate urgent reason, except an order of at least $100 is notable. "
-            "For each selected ranking candidate, use its "
-            "input key unchanged. Every headline must lead with the concrete entity, "
-            "person, project, or device involved. Call out any source deadline or date. "
-            "For mail, extract concrete specifics from the body—amounts, quantities, "
-            "dates, deadlines, and names—and never echo a vague snippet. For an orders "
-            "message with an amount of at least $100, lead the headline with the amount "
-            "and merchant. "
-            "Never use generic scheduler or system phrasing such as 'Cron job', 'scheduled "
-            "run', 'system update', or 'session update', and never surface curator or "
-            "scheduling mechanics. Summaries must be concrete, contain no hedging, and be "
-            "no more than two sentences. "
-            "Also return 3-5 suggestions by independently analyzing suggestion_signals. "
-            "Use the four capped groups before suggestion_fallback_candidates: (1) action "
-            "mail, including persistent open-loop entries with person, ask, deadline, and "
-            "age, using timing fields to re-raise stale or missed deadlines; (2) awaiting "
-            "replies, naming the recipient "
-            "and how long ago the message was sent; (3) orders with visible amounts, but "
-            "only when the amount or merchant makes a verification or investigation notably "
-            "worthwhile—never merely summarize a routine receipt; and (4) events in the "
-            "next 48 hours that genuinely merit preparation: meetings, syncs, gatherings, "
-            "travel, or anything involving other people or a deliverable. NEVER suggest "
-            "preparation for personal reminders or routine logistics (medication, food "
-            "deliveries, chores, recurring personal tasks) — skip those events entirely; a "
-            "birthday may yield at most one warm send-wishes follow-up. At most 2 of the "
-            "suggestions may come from calendar events; when the mail groups (1)-(3) have "
-            "any usable signal, at least one suggestion must come from them. Use an NTK "
-            "fallback candidate only to fill a remaining suggestion slot after useful "
-            "signals from those four groups are exhausted; returning fewer, sharper "
-            "suggestions beats padding with weak ones. Never make two suggestions from the "
-            "same underlying signal. Write every chip label as a conversational, verb-led imperative of at "
-            "most 70 characters. Name the person for a follow-up and the event for event "
-            "prep; otherwise name the concrete subject. Mix followup, digest, and maintenance "
-            "kinds across the output rather than repeating one kind. Each suggestion needs "
-            "a unique stable id, a complete ready-to-send task prompt, and a best-fit kind. "
-            "Use zero operations or system jargon: never say 'verify auth state', 'check "
-            "config', or 'review logs' unless the signal genuinely concerns infrastructure "
-            "the user owns. Never refer to the Town Feed curator, scheduler mechanics, or "
-            "the curation task itself. Write only factual concise headlines, summaries, and "
-            "suggestions, score 0-100, do not invent facts, and return only items worth showing."
+            TOWN_VOICE
+            + (
+                "Preserve the supplied Town label signal: 'action needed' is strong "
+                "headline evidence, 'new sender' is moderate evidence, and 'awaiting "
+                "reply' is mild evidence; orders, travel, and updates are strongly "
+                "demoted from headline status unless their content shows a separate "
+                "urgent reason, except an order of at least $100 is notable. "
+            )
+            + _RANKING_RULES
+            + (
+                "Also return 3-5 suggestions by independently analyzing "
+                "suggestion_signals. Use the capped groups before "
+                "suggestion_fallback_candidates: (1) action mail, including persistent "
+                "open-loop entries with person, ask, deadline, and age, using timing "
+                "fields to re-raise stale or missed deadlines; (2) awaiting replies, "
+                "naming the recipient and how long ago the message was sent — "
+                "awaiting_replies_chat entries are chat threads where the user spoke "
+                "last and is waiting on the named person, good for one nudge chip; "
+                "(3) orders with visible amounts, but only when the amount or merchant "
+                "makes a verification or investigation notably worthwhile—never merely "
+                "summarize a routine receipt; (4) events in the next 48 hours that "
+                "genuinely merit preparation: meetings, syncs, gatherings, travel, or "
+                "anything involving other people or a deliverable — use the supplied "
+                "location, conference, organizer, and attendees to make prep chips "
+                "concrete, and when first_contact_attendees is present you may note "
+                "there is no prior email history with them (never claim that "
+                "otherwise); and (5) schedule_pressure: overlapping events or tight "
+                "start clusters deserve one pick-a-priority chip naming the competing "
+                "events, and venue_changes with tight gaps deserve a travel-buffer "
+                "chip naming both venues — never invent travel durations. NEVER "
+                "suggest preparation for personal reminders or routine logistics "
+                "(medication, food deliveries, chores, recurring personal tasks) — "
+                "skip those events entirely; a birthday may yield at most one warm "
+                "send-wishes follow-up. At most 2 suggestions may come from calendar "
+                "events and schedule_pressure combined; when the mail groups (1)-(3) "
+                "have any usable signal, at least one suggestion must come from them. "
+                "Use an NTK fallback candidate only to fill a remaining suggestion "
+                "slot after useful signals from those groups are exhausted; returning "
+                "fewer, sharper suggestions beats padding with weak ones. Never make "
+                "two suggestions from the same underlying signal. Write every chip "
+                "label as a conversational, verb-led imperative of at most 70 "
+                "characters. Name the person for a follow-up and the event for event "
+                "prep; otherwise name the concrete subject. Mix followup, digest, and "
+                "maintenance kinds across the output rather than repeating one kind. "
+                "Each suggestion needs a unique stable id, a complete ready-to-send "
+                "task prompt, and a best-fit kind. "
+            )
+            + _CLOSING_RULES
         )
     try:
         result = llm.complete_structured(
@@ -1402,6 +1845,187 @@ def _llm_rank(
         return ranked, suggestions, None
     except Exception as exc:
         return {}, [], str(exc)
+
+
+def _day_brief_event_projection(
+    schedule_events: list[dict[str, Any]], local_tz: Any
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for event in schedule_events:
+        start_ts = _parse_timestamp(event.get("start_iso"))
+        end_ts = _parse_timestamp(event.get("end_iso"))
+        if not start_ts or not end_ts:
+            continue
+        start_local = datetime.fromtimestamp(start_ts, tz=local_tz)
+        end_local = datetime.fromtimestamp(end_ts, tz=local_tz)
+        row: dict[str, Any] = {"summary": event.get("summary")}
+        if event.get("all_day"):
+            row["all_day"] = True
+            row["start_local"] = start_local.strftime("%a %b %-d")
+            row["end_local"] = end_local.strftime("%a %b %-d")
+        else:
+            row["start_local"] = start_local.strftime("%a %-I:%M %p")
+            row["end_local"] = end_local.strftime("%-I:%M %p")
+        for field in (
+            "location",
+            "conference",
+            "organizer",
+            "event_tz",
+            "multi_day",
+            "lodging_hint",
+        ):
+            if event.get(field):
+                row[field] = event[field]
+        attendees = event.get("attendees")
+        if isinstance(attendees, list) and attendees:
+            names = [
+                str(attendee.get("name") or attendee.get("email") or "").strip()
+                for attendee in attendees[:6]
+                if isinstance(attendee, dict) and attendee.get("self") is not True
+            ]
+            names = [name for name in names if name]
+            if names:
+                row["attendees"] = names
+        details = str(event.get("description_excerpt") or "").strip()
+        if details:
+            row["details"] = _compact(details, 240)
+        rows.append(row)
+    return rows
+
+
+def _generate_day_brief(
+    llm: Any,
+    *,
+    schedule_events: list[dict[str, Any]],
+    schedule_context: Optional[dict[str, Any]],
+    next_event: Optional[dict[str, str]],
+    awaiting_reply: list[dict[str, Any]],
+    top_headlines: list[str],
+    known_contacts: Optional[set[str]],
+    now: float,
+) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    """One narrative sentence + grounded callouts for the dashboard header."""
+    local_tz = _local_timezone()
+    local_now = datetime.fromtimestamp(now, tz=local_tz)
+    schema = {
+        "type": "object",
+        "properties": {
+            "day_summary": {"type": "string", "maxLength": 220},
+            "callouts": {
+                "type": "array",
+                "maxItems": DAY_BRIEF_MAX_CALLOUTS,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "kind": {
+                            "type": "string",
+                            "enum": sorted(DAY_BRIEF_CALLOUT_KINDS),
+                        },
+                        "text": {"type": "string", "maxLength": 240},
+                    },
+                    "required": ["kind", "text"],
+                    "additionalProperties": False,
+                },
+            },
+            "trip": {
+                "anyOf": [
+                    {"type": "null"},
+                    {
+                        "type": "object",
+                        "properties": {
+                            "label": {"type": "string", "maxLength": 40},
+                            "day_n": {"type": "integer", "minimum": 1},
+                            "total_days": {"type": "integer", "minimum": 1},
+                        },
+                        "required": ["label"],
+                        "additionalProperties": False,
+                    },
+                ]
+            },
+        },
+        "required": ["day_summary", "callouts"],
+        "additionalProperties": False,
+    }
+    first_contact: list[str] = []
+    if known_contacts:
+        for event in schedule_events:
+            attendees = event.get("attendees")
+            if not isinstance(attendees, list):
+                continue
+            for attendee in attendees:
+                if not isinstance(attendee, dict) or attendee.get("self") is True:
+                    continue
+                email = str(attendee.get("email") or "").strip().casefold()
+                if email and email not in known_contacts and email not in first_contact:
+                    first_contact.append(email)
+    llm_input = {
+        "local_now": local_now.strftime("%A %b %-d, %-I:%M %p"),
+        "local_tz": str(getattr(local_tz, "key", None) or local_now.tzname() or "local"),
+        "events": _day_brief_event_projection(schedule_events, local_tz),
+        "schedule_context": schedule_context or {},
+        "next_event": next_event,
+        "awaiting_replies": [
+            {
+                "to": entry.get("to"),
+                "subject": entry.get("subject"),
+                "sent_ago": _relative_age(float(entry["last_sent_ts"]), now),
+            }
+            for entry in awaiting_reply[:5]
+        ],
+        "first_contact_attendees": first_contact[:8],
+        "top_need_to_know": top_headlines[:5],
+    }
+    instructions = (
+        TOWN_VOICE
+        + (
+            "You write the day brief at the top of the operator's dashboard. The "
+            "input is the complete ground truth: never invent events, people, "
+            "venues, times, or relationships, and express every time in the "
+            "supplied local timezone using the start_local/end_local fields. "
+            "day_summary: ONE sentence of at most 160 characters capturing the "
+            "shape of the day — the load (from schedule_context.load), the single "
+            "thing that matters most, and the trip day when schedule_context.trips "
+            "is non-empty. Do not greet and do not state the date; the dashboard "
+            "renders both. callouts: zero to four, each one concrete sentence the "
+            "operator should act on before it bites. kind rules — conflict: only "
+            "from schedule_context.conflicts or start_clusters; name the competing "
+            "events and their local times and recommend picking a priority. "
+            "travel: only from schedule_context.venue_changes or event locations; "
+            "flag tight venue-to-venue transitions and say to factor in travel — "
+            "never invent travel durations. timezone: only from "
+            "schedule_context.tz_skew, or when a trip's location plainly disagrees "
+            "with the local timezone; spell out the concrete conversion. prep: a "
+            "meeting involving other people that deserves preparation; name the "
+            "attendees, and when first_contact_attendees lists them you may say "
+            "there is no prior email history — never claim that otherwise. "
+            "deadline: a hard time today or tomorrow from events or "
+            "top_need_to_know; state the consequence when the source states one. "
+            "trip: on a trip day, one orienting callout is welcome. Pull concrete "
+            "details — reservation names, confirmation numbers, street addresses — "
+            "from event details when present. A plain day yields an empty callouts "
+            "array; padding is worse than silence. trip field: only when "
+            "schedule_context.trips is non-empty; label is a short name derived "
+            "from the trip event or location text ('SF trip', 'SBC week'); copy "
+            "day_n and total_days from the trip entry."
+        )
+    )
+    try:
+        result = llm.complete_structured(
+            instructions=instructions,
+            input=[{"type": "text", "text": json.dumps(llm_input, ensure_ascii=False)}],
+            json_schema=schema,
+            schema_name="town_day_brief",
+            temperature=0.2,
+            max_tokens=700,
+            purpose="town-day-brief",
+        )
+        parsed = getattr(result, "parsed", None)
+        brief = _normalize_day_brief(parsed if isinstance(parsed, dict) else None)
+        if brief is None:
+            return None, "day brief response had no usable day_summary"
+        return brief, None
+    except Exception as exc:
+        return None, str(exc)
 
 
 def _prune_decisions(decisions: dict[str, Any], now: Optional[float] = None) -> dict[str, Any]:
@@ -1448,10 +2072,12 @@ def run_curator(llm: Any = None) -> dict[str, Any]:
         schedule_events,
         awaiting_reply,
         open_loops,
+        known_contacts,
         has_enriched_contract,
     ) = _scan_cron(now)
     memory_items, memory_hashes, memory_errors = _scan_memory(now, previous_hashes)
     errors = session_errors + cron_errors + memory_errors
+    schedule_context = _schedule_context(schedule_events, now)
 
     by_hash: dict[str, dict[str, Any]] = {}
     for candidate in session_items + cron_items + memory_items:
@@ -1490,7 +2116,17 @@ def run_curator(llm: Any = None) -> dict[str, Any]:
             "summary": str(prior.get("summary") or ""),
             "created_at_ts": created or now,
         }
-        for field in ("town_label", "town_label_confidence", "body", "account", "thread_id"):
+        for field in (
+            "town_label",
+            "town_label_confidence",
+            "body",
+            "account",
+            "thread_id",
+            "chat_name",
+            "last_sender",
+            "user_spoke_last",
+            "action_hint",
+        ):
             if field in prior:
                 candidate[field] = prior.get(field)
         if not _is_ntk_candidate(candidate):
@@ -1530,6 +2166,8 @@ def run_curator(llm: Any = None) -> dict[str, Any]:
             next_event=next_event,
             schedule_events=schedule_events,
             now=now,
+            known_contacts=known_contacts,
+            schedule_context=schedule_context,
             has_enriched_contract=has_enriched_contract,
         )
         if llm_rows:
@@ -1543,6 +2181,11 @@ def run_curator(llm: Any = None) -> dict[str, Any]:
                         _strip_scheduler_preamble(str(row.get("summary") or candidate["summary"])),
                         420,
                     )
+                    action_hint = _compact(str(row.get("action_hint") or ""), 60)
+                    if action_hint:
+                        candidate["action_hint"] = action_hint
+                    else:
+                        candidate.pop("action_hint", None)
                     try:
                         candidate["score"] = round(max(0.0, min(100.0, float(row["score"]))), 2)
                     except (KeyError, TypeError, ValueError):
@@ -1552,6 +2195,43 @@ def run_curator(llm: Any = None) -> dict[str, Any]:
         elif llm_error:
             ranking_mode = "heuristic (LLM fallback)"
             errors.append(f"llm: {llm_error}")
+
+    # C3: the day brief regenerates only when its inputs change, the local date
+    # rolls, or the last one is over an hour old — not on every curation cycle.
+    day_brief = _normalize_day_brief(snapshot.get("day_brief"))
+    if llm is not None:
+        if schedule_events:
+            local_date = datetime.fromtimestamp(now, tz=_local_timezone()).date().isoformat()
+            input_hash = _day_brief_input_hash(schedule_events, schedule_context)
+            current = day_brief if isinstance(day_brief, dict) else {}
+            fresh_enough = (
+                current.get("input_hash") == input_hash
+                and current.get("local_date") == local_date
+                and now - _parse_timestamp(current.get("generated_at"))
+                <= DAY_BRIEF_REFRESH_SECONDS
+            )
+            if not fresh_enough:
+                generated, day_brief_error = _generate_day_brief(
+                    llm,
+                    schedule_events=schedule_events,
+                    schedule_context=schedule_context,
+                    next_event=next_event,
+                    awaiting_reply=awaiting_reply,
+                    top_headlines=[
+                        str(candidate.get("headline") or "") for candidate in candidates[:5]
+                    ],
+                    known_contacts=known_contacts,
+                    now=now,
+                )
+                if generated is not None:
+                    generated["generated_at"] = _iso_timestamp(now)
+                    generated["input_hash"] = input_hash
+                    generated["local_date"] = local_date
+                    day_brief = generated
+                elif day_brief_error:
+                    errors.append(f"day_brief: {day_brief_error}")
+        else:
+            day_brief = None
 
     with _process_lock():
         state = _read_state_unlocked()
@@ -1592,9 +2272,11 @@ def run_curator(llm: Any = None) -> dict[str, Any]:
             for field in ("town_label", "town_label_confidence"):
                 if field in candidate:
                     merged_item[field] = candidate.get(field)
-            for field in ("body", "account", "thread_id"):
+            for field in ("body", "account", "thread_id", "chat_name", "last_sender", "action_hint"):
                 if candidate.get(field):
                     merged_item[field] = candidate[field]
+            if candidate.get("user_spoke_last") is True:
+                merged_item["user_spoke_last"] = True
             candidate_open_loop_key = _open_loop_key(
                 candidate.get("account"), candidate.get("thread_id")
             )
@@ -1618,7 +2300,9 @@ def run_curator(llm: Any = None) -> dict[str, Any]:
         state["schedule"] = {
             "events": schedule_events,
             "generated_at": completed_at,
+            "context": schedule_context,
         }
+        state["day_brief"] = _normalize_day_brief(day_brief)
         # Scanner failures surface via the town-cron-health candidates, not by
         # carrying stale gmail: errors forward (which would never clear).
         state["last_curate_errors"] = errors[:20]
@@ -1638,7 +2322,7 @@ def run_curator(llm: Any = None) -> dict[str, Any]:
 
 
 def _public_item(item: dict[str, Any]) -> dict[str, Any]:
-    return {
+    public = {
         "id": item["id"],
         "headline": item["headline"],
         "summary": item["summary"],
@@ -1647,6 +2331,10 @@ def _public_item(item: dict[str, Any]) -> dict[str, Any]:
         "created_at": item["created_at"],
         "dismissed": False,
     }
+    action_hint = str(item.get("action_hint") or "").strip()
+    if action_hint:
+        public["action_hint"] = action_hint
+    return public
 
 
 @router.get("/feed")
@@ -1675,6 +2363,22 @@ def get_feed() -> dict[str, Any]:
         key=lambda item: (float(item["score"]), _parse_timestamp(item["created_at"])),
         reverse=True,
     )
+    day_brief = state.get("day_brief")
+    day_brief_payload = None
+    if isinstance(day_brief, dict):
+        brief_generated_at = _parse_timestamp(day_brief.get("generated_at"))
+        local_today = datetime.fromtimestamp(now, tz=_local_timezone()).date().isoformat()
+        if (
+            brief_generated_at
+            and now - brief_generated_at <= DAY_BRIEF_STALE_SECONDS
+            and str(day_brief.get("local_date") or "") == local_today
+        ):
+            day_brief_payload = {
+                "day_summary": day_brief.get("day_summary"),
+                "callouts": day_brief.get("callouts") or [],
+                "trip": day_brief.get("trip"),
+                "generated_at": day_brief.get("generated_at"),
+            }
     return {
         "items": visible[:MAX_FEED_ITEMS],
         "curated_at": _iso_timestamp(curated_timestamp) if curated_timestamp else None,
@@ -1682,6 +2386,7 @@ def get_feed() -> dict[str, Any]:
         "suggestions_generated_at": state["suggestions_generated_at"],
         "next_event": state["next_event"],
         "schedule": schedule_events,
+        "day_brief": day_brief_payload,
     }
 
 

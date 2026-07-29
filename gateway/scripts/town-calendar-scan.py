@@ -49,9 +49,26 @@ CALENDAR_SCOPES = {
     "https://www.googleapis.com/auth/calendar.readonly",
 }
 MAX_EVENTS_PER_ACCOUNT = 20
+MAX_ATTENDEE_ENTRIES = 8
 SCAN_WINDOW = timedelta(hours=48)
 BIRTHDAYS_CALENDAR_ID = "addressbook#contacts@group.v.calendar.google.com"
 HOLIDAY_CALENDAR_SUFFIX = "#holiday@group.v.calendar.google.com"
+
+_CONFERENCE_HOSTS = {
+    "meet.google.com": "Google Meet",
+    "zoom.us": "Zoom",
+    "teams.microsoft.com": "Microsoft Teams",
+    "streamyard.com": "StreamYard",
+    "webex.com": "Webex",
+}
+_CONFERENCE_RE = re.compile(
+    r"\b(" + "|".join(re.escape(host) for host in _CONFERENCE_HOSTS) + r")\b",
+    re.IGNORECASE,
+)
+_LODGING_RE = re.compile(
+    r"\b(hotel|inn|resort|ritz|marriott|hyatt|hilton|airbnb|lodging|stay|flight)\b",
+    re.IGNORECASE,
+)
 
 
 def _eprint(*args: Any) -> None:
@@ -155,11 +172,111 @@ def _event_details(event: dict[str, Any]) -> str:
         if count:
             parts.append(f"{count} attendee" if count == 1 else f"{count} attendees")
 
+    conference = _conference(event)
+    if conference:
+        parts.append(conference)
+
     description = str(event.get("description") or "")
     first_line = next((line.strip() for line in description.splitlines() if line.strip()), "")
     if first_line:
         parts.append(_compact(first_line, 240))
     return " · ".join(parts) or "No additional event details."
+
+
+def _attendee_entries(event: dict[str, Any]) -> tuple[list[dict[str, Any]], int]:
+    raw = event.get("attendees")
+    if not isinstance(raw, list):
+        return [], 0
+    rows = [
+        attendee
+        for attendee in raw
+        if isinstance(attendee, dict) and attendee.get("resource") is not True
+    ]
+    entries: list[dict[str, Any]] = []
+    for attendee in rows[:MAX_ATTENDEE_ENTRIES]:
+        email = str(attendee.get("email") or "").strip().casefold()
+        name = _compact(attendee.get("displayName"), 80)
+        if not email and not name:
+            continue
+        entry: dict[str, Any] = {}
+        if email:
+            entry["email"] = email
+        if name:
+            entry["name"] = name
+        response = str(attendee.get("responseStatus") or "").strip()
+        if response:
+            entry["response"] = response
+        if attendee.get("self") is True:
+            entry["self"] = True
+        entries.append(entry)
+    return entries, len(rows)
+
+
+def _conference(event: dict[str, Any]) -> str:
+    conference_data = event.get("conferenceData")
+    if isinstance(conference_data, dict):
+        solution = conference_data.get("conferenceSolution")
+        if isinstance(solution, dict):
+            name = _compact(solution.get("name"), 40)
+            if name:
+                return name
+    if str(event.get("hangoutLink") or "").strip():
+        return "Google Meet"
+    match = _CONFERENCE_RE.search(
+        f"{event.get('location') or ''} {event.get('description') or ''}"
+    )
+    if match:
+        return _CONFERENCE_HOSTS[match.group(1).casefold()]
+    return ""
+
+
+def _enriched_event_row(
+    event: dict[str, Any],
+    *,
+    account: str,
+    calendar_name: str,
+    start: datetime,
+    end: datetime,
+    all_day: bool,
+) -> dict[str, Any]:
+    row: dict[str, Any] = {
+        "summary": _compact(event.get("summary"), 160) or "(untitled event)",
+        "start_iso": start.isoformat(),
+        "end_iso": end.isoformat(),
+        "all_day": all_day,
+        "account": account,
+        "calendar": calendar_name,
+    }
+    location = _compact(event.get("location"), 240)
+    if location:
+        row["location"] = location
+    attendees, attendee_count = _attendee_entries(event)
+    if attendees:
+        row["attendees"] = attendees
+        row["attendee_count"] = attendee_count
+    description = " ".join(str(event.get("description") or "").split())
+    if description:
+        row["description_excerpt"] = _compact(description, 500)
+    organizer = event.get("organizer")
+    if isinstance(organizer, dict):
+        organizer_name = _compact(
+            organizer.get("displayName") or organizer.get("email"), 120
+        )
+        if organizer_name and organizer.get("self") is not True:
+            row["organizer"] = organizer_name
+    conference = _conference(event)
+    if conference:
+        row["conference"] = conference
+    start_info = event.get("start")
+    if isinstance(start_info, dict):
+        event_tz = str(start_info.get("timeZone") or "").strip()
+        if event_tz:
+            row["event_tz"] = event_tz[:64]
+    if all_day and (end - start) >= timedelta(days=2):
+        row["multi_day"] = True
+    if all_day and _LODGING_RE.search(f"{row['summary']} {location}"):
+        row["lodging_hint"] = True
+    return row
 
 
 def _candidate(
@@ -306,21 +423,21 @@ def _run() -> tuple[int, dict[str, Any] | None]:
                     candidate = _candidate(event, account, start, now, all_day)
                     if candidate:
                         candidates.append(candidate)
-                    if start >= now:
-                        upcoming.append(
-                            (
-                                start,
-                                {
-                                    "summary": _compact(event.get("summary"), 160)
-                                    or "(untitled event)",
-                                    "start_iso": start.isoformat(),
-                                    "end_iso": end.isoformat(),
-                                    "all_day": all_day,
-                                    "account": account,
-                                    "calendar": calendar_name or calendar_id,
-                                },
-                            )
+                    # Ongoing events count too: an in-progress multi-day hotel
+                    # stay is the downstream trip signal, not a past event.
+                    upcoming.append(
+                        (
+                            start,
+                            _enriched_event_row(
+                                event,
+                                account=account,
+                                calendar_name=calendar_name or calendar_id,
+                                start=start,
+                                end=end,
+                                all_day=all_day,
+                            ),
                         )
+                    )
         except Exception as exc:
             fatal_errors.append(f"{token_path}: {exc}")
 
@@ -332,13 +449,17 @@ def _run() -> tuple[int, dict[str, Any] | None]:
         return 0, None
 
     candidates.sort(key=lambda candidate: float(candidate["created_at_ts"]))
-    next_event = min(upcoming, key=lambda row: row[0])[1] if upcoming else None
+    future = [row for row in upcoming if row[0] >= now]
+    next_event = min(future, key=lambda row: row[0])[1] if future else None
     if next_event:
-        next_event = {
+        slim = {
             "summary": next_event["summary"],
             "start_iso": next_event["start_iso"],
             "account": next_event["account"],
         }
+        if next_event.get("location"):
+            slim["location"] = next_event["location"]
+        next_event = slim
     events = [event for _, event in sorted(upcoming, key=lambda row: row[0])[:20]]
     return 0, {"candidates": candidates, "next_event": next_event, "events": events}
 
