@@ -396,6 +396,22 @@ def _normalize_schedule_events(value: Any) -> list[dict[str, Any]]:
             event["multi_day"] = True
         if raw_event.get("lodging_hint") is True:
             event["lodging_hint"] = True
+        event_type = str(raw_event.get("event_type") or "").strip()
+        if event_type:
+            event["event_type"] = event_type[:32]
+        working_location = raw_event.get("working_location")
+        if isinstance(working_location, dict) and working_location.get("type") in {
+            "home",
+            "office",
+            "custom",
+        }:
+            event["working_location"] = {"type": working_location["type"]}
+            label = str(working_location.get("label") or "").strip()
+            if label:
+                event["working_location"]["label"] = _compact(label, 120)
+        ical_uid = str(raw_event.get("ical_uid") or "").strip()
+        if ical_uid:
+            event["ical_uid"] = ical_uid[:255]
         events.append(event)
         if len(events) >= MAX_SCHEDULE_EVENTS:
             break
@@ -1237,6 +1253,24 @@ def _local_timezone() -> Any:
     return datetime.now(timezone.utc).astimezone().tzinfo
 
 
+# Context rows, not commitments: never conflicts, clusters, load, or trips.
+_SCHEDULE_IGNORED_EVENT_TYPES = {"workingLocation", "birthday"}
+
+
+def _schedule_identity_keys(
+    event: dict[str, Any], start_ts: float, end_ts: float
+) -> set[tuple[Any, ...]]:
+    """One occurrence's identities: iCalUID + start, or summary + start + end."""
+    keys: set[tuple[Any, ...]] = set()
+    ical_uid = str(event.get("ical_uid") or "").strip()
+    if ical_uid:
+        keys.add(("ical", ical_uid, start_ts))
+    summary = " ".join(str(event.get("summary") or "").split()).casefold()
+    if summary:
+        keys.add(("text", summary, start_ts, end_ts))
+    return keys
+
+
 def _schedule_context(
     schedule_events: list[dict[str, Any]], now: float
 ) -> Optional[dict[str, Any]]:
@@ -1253,11 +1287,19 @@ def _schedule_context(
 
     timed: list[dict[str, Any]] = []
     all_day: list[dict[str, Any]] = []
+    seen_identities: set[tuple[Any, ...]] = set()
     for event in schedule_events:
+        if str(event.get("event_type") or "") in _SCHEDULE_IGNORED_EVENT_TYPES:
+            continue
         start_ts = _parse_timestamp(event.get("start_iso"))
         end_ts = _parse_timestamp(event.get("end_iso"))
         if not start_ts or not end_ts or end_ts <= start_ts:
             continue
+        identities = _schedule_identity_keys(event, start_ts, end_ts)
+        if identities & seen_identities:
+            seen_identities |= identities
+            continue
+        seen_identities |= identities
         row = dict(event)
         row["_start_ts"] = start_ts
         row["_end_ts"] = end_ts
