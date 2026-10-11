@@ -58,8 +58,14 @@ def load_script(filename: str) -> ModuleType:
 
 
 def load_plugin_api(state_dir: Path) -> ModuleType:
-    """Import plugin_api with feed-state redirected into ``state_dir``."""
+    """Import plugin_api with feed-state redirected into ``state_dir``.
+
+    ``get_hermes_home`` points at an empty ``state_dir/hermes-home`` so the
+    operator profile and memories never come from the live ``~/.hermes``;
+    tests that need a profile write one there (or rebind the function).
+    """
     module = load_module(DASHBOARD / "plugin_api.py", "town_test_plugin_api")
     module._state_path = lambda: state_dir / "feed-state.json"
     module._lock_path = lambda: state_dir / ".feed-state.lock"
+    module.get_hermes_home = lambda: state_dir / "hermes-home"
     return module

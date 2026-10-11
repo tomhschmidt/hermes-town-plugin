@@ -29,7 +29,6 @@ HERMES_HOME = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")).expan
 STATE_PATH = HERMES_HOME / "town-feed" / "telegram-state.json"
 LOCK_PATH = HERMES_HOME / "town-feed" / ".telegram-state.lock"
 DAEMON_URL = "http://127.0.0.1:18784"
-CHAT_ID = 372430020
 LOOKBACK = timedelta(hours=48)
 MAX_CANDIDATES = 15
 STATE_VERSION = 1
@@ -225,7 +224,7 @@ def get_chats(bot_user_id: int) -> dict[int, dict[str, Any]]:
             not isinstance(chat_id, int)
             or not title
             or chat_id in muted
-            or chat_id in {CHAT_ID, bot_user_id}
+            or chat_id == bot_user_id
             or title in SKIP_CHAT_NAMES
         ):
             continue

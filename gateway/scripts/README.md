@@ -6,7 +6,7 @@ Deploy these four files together to `~/.hermes/scripts/`. Hermes cron resolves t
 |---|---|---|---|
 | `town-gmail-scan.py` | Always prints `{"candidates": [...], "labeling": {"applied": n, "skipped": [...], "errors": [...]}, "watermarks_advanced": bool}`. Candidates carry `recipients` (To/Cc `{email, name?}`, at most 8) for the curator's people context. | `0` success, `2` config/state, `3` plugin/Hermes import, `4` auxiliary classifier, `5` Gmail API or labeling. | Owns `~/.hermes/town-feed/gmail-state.json` and `.gmail-state.lock`; on first load it copies Gmail-owned legacy fields from the plugin's `feed-state.json` without modifying that file. |
 | `town-telegram-scan.py` | Prints `{"candidates": [...]}` only when changed threads exist; successful quiet scans have empty stdout. | `0` success, `2` config/state, `3` runtime import, `5` local Telegram daemon API. | Owns `~/.hermes/town-feed/telegram-state.json` and `.telegram-state.lock` with per-chat watermarks. |
-| `town-calendar-scan.py` | Prints `{"candidates": [...], "next_event": {...} | null, "events": [...]}` when events exist (see [Calendar time and event types](#calendar-time-and-event-types)); no scoped tokens or no events produce empty stdout. | `0` success/quiet, `2` token/config, `3` Google API imports, `5` Calendar auth/API. | No state file. Reads `~/.hermes/google_token.json` and `~/.hermes/google-accounts/*/google_token.json`; refreshes credentials in memory only. |
+| `town-calendar-scan.py` | Prints `{"candidates": [...], "next_event": {...} | null, "events": [...], "recent_travel": [...]}` when events or recent travel exist (see [Calendar time and event types](#calendar-time-and-event-types)); no scoped tokens or no events produce empty stdout. | `0` success/quiet, `2` token/config, `3` Google API imports, `5` Calendar auth/API. | No state file. Reads `~/.hermes/google_token.json` and `~/.hermes/google-accounts/*/google_token.json`; refreshes credentials in memory only. |
 | `town-curate.py` | Always prints the installed plugin's curator result object, including `{"ok": false, "error": ...}` on setup/state failures. | `0` success, `2` curator state/result, `3` plugin/Hermes import, `4` heuristic fallback after auxiliary LLM failure. | The installed plugin owns `~/.hermes/plugins/town-feed/feed-state.json` and its lock. |
 
 Deploy from the repository root:
@@ -87,6 +87,14 @@ events starting within 24 h that have another attendee, a conference link,
 or a location; `next_event` is the earliest future timed `default`/`fromGmail`
 event. Working-location, birthday, focus-time, and out-of-office rows are
 schedule-only.
+
+`recent_travel` lists flights and stays (same row shape as `events`) that
+ended within the last 36 h, from a second, best-effort look-back query per
+calendar; a failed look-back is logged and never fails the scan. Flight and
+lodging detection is the plugin's pure `where.py`, loaded from the installed
+plugin (`~/.hermes/plugins/town-feed/dashboard/where.py`); without it the list
+is empty. Rows whose end carries a different zone than their start (Google's
+flight rows end in the arrival airport's zone) add `end_tz`.
 
 ## People directory
 

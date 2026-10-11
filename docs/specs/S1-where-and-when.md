@@ -60,7 +60,7 @@ fields to the day-brief schema only for S1's needs (`opener`); S2 adds
 2. The calendar scanner adds `recent_travel`: flight-like and lodging rows
    that ended within the last 36 h (same row shape as `events`). Flight
    detection is a pure function:
-   - an airline code + number ("SQ 22", "UA123");
+   - an airline code + number ("BA 117", "UA123");
    - "Flight to/from <X>";
    - an IATA pair "XXX→YYY" / "XXX-YYY";
    - Google's auto-added flight events (`eventType`/source/description cues).
@@ -147,7 +147,7 @@ fields to the day-brief schema only for S1's needs (`opener`); S2 adds
 ## Required tests
 
 Gateway (`gateway/tests/test_s1_where.py`):
-- Flight detection: positive and negative titles (e.g. "SQ 22 SIN→EWR",
+- Flight detection: positive and negative titles (e.g. "BA 117 LHR→JFK",
   "Flight to Lisbon", "UA123" positive; "Sync 22" and "Q3 planning"
   negative).
 - `infer_where` cases:

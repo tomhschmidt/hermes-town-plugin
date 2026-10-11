@@ -474,7 +474,7 @@ class CalendarEnrichmentTest(unittest.TestCase):
             ],
             self.now,
             [ALICE],
-            enrich,
+            enrich_attendee=enrich,
         )
         attendees = {entry["email"]: entry for entry in payload["events"][0]["attendees"]}
         self.assertEqual(attendees[ALICE], {"email": ALICE, "response": "accepted", "self": True})
@@ -497,7 +497,7 @@ class CalendarEnrichmentTest(unittest.TestCase):
             [self.event({"email": "bob@example-fund.com", "displayName": "Bob Lee"})],
             self.now,
             [ALICE],
-            self.scanner._people_enricher([ALICE]),
+            enrich_attendee=self.scanner._people_enricher([ALICE]),
         )
         self.assertEqual(payload["events"][0]["attendees"], [{"email": "bob@example-fund.com", "name": "Bob Lee"}])
 

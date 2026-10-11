@@ -41,8 +41,13 @@ The required installed layout is:
     |-- google_scan.py
     |-- operator_profile.py
     |-- people.py
-    `-- plugin_api.py
+    |-- plugin_api.py
+    `-- where.py
 ```
+
+`where.py` (S1) is pure: where the operator is (home, away, traveling today,
+just returned) from calendar evidence, and which events are meaningful. The
+calendar scanner loads the installed copy to pick `recent_travel` rows.
 
 `feed-state.json` and `.feed-state.lock` are created beside `plugin.yaml` on
 first use. They survive gateway restarts. Do not copy an old state file over a

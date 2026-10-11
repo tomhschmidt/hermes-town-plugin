@@ -76,6 +76,12 @@ MAX_EVENTS_PER_ACCOUNT = 20
 MAX_ATTENDEE_ENTRIES = 8
 SCAN_WINDOW = timedelta(hours=48)
 NTK_WINDOW = timedelta(hours=24)
+# Ended flights and stays stay visible this long so the dashboard can say
+# "back in <home city> after <origin>" (S1); travel detection lives in the
+# plugin's where.py.
+RECENT_TRAVEL_WINDOW = timedelta(hours=36)
+MAX_RECENT_TRAVEL = 10
+MAX_LOOKBACK_EVENTS = 50
 BIRTHDAYS_CALENDAR_ID = "addressbook#contacts@group.v.calendar.google.com"
 HOLIDAY_CALENDAR_SUFFIX = "#holiday@group.v.calendar.google.com"
 CONFIG_PATH = HERMES_HOME / "config.yaml"
@@ -83,6 +89,11 @@ OPERATOR_PROFILE_PATH = HERMES_HOME / "plugins" / "town-feed" / "dashboard" / "o
 _OPERATOR_PROFILE_MODULE_NAME = "hermes_town_calendar_operator_profile"
 PEOPLE_PATH = HERMES_HOME / "plugins" / "town-feed" / "dashboard" / "people.py"
 _PEOPLE_MODULE_NAME = "hermes_town_calendar_people"
+WHERE_PATHS = (
+    HERMES_HOME / "plugins" / "town-feed" / "dashboard" / "where.py",
+    Path(__file__).resolve().parents[1] / "town-feed" / "dashboard" / "where.py",
+)
+_WHERE_MODULE_NAME = "hermes_town_calendar_where"
 
 # Google eventType values that are real commitments: NTK candidates and
 # next_event come only from these. fromGmail rows are reservations Google
@@ -182,6 +193,31 @@ def _operator_profile_timezone() -> str:
     if not isinstance(profile, dict):
         return ""
     return str(profile.get("home_timezone") or "")
+
+
+def _where_module() -> Any:
+    """The plugin's pure where.py (installed copy, else the repo sibling).
+
+    ``None`` when neither loads: the scan then reports no recent travel.
+    """
+    cached = sys.modules.get(_WHERE_MODULE_NAME)
+    if cached is not None:
+        return cached
+    for path in WHERE_PATHS:
+        if not path.is_file():
+            continue
+        try:
+            spec = importlib.util.spec_from_file_location(_WHERE_MODULE_NAME, path)
+            if spec is None or spec.loader is None:
+                continue
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[_WHERE_MODULE_NAME] = module
+            spec.loader.exec_module(module)
+        except Exception:
+            sys.modules.pop(_WHERE_MODULE_NAME, None)
+            continue
+        return module
+    return None
 
 
 def _config_timezone() -> str:
@@ -470,10 +506,17 @@ def _enriched_event_row(
     if conference:
         row["conference"] = conference
     start_info = event.get("start")
+    event_tz = ""
     if isinstance(start_info, dict):
         event_tz = str(start_info.get("timeZone") or "").strip()
         if event_tz:
             row["event_tz"] = event_tz[:64]
+    end_info = event.get("end")
+    if isinstance(end_info, dict):
+        # Google's flight rows end in the arrival airport's zone.
+        end_tz = str(end_info.get("timeZone") or "").strip()
+        if end_tz and end_tz != event_tz:
+            row["end_tz"] = end_tz[:64]
     if all_day and (end - start) >= timedelta(days=2):
         row["multi_day"] = True
     if all_day and _LODGING_RE.search(f"{row['summary']} {location}"):
@@ -598,19 +641,10 @@ def _people_enricher(accounts: Iterable[str]) -> Callable[[dict[str, Any]], dict
     return enrich
 
 
-def _build_payload(
-    entries: Iterable[tuple[str, str, dict[str, Any]]],
-    now: datetime,
-    accounts: Iterable[str] = (),
-    enrich_attendee: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
-) -> dict[str, Any] | None:
-    """Turn raw ``(account, calendar name, Google event)`` rows into the scan payload.
-
-    Pure apart from resolving the operator's time zone; ``now`` is injected.
-    ``enrich_attendee`` (S2) adds directory facts to each non-self attendee.
-    """
-    user_tz = _user_timezone()
-    self_addresses = {str(account).strip().casefold() for account in accounts}
+def _event_items(
+    entries: Iterable[tuple[str, str, dict[str, Any]]], user_tz: tzinfo
+) -> list[dict[str, Any]]:
+    """Parsed, non-cancelled, non-declined copies of raw Google events."""
     items: list[dict[str, Any]] = []
     for account, calendar_name, event in entries:
         if not isinstance(event, dict) or event.get("status") == "cancelled":
@@ -623,8 +657,6 @@ def _build_payload(
             continue
         start, all_day = parsed_start
         end, _ = parsed_end
-        if end <= now:
-            continue
         items.append(
             {
                 "account": account,
@@ -636,6 +668,62 @@ def _build_payload(
                 "keys": _identity_keys(event, start, end),
             }
         )
+    return items
+
+
+def _recent_travel(
+    recent_entries: Iterable[tuple[str, str, dict[str, Any]]],
+    now: datetime,
+    user_tz: tzinfo,
+) -> list[dict[str, Any]]:
+    """Flights and stays that ended within RECENT_TRAVEL_WINDOW (``events`` row shape)."""
+    where = _where_module()
+    if where is None:
+        return []
+    items = [
+        item
+        for item in _event_items(recent_entries, user_tz)
+        if now - RECENT_TRAVEL_WINDOW <= item["end"] <= now
+    ]
+    travel: list[tuple[datetime, dict[str, Any]]] = []
+    for group in _group_duplicates(items):
+        first = group[0]
+        row = _enriched_event_row(
+            first["event"],
+            account=first["account"],
+            calendar_name=first["calendar"],
+            start=first["start"],
+            end=first["end"],
+            all_day=first["all_day"],
+        )
+        try:
+            keep = where.is_travel_row(row)
+        except Exception:
+            keep = False
+        if keep:
+            travel.append((group[0]["start"], row))
+    travel.sort(key=lambda entry: entry[0])
+    return [row for _, row in travel[-MAX_RECENT_TRAVEL:]]
+
+
+def _build_payload(
+    entries: Iterable[tuple[str, str, dict[str, Any]]],
+    now: datetime,
+    accounts: Iterable[str] = (),
+    recent_entries: Iterable[tuple[str, str, dict[str, Any]]] = (),
+    enrich_attendee: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
+    """Turn raw ``(account, calendar name, Google event)`` rows into the scan payload.
+
+    ``recent_entries`` come from the look-back query; only flights and stays
+    that already ended are kept from them (``recent_travel``). Pure apart from
+    resolving the operator's time zone and loading where.py; ``now`` is injected.
+    ``enrich_attendee`` (S2) adds directory facts to each non-self attendee.
+    """
+    user_tz = _user_timezone()
+    self_addresses = {str(account).strip().casefold() for account in accounts}
+    items = [item for item in _event_items(entries, user_tz) if item["end"] > now]
+    recent_travel = _recent_travel(recent_entries, now, user_tz)
 
     candidates: list[dict[str, Any]] = []
     upcoming: list[tuple[datetime, dict[str, Any]]] = []
@@ -691,7 +779,7 @@ def _build_payload(
             if candidate:
                 candidates.append(candidate)
 
-    if not upcoming:
+    if not upcoming and not recent_travel:
         return None
     candidates.sort(key=lambda candidate: float(candidate["created_at_ts"]))
     slim: dict[str, Any] | None = None
@@ -705,7 +793,12 @@ def _build_payload(
         if row.get("location"):
             slim["location"] = row["location"]
     events_out = [row for _, row in sorted(upcoming, key=lambda entry: entry[0])[:20]]
-    return {"candidates": candidates, "next_event": slim, "events": events_out}
+    return {
+        "candidates": candidates,
+        "next_event": slim,
+        "events": events_out,
+        "recent_travel": recent_travel,
+    }
 
 
 def _run() -> tuple[int, dict[str, Any] | None]:
@@ -730,7 +823,9 @@ def _run() -> tuple[int, dict[str, Any] | None]:
 
     now = datetime.now(timezone.utc)
     time_max = now + SCAN_WINDOW
+    time_back = now - RECENT_TRAVEL_WINDOW
     entries: list[tuple[str, str, dict[str, Any]]] = []
+    recent_entries: list[tuple[str, str, dict[str, Any]]] = []
     seen_accounts: set[str] = set()
     fatal_errors: list[str] = []
     calendar_errors: list[str] = []
@@ -804,6 +899,26 @@ def _run() -> tuple[int, dict[str, Any] | None]:
                     (account, calendar_name or calendar_id, event)
                     for event in response.get("items", []) or []
                 )
+                # Best-effort look-back for travel that already ended; the
+                # forward window above never returns it.
+                try:
+                    response = service.events().list(
+                        calendarId=calendar_id,
+                        timeMin=time_back.isoformat().replace("+00:00", "Z"),
+                        timeMax=now.isoformat().replace("+00:00", "Z"),
+                        singleEvents=True,
+                        orderBy="startTime",
+                        maxResults=MAX_LOOKBACK_EVENTS,
+                    ).execute()
+                except Exception as exc:
+                    calendar_errors.append(
+                        f"{token_path}: {calendar_name or calendar_id} (recent travel): {exc}"
+                    )
+                    continue
+                recent_entries.extend(
+                    (account, calendar_name or calendar_id, event)
+                    for event in response.get("items", []) or []
+                )
         except Exception as exc:
             fatal_errors.append(f"{token_path}: {exc}")
 
@@ -811,7 +926,9 @@ def _run() -> tuple[int, dict[str, Any] | None]:
         _eprint(f"town-calendar-scan: Calendar API failure: {error}")
     if fatal_errors:
         return 5, None
-    return 0, _build_payload(entries, now, seen_accounts, _people_enricher(seen_accounts))
+    return 0, _build_payload(
+        entries, now, seen_accounts, recent_entries, _people_enricher(seen_accounts)
+    )
 
 
 def main() -> int:
