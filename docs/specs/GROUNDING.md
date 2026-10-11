@@ -5,6 +5,24 @@ history, feed-state, scanner outputs, Telegram history replayed through the
 prompt builders) plus a review of ~170 Town.com assistant emails. Shared
 conventions in `docs/specs/README.md` bind, with the overrides below.*
 
+**STATUS: SHIPPED 2026-10-11.** All seven lanes implemented by separate agents in
+isolated worktrees, reviewed and merged by the orchestrator, and deployed to
+the gateway host (scripts, plugin, TDLib daemon cutover, `:9119` restart,
+desktop bundles). Verified live: Gmail LLM labels resumed (first since
+Sep 26); Telegram replay of real history drops the misattributed and
+already-answered items; calendar labels in local time; curator reads every
+scan. Post-review amendments: R4 req 6 (LLM mode serves only vetted items),
+R3 dedupe identity (iCalUID+start; title+start+end even across UIDs), Up next
+shows a second clock only while away.
+
+Follow-ups (not in this pack): `town-routines` still subscribes to
+`onEvent('*')` and has its own run-history copy; approval/clarify listeners
+in town-home/town-approvals wait for events the v8 backend never emits;
+the Schedule dialog renders in the renderer's zone; `_local_timezone()`
+callers outside S1's paths; the digest's delivery `CHAT_ID` should come
+from config; implicit addressing in very small groups (no reply/mention)
+is not detected.
+
 | Spec | Title | Lane |
 |---|---|---|
 | [R1a](R1a-tdlib-daemon.md) | TDLib daemon: move into repo + richer message contract | gateway/tdlib-daemon |
