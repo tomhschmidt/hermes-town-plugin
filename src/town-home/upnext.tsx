@@ -1,7 +1,7 @@
 import { Badge } from '@hermes/plugin-sdk'
 import type { ReactNode } from 'react'
 
-import type { UpNextEvent, UpNextResult, UpNextRow } from './lib/upnext.ts'
+import { upNextRowMeta, type UpNextEvent, type UpNextResult } from './lib/upnext.ts'
 
 // Up next (S1): the next 2-3 meaningful events under the header. Rows open
 // the Schedule dialog. ``renderPeople`` is the attendee slot for the next
@@ -18,10 +18,6 @@ export interface UpNextProps<E extends UpNextEvent> {
 // time column + gap-3 (the precompiled host CSS has no pl-* that wide).
 const PEOPLE_INDENT = { paddingLeft: 'calc(0.5rem + 5rem + 0.75rem)' }
 
-function rowDetail(row: UpNextRow): string {
-  return [row.hint, row.dualTime].filter((part): part is string => Boolean(part)).join(' · ')
-}
-
 export function UpNext<E extends UpNextEvent>({ result, onOpenSchedule, renderPeople }: UpNextProps<E>) {
   const peopleKey = renderPeople ? result.rows.find(row => row.meeting)?.key ?? null : null
 
@@ -32,7 +28,9 @@ export function UpNext<E extends UpNextEvent>({ result, onOpenSchedule, renderPe
         {result.rows.length > 0 ? (
           <div className="flex flex-col gap-0.5">
             {result.rows.map(row => {
-              const detail = rowDetail(row)
+              // U13: one line — clock time, then "Title · in 8h · Zoom"; the
+              // second line is only the dual time while away.
+              const meta = upNextRowMeta(row)
               return (
                 <div className="min-w-0" key={row.key}>
                   <button
@@ -41,21 +39,19 @@ export function UpNext<E extends UpNextEvent>({ result, onOpenSchedule, renderPe
                     type="button"
                     onClick={onOpenSchedule}
                   >
-                    <div className="w-20 shrink-0 pt-0.5 text-xs">
-                      <span className="block tabular-nums text-(--ui-text-secondary)">
-                        {row.day === 'tomorrow' ? `Tmrw ${row.time}` : row.time}
-                      </span>
-                      <span className="block text-(--ui-text-tertiary)">{row.relative}</span>
-                    </div>
+                    <span className="w-20 shrink-0 pt-0.5 text-xs tabular-nums text-(--ui-text-secondary)">{row.time}</span>
                     <div className="min-w-0 flex-1">
                       <div className="flex min-w-0 items-center gap-2">
-                        <p className="min-w-0 truncate text-sm text-(--ui-text-primary)" title={row.title}>{row.title}</p>
+                        <p className="min-w-0 truncate text-sm" title={meta ? `${row.title} · ${meta}` : row.title}>
+                          <span className="text-(--ui-text-primary)">{row.title}</span>
+                          {meta ? <span className="text-xs text-(--ui-text-tertiary)">{` · ${meta}`}</span> : null}
+                        </p>
                         {row.conflict ? (
                           <Badge className="shrink-0" size="xs" variant="warn">Overlaps</Badge>
                         ) : null}
                       </div>
-                      {detail ? (
-                        <p className="truncate text-xs text-(--ui-text-tertiary)" title={detail}>{detail}</p>
+                      {row.dualTime ? (
+                        <p className="truncate text-xs text-(--ui-text-tertiary)" title={row.dualTime}>{row.dualTime}</p>
                       ) : null}
                     </div>
                   </button>

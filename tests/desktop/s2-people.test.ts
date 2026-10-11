@@ -7,7 +7,6 @@ import {
   attendeeOverflow,
   displayNameFromEmail,
   lastTouchText,
-  meetingPeopleView,
   otherAttendeeTotal,
   personRowText,
   prepForEvent,
@@ -146,33 +145,4 @@ test('normalizeMeetingPrep keeps two grounded entries in either shape', () => {
   assert.equal(prepForEvent(prep, 'ev_c')?.people[0].line, 'kept')
   assert.equal(prepForEvent(prep, 'ev_x'), null)
   assert.equal(prepForEvent(prep, null), null)
-})
-
-test('meetingPeopleView shows five rows, prep lines first, declined last, "+N more"', () => {
-  const details = normalizeAttendeeDetails([
-    { email: 'alice@example.com', self: true },
-    { email: 'carol@example.com', name: 'Carol Example', relationship: 'contact', response: 'declined' },
-    { email: 'erin@example.org', name: 'Erin Example', relationship: 'correspondent', last_contact_ts: (NOW - 3 * DAY) / 1_000 },
-    { email: 'bob@example-fund.com', name: 'Bob Lee', org: 'Example Fund', relationship: 'colleague' },
-    { email: 'dana@example.org', name: 'Dana Example', relationship: 'new' },
-    { email: 'frank@example.org' },
-    { email: 'gina@example.org', name: 'Gina Example' }
-  ])
-  const prep = { eventKey: 'ev_a', people: [{ email: 'bob@example-fund.com', line: 'Colleague at Example Fund' }], talkingPoint: 'Ask about Q4.' }
-  const view = meetingPeopleView(details, 12, prep, NOW)
-  assert.deepEqual(
-    view.rows.map(row => row.text),
-    [
-      'Bob Lee — Example Fund · colleague',
-      "Erin Example — you've emailed · last email 3 days ago",
-      'Dana Example — first meeting',
-      'Frank',
-      'Gina Example'
-    ]
-  )
-  assert.equal(view.rows[0].prepLine, 'Colleague at Example Fund')
-  assert.equal(view.rows[1].prepLine, null)
-  assert.equal(view.overflow, 6)
-  assert.equal(view.talkingPoint, 'Ask about Q4.')
-  assert.equal(meetingPeopleView([], 0, null, NOW).rows.length, 0)
 })

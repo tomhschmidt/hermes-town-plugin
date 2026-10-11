@@ -1,5 +1,7 @@
+import type { ReactNode } from 'react'
+
 import { normalizeAttendeeDetails, normalizeMeetingPrep } from '../shared/people.ts'
-import { meetingPeopleView, prepForEvent } from './lib/people.ts'
+import { meetingPeopleSummary, prepForEvent } from './lib/people.ts'
 
 /**
  * The slice of a schedule event MeetingPeople reads. Either the town-home
@@ -20,7 +22,6 @@ export interface MeetingPeopleProps {
   event: MeetingPeopleEvent | null | undefined
   /** The day brief's ``prep`` list (or one entry); matched by event key. */
   prep?: unknown
-  now?: number
 }
 
 function countValue(value: unknown): number | null {
@@ -28,45 +29,55 @@ function countValue(value: unknown): number | null {
 }
 
 /**
- * Who is in a meeting (S2): up to five attendees as
- * "Name — org · relationship · last touch", each with its prep line when the
- * day brief has one, then "+N more" from the true attendee total.
+ * Who is in a meeting (S2, reshaped by U13), as one muted line: up to three
+ * non-colleagues by name, colleagues grouped per org ("8 Example Co
+ * colleagues"), then "+N more" — plus prep lines for the people named.
  */
-export function MeetingPeople({ event, prep, now }: MeetingPeopleProps) {
+export function MeetingPeople({ event, prep }: MeetingPeopleProps) {
   const details = normalizeAttendeeDetails(event?.attendeeDetails ?? event?.attendees)
   const rawKey = event?.eventKey ?? event?.event_key
   const eventKey = typeof rawKey === 'string' ? rawKey : null
-  const view = meetingPeopleView(
+  const summary = meetingPeopleSummary(
     details,
     countValue(event?.attendeeCount ?? event?.attendee_count),
-    prepForEvent(normalizeMeetingPrep(prep), eventKey),
-    now ?? Date.now()
+    prepForEvent(normalizeMeetingPrep(prep), eventKey)
   )
-  if (view.rows.length === 0) {
+  if (!summary.text) {
     return null
   }
 
+  const parts: Array<{ key: string; node: ReactNode }> = [
+    ...summary.people.map(person => ({
+      key: `person-${person.key}`,
+      node: (
+        <>
+          <span className="text-(--ui-text-secondary)">{person.name}</span>
+          {person.detail ? ` ${person.detail}` : null}
+        </>
+      )
+    })),
+    ...summary.colleagues.map(phrase => ({ key: `colleagues-${phrase}`, node: phrase })),
+    ...(summary.overflow > 0 ? [{ key: 'overflow', node: `+${summary.overflow} more` }] : [])
+  ]
+
   return (
-    <div className="min-w-0 space-y-1">
-      {view.rows.map(row => (
-        <div className="min-w-0" key={row.key}>
-          <p className="truncate text-xs text-(--ui-text-secondary)" title={row.text}>
-            <span className="text-(--ui-text-primary)">{row.name}</span>
-            {row.detail ? ` — ${row.detail}` : null}
-          </p>
-          {row.prepLine ? (
-            <p className="truncate text-xs text-(--ui-text-tertiary)" title={row.prepLine}>
-              {row.prepLine}
-            </p>
-          ) : null}
-        </div>
-      ))}
-      {view.overflow > 0 ? (
-        <p className="text-xs text-(--ui-text-tertiary)">+{view.overflow} more</p>
-      ) : null}
-      {view.talkingPoint ? (
-        <p className="truncate text-xs text-(--ui-text-secondary)" title={view.talkingPoint}>
-          Talking point: {view.talkingPoint}
+    <div className="min-w-0 space-y-0.5 text-xs text-(--ui-text-tertiary)">
+      <p className="min-w-0" title={summary.text}>
+        {parts.map((part, index) => (
+          <span key={part.key}>
+            {index > 0 ? ' · ' : null}
+            {part.node}
+          </span>
+        ))}
+      </p>
+      {summary.people.map(person => person.prepLine ? (
+        <p className="truncate" key={`prep-${person.key}`} title={`${person.name}: ${person.prepLine}`}>
+          {person.name}: {person.prepLine}
+        </p>
+      ) : null)}
+      {summary.talkingPoint ? (
+        <p className="truncate text-(--ui-text-secondary)" title={summary.talkingPoint}>
+          Talking point: {summary.talkingPoint}
         </p>
       ) : null}
     </div>
