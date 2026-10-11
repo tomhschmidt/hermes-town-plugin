@@ -17,3 +17,39 @@ install -m 700 gateway/scripts/town-{gmail-scan,telegram-scan,calendar-scan,cura
 ```
 
 Cron jobs should reference the installed basenames, not paths in the checkout.
+
+## Python runtime
+
+Hermes cron runs `.py` scripts on the package manager's (PM) dependency
+environment interpreter. `town-gmail-scan.py`, `town-calendar-scan.py`, and
+`town-curate.py` bootstrap like `telegram-action-items-v2.py`: put
+`~/.hermes/hermes-agent` on `sys.path`, `import hermes_bootstrap`, then import
+agent and Google modules, all in-process. None of them re-executes itself or
+points at the pre-PM `hermes-agent` venv; loading that venv's Python against
+PM's packages fails on compiled modules
+(`No module named 'pydantic_core._pydantic_core'`).
+
+A manual run under another Python minor version (a pyenv or system `python3`)
+fails fast before touching any state: exit `3`, the usual stdout contract, and
+one stderr line naming the interpreter to use, resolved through PM's own API,
+for example:
+
+```text
+town-gmail-scan: Python 3.10 cannot load Hermes' managed environment (Python 3.14); run: <PM environment>/bin/python ~/.hermes/scripts/town-gmail-scan.py
+```
+
+On a Python too old to load Hermes' launcher modules at all, the line points
+at `hermes cron run <job_id>` instead.
+
+## Gmail watermark hold
+
+`town-gmail-scan.py` advances each account's inbox watermark only over
+messages whose labeling pass finished. When the classifier fails for a batch
+(skip reason `classifier_error`, exit `4`), the account's watermark stops at
+the newest handled message older than its oldest unclassified one, and the
+unclassified ids leave the 7-day lookback seen-list, so the next run sends
+them to the classifier again. Handled messages newer than the hold are
+re-scanned, and the labeler skips them again. The watermark never moves
+below its pre-run value (no backfill), sent-mail watermarks advance as before, and
+`watermarks_advanced` reports the saved state. Successful classification
+advances watermarks exactly as before; label removal is unchanged.

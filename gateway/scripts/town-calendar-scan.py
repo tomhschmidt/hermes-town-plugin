@@ -23,25 +23,48 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 HERMES_HOME = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")).expanduser()
 HERMES_AGENT = HERMES_HOME / "hermes-agent"
-HERMES_VENV_PYTHON = HERMES_AGENT / ".venv" / "bin" / "python"
-if not HERMES_VENV_PYTHON.exists():
-    HERMES_VENV_PYTHON = HERMES_AGENT / "venv" / "bin" / "python"
-
-# Hermes and Google dependencies live in the Hermes venv. Re-exec once so a
-# manual invocation matches cron execution.
-if (
-    HERMES_VENV_PYTHON.exists()
-    and Path(sys.executable).resolve() != HERMES_VENV_PYTHON.resolve()
-    and os.environ.get("HERMES_CALENDAR_SCAN_BOOTSTRAPPED") != "1"
-):
-    os.environ["HERMES_CALENDAR_SCAN_BOOTSTRAPPED"] = "1"
-    os.execv(
-        str(HERMES_VENV_PYTHON),
-        [str(HERMES_VENV_PYTHON), __file__, *sys.argv[1:]],
-    )
-
 if HERMES_AGENT.exists():
     sys.path.insert(0, str(HERMES_AGENT))
+
+
+def _foreign_python_error(
+    version: tuple[int, ...] = tuple(sys.version_info[:2]),
+) -> str | None:
+    """Name the managed command when this Python cannot load Hermes' packages.
+
+    hermes_bootstrap activates PM's dependency environment into the running
+    interpreter, so another Python minor version dies on its first compiled
+    import. Cron runs scripts on PM's interpreter; PM's own API names it.
+    """
+    try:
+        from pm.environments import committed_venv, venv_python, venv_python_version
+
+        environment = committed_venv(HERMES_AGENT)
+        wanted = venv_python_version(environment) if environment else None
+    except Exception as exc:
+        return (
+            f"Python {version[0]}.{version[1]} cannot load Hermes "
+            f"({type(exc).__name__}: {exc}); run it the way cron does: "
+            "hermes cron run <job_id>"
+        )
+    if wanted is None or tuple(version[:2]) == tuple(wanted):
+        return None
+    return (
+        f"Python {version[0]}.{version[1]} cannot load Hermes' managed environment "
+        f"(Python {wanted[0]}.{wanted[1]}); run: "
+        f"{venv_python(environment)} {Path(__file__).resolve()}"
+    )
+
+
+# Bootstrap BEFORE importing agent dependencies, exactly like
+# telegram-action-items-v2.py: PM activates its packages in this process.
+# Cron already runs scripts on PM's interpreter, so there is no re-exec here.
+_RUNTIME_ERROR = _foreign_python_error()
+if _RUNTIME_ERROR is None:
+    try:
+        import hermes_bootstrap  # noqa: F401
+    except Exception as exc:
+        _RUNTIME_ERROR = f"cannot bootstrap Hermes: {exc}"
 
 
 CALENDAR_SCOPES = {
@@ -465,6 +488,9 @@ def _run() -> tuple[int, dict[str, Any] | None]:
 
 
 def main() -> int:
+    if _RUNTIME_ERROR:
+        _eprint(f"town-calendar-scan: {_RUNTIME_ERROR}")
+        return 3
     code, payload = _run()
     if payload is not None:
         print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
