@@ -15,6 +15,12 @@ import {
 } from '@hermes/plugin-sdk'
 import { useEffect } from 'react'
 
+import {
+  normalizeAttendeeDetails,
+  normalizeMeetingPrep,
+  type AttendeeDetail,
+  type MeetingPrep
+} from '../shared/people.ts'
 import { refetchEventTypes, shouldRefetchForEvent } from '../shared/refetch-events.ts'
 import { gmailUrl, telegramChipLabel } from '../shared/sources.ts'
 import { waitForCuration } from './lib/refresh.ts'
@@ -61,6 +67,9 @@ interface ScheduleEvent {
   attendees: string[]
   attendeeCount: number | null
   multiDay: boolean
+  // S2: directory-enriched attendees (self/declined kept) and the prep key.
+  attendeeDetails: AttendeeDetail[]
+  eventKey: string | null
 }
 
 interface DayBriefCallout {
@@ -79,6 +88,7 @@ interface DayBrief {
   callouts: DayBriefCallout[]
   trip: DayBriefTrip | null
   generatedAt: number | null
+  prep: MeetingPrep[]
 }
 
 type SuggestionKind = 'followup' | 'digest' | 'maintenance'
@@ -366,7 +376,9 @@ function normalizeSchedule(value: unknown): ScheduleEvent[] {
         conference: stringValue(event.conference).trim() || null,
         attendees,
         attendeeCount: typeof rawCount === 'number' && Number.isFinite(rawCount) ? rawCount : null,
-        multiDay: event.multi_day === true
+        multiDay: event.multi_day === true,
+        attendeeDetails: normalizeAttendeeDetails(event.attendees),
+        eventKey: stringValue(event.event_key).trim() || null
       })
     }
   }
@@ -404,7 +416,8 @@ function normalizeDayBrief(value: unknown): DayBrief | null {
     daySummary,
     callouts,
     trip,
-    generatedAt: timestampValue(brief.generated_at ?? brief.generatedAt)
+    generatedAt: timestampValue(brief.generated_at ?? brief.generatedAt),
+    prep: normalizeMeetingPrep(brief.prep)
   }
 }
 

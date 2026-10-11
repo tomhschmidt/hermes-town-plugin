@@ -14,6 +14,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -484,6 +485,39 @@ def _hold_unclassified_watermarks(
             ]
 
 
+_ADDRESS_RE = re.compile(r"[^@\s<>\"',;()]+@[^@\s<>\"',;()]+")
+
+
+def _refresh_people(
+    scanner: Any,
+    gmail_services: dict[str, Any],
+    inbound: list[dict[str, Any]],
+    outbound: list[dict[str, Any]],
+    known_contacts: list[str],
+) -> None:
+    """Refresh the S2 people directory; never changes the exit code or stdout.
+
+    Runs before the scan's own errors are printed, so a failing run's last
+    ``town-gmail-scan:`` line (the health detail) is still the scan's error.
+    """
+    refresh = getattr(scanner, "refresh_people", None)
+    if refresh is None or not gmail_services:
+        return
+    try:
+        refresh(
+            HERMES_HOME,
+            time.time(),
+            gmail_services=gmail_services,
+            inbound=inbound,
+            outbound=outbound,
+            known_contacts=known_contacts,
+            log=lambda line: _eprint(f"town-gmail-scan: people refresh: {line}"),
+        )
+    except Exception as exc:
+        detail = _ADDRESS_RE.sub("<address>", " ".join(str(exc).split()))[:160]
+        _eprint(f"town-gmail-scan: people refresh failed ({type(exc).__name__}: {detail})")
+
+
 def _run(
     load_call_llm: Callable[[], Callable[..., Any]],
 ) -> tuple[int, dict[str, Any]]:
@@ -636,6 +670,10 @@ def _run(
                     before_watermarks, _watermark_snapshot(state)
                 ),
             }
+
+            _refresh_people(
+                scanner, gmail_services, candidates, labeling_candidates, known_contacts
+            )
 
             try:
                 _save_state(state)

@@ -40,6 +40,7 @@ The required installed layout is:
     |-- dist/index.js
     |-- google_scan.py
     |-- operator_profile.py
+    |-- people.py
     `-- plugin_api.py
 ```
 
@@ -76,8 +77,10 @@ main model). Kill switches: `hermes cron pause <job>` and
 State files: `feed-state.json` (v5 — product state only: items,
 decisions, suggestions, next_event) plus script-local
 `~/.hermes/town-feed/{gmail,telegram}-state.json` (watermarks,
-known-correspondent cache, labeling audit log). Google tokens are owned
-by the google-workspace skill; scripts refresh in memory only.
+known-correspondent cache, labeling audit log), and the people directory
+`~/.hermes/town-feed/people-cache.json` (written by `town-gmail-scan`, read by
+`town-calendar-scan` and the curator; see `gateway/scripts/README.md`). Google
+tokens are owned by the google-workspace skill; scripts refresh in memory only.
 
 ## Operator profile (`~/.hermes/town-feed/operator.json`)
 

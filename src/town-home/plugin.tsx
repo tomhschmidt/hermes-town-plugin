@@ -41,9 +41,16 @@ import {
 import type * as React from 'react'
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 
+import {
+  normalizeAttendeeDetails,
+  normalizeMeetingPrep,
+  type AttendeeDetail,
+  type MeetingPrep
+} from '../shared/people.ts'
 import { refetchEventTypes, shouldRefetchForEvent, type RefetchTopic } from '../shared/refetch-events.ts'
 import { gmailUrl, telegramChipLabel } from '../shared/sources.ts'
 import { isInternalTownJob } from './lib/jobs.ts'
+import { scheduleAttendeeSummary } from './lib/people.ts'
 import { humanRunStatus, runOutputPreview, runStatusTone, stripMarkdownToText } from './lib/run-output.ts'
 
 const MIN_POLL_INTERVAL_MS = 15_000
@@ -394,6 +401,10 @@ interface TownScheduleEvent {
   conference: string | null
   attendees: string[]
   multiDay: boolean
+  // S2: directory-enriched attendees (self/declined kept), true total, prep key.
+  attendeeDetails: AttendeeDetail[]
+  attendeeCount: number | null
+  eventKey: string | null
 }
 
 interface TownDayBriefCallout {
@@ -411,6 +422,7 @@ interface TownDayBrief {
   daySummary: string
   callouts: TownDayBriefCallout[]
   trip: TownDayBriefTrip | null
+  prep: MeetingPrep[]
 }
 
 type TownSuggestionKind = 'followup' | 'digest' | 'maintenance'
@@ -727,6 +739,7 @@ function normalizeTownSchedule(value: unknown): TownScheduleEvent[] {
         const display = stringValue(attendee.name).trim() || stringValue(attendee.email).trim()
         return display ? [display] : []
       }).slice(0, 8)
+      const attendeeCount = event.attendeeCount ?? event.attendee_count
       schedule.push({
         account,
         allDay,
@@ -736,7 +749,10 @@ function normalizeTownSchedule(value: unknown): TownScheduleEvent[] {
         location: stringValue(event.location).trim() || null,
         conference: stringValue(event.conference).trim() || null,
         attendees,
-        multiDay: event.multiDay === true || event.multi_day === true
+        multiDay: event.multiDay === true || event.multi_day === true,
+        attendeeDetails: normalizeAttendeeDetails(event.attendeeDetails ?? event.attendees),
+        attendeeCount: typeof attendeeCount === 'number' && Number.isFinite(attendeeCount) ? attendeeCount : null,
+        eventKey: stringValue(event.eventKey ?? event.event_key).trim() || null
       })
     }
   }
@@ -770,7 +786,7 @@ function normalizeTownDayBrief(value: unknown): TownDayBrief | null {
       }
     : null
 
-  return { daySummary, callouts, trip }
+  return { daySummary, callouts, trip, prep: normalizeMeetingPrep(brief.prep) }
 }
 
 function normalizeTownFeedState(value: unknown): TownFeedState {
@@ -1762,7 +1778,7 @@ function ScheduleDialog({ schedule }: { schedule: TownScheduleEvent[] }) {
                     const detailParts = [
                       event.conference,
                       event.location,
-                      event.attendees.length > 0 ? `with ${event.attendees.slice(0, 3).join(', ')}${event.attendees.length > 3 ? ` +${event.attendees.length - 3}` : ''}` : null
+                      scheduleAttendeeSummary(event.attendeeDetails, event.attendeeCount)
                     ].filter((part): part is string => Boolean(part))
                     const details = detailParts.join(' · ')
 

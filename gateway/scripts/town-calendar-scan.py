@@ -18,7 +18,7 @@ import re
 import sys
 from datetime import date, datetime, time as datetime_time, timedelta, timezone, tzinfo
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 from zoneinfo import ZoneInfo
 
 
@@ -81,6 +81,8 @@ HOLIDAY_CALENDAR_SUFFIX = "#holiday@group.v.calendar.google.com"
 CONFIG_PATH = HERMES_HOME / "config.yaml"
 OPERATOR_PROFILE_PATH = HERMES_HOME / "plugins" / "town-feed" / "dashboard" / "operator_profile.py"
 _OPERATOR_PROFILE_MODULE_NAME = "hermes_town_calendar_operator_profile"
+PEOPLE_PATH = HERMES_HOME / "plugins" / "town-feed" / "dashboard" / "people.py"
+_PEOPLE_MODULE_NAME = "hermes_town_calendar_people"
 
 # Google eventType values that are real commitments: NTK candidates and
 # next_event come only from these. fromGmail rows are reservations Google
@@ -315,10 +317,14 @@ def _attendees(event: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
-def _attendee_entries(*events: dict[str, Any]) -> tuple[list[dict[str, Any]], int]:
+def _attendee_entries(
+    *events: dict[str, Any], self_addresses: frozenset[str] | set[str] = frozenset()
+) -> tuple[list[dict[str, Any]], int]:
     """Attendee union across copies of one event, keyed by email (else name).
 
     Returns at most MAX_ATTENDEE_ENTRIES entries and the TRUE union size.
+    The operator's own addresses are flagged ``self`` and survive the cap, so
+    consumers can count the other attendees exactly.
     """
     merged: dict[str, dict[str, Any]] = {}
     anonymous = 0
@@ -339,14 +345,22 @@ def _attendee_entries(*events: dict[str, Any]) -> tuple[list[dict[str, Any]], in
             response = str(attendee.get("responseStatus") or "").strip()
             if response:
                 entry.setdefault("response", response)
-            if attendee.get("self") is True:
+            if attendee.get("self") is True or (email and email in self_addresses):
                 entry["self"] = True
         anonymous = max(anonymous, unnamed)
     entries = [
         {field: entry[field] for field in ("email", "name", "response", "self") if field in entry}
         for entry in merged.values()
     ]
-    return entries[:MAX_ATTENDEE_ENTRIES], len(entries) + anonymous
+    if len(entries) > MAX_ATTENDEE_ENTRIES:
+        own = [index for index, entry in enumerate(entries) if entry.get("self")]
+        own = own[:MAX_ATTENDEE_ENTRIES]
+        others = [index for index, entry in enumerate(entries) if not entry.get("self")]
+        keep = set(own) | set(others[: MAX_ATTENDEE_ENTRIES - len(own)])
+        capped = [entry for index, entry in enumerate(entries) if index in keep]
+    else:
+        capped = entries
+    return capped, len(entries) + anonymous
 
 
 def _has_other_attendee(events: list[dict[str, Any]], self_addresses: set[str]) -> bool:
@@ -418,6 +432,7 @@ def _enriched_event_row(
     start: datetime,
     end: datetime,
     all_day: bool,
+    self_addresses: frozenset[str] | set[str] = frozenset(),
 ) -> dict[str, Any]:
     row: dict[str, Any] = {
         "summary": _compact(event.get("summary"), 160) or "(untitled event)",
@@ -437,7 +452,7 @@ def _enriched_event_row(
     location = _compact(event.get("location"), 240)
     if location:
         row["location"] = location
-    attendees, attendee_count = _attendee_entries(event)
+    attendees, attendee_count = _attendee_entries(event, self_addresses=self_addresses)
     if attendees:
         row["attendees"] = attendees
         row["attendee_count"] = attendee_count
@@ -535,14 +550,64 @@ def _group_duplicates(items: list[dict[str, Any]]) -> list[list[dict[str, Any]]]
     return [groups[root] for root in sorted(groups)]
 
 
+def _operator_profile(accounts: Iterable[str]) -> dict[str, Any] | None:
+    """The installed plugin's operator profile (with connected accounts), if any."""
+    if not OPERATOR_PROFILE_PATH.is_file():
+        return None
+    try:
+        spec = importlib.util.spec_from_file_location(
+            _OPERATOR_PROFILE_MODULE_NAME, OPERATOR_PROFILE_PATH
+        )
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        profile = module.load_operator_profile(HERMES_HOME, account_addresses=list(accounts))
+    except Exception:
+        return None
+    return profile if isinstance(profile, dict) else None
+
+
+def _people_enricher(accounts: Iterable[str]) -> Callable[[dict[str, Any]], dict[str, Any]] | None:
+    """Directory-backed attendee enrichment (S2); None without a people cache.
+
+    Reads ``people-cache.json`` through the installed plugin's ``people.py``.
+    A missing module or cache means no enrichment, never a failed scan.
+    """
+    if not PEOPLE_PATH.is_file():
+        return None
+    try:
+        spec = importlib.util.spec_from_file_location(_PEOPLE_MODULE_NAME, PEOPLE_PATH)
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        directory = module.load_directory(HERMES_HOME)
+    except Exception:
+        return None
+    if not directory:
+        return None
+    profile = _operator_profile(accounts) or {"self_addresses": sorted(accounts)}
+
+    def enrich(attendee: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return module.enrich_attendee(attendee, directory, profile)
+        except Exception:
+            return attendee
+
+    return enrich
+
+
 def _build_payload(
     entries: Iterable[tuple[str, str, dict[str, Any]]],
     now: datetime,
     accounts: Iterable[str] = (),
+    enrich_attendee: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     """Turn raw ``(account, calendar name, Google event)`` rows into the scan payload.
 
     Pure apart from resolving the operator's time zone; ``now`` is injected.
+    ``enrich_attendee`` (S2) adds directory facts to each non-self attendee.
     """
     user_tz = _user_timezone()
     self_addresses = {str(account).strip().casefold() for account in accounts}
@@ -587,6 +652,7 @@ def _build_payload(
                 start=item["start"],
                 end=item["end"],
                 all_day=item["all_day"],
+                self_addresses=self_addresses,
             )
             for item in group
         ]
@@ -595,7 +661,7 @@ def _build_payload(
             calendars = list(dict.fromkeys(item["calendar"] for item in group))
             if len(calendars) > 1:
                 row["calendars"] = calendars
-            attendees, attendee_count = _attendee_entries(*events)
+            attendees, attendee_count = _attendee_entries(*events, self_addresses=self_addresses)
             if attendees:
                 row["attendees"] = attendees
                 row["attendee_count"] = attendee_count
@@ -603,6 +669,8 @@ def _build_payload(
                 value = next((copy[field] for copy in rows if copy.get(field)), None)
                 if value and field not in row:
                     row[field] = value
+        if enrich_attendee is not None and row.get("attendees"):
+            row["attendees"] = [enrich_attendee(attendee) for attendee in row["attendees"]]
         # Ongoing events count too: an in-progress multi-day hotel stay is
         # the downstream trip signal, not a past event.
         upcoming.append((start, row))
@@ -743,7 +811,7 @@ def _run() -> tuple[int, dict[str, Any] | None]:
         _eprint(f"town-calendar-scan: Calendar API failure: {error}")
     if fatal_errors:
         return 5, None
-    return 0, _build_payload(entries, now, seen_accounts)
+    return 0, _build_payload(entries, now, seen_accounts, _people_enricher(seen_accounts))
 
 
 def main() -> int:
