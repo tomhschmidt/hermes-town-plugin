@@ -887,6 +887,64 @@ def _town_scan_schedule_events(output: str) -> Optional[list[dict[str, Any]]]:
     return _normalize_schedule_events(payload.get("events"))
 
 
+_CRON_ERROR_NOISE = (
+    re.compile(r"^Plugin \S.*?: unknown kind\b"),
+    re.compile(r"^providers\.\S+?: unknown config keys\b"),
+    re.compile(r"^Script exited with code -?\d+$"),
+)
+_CRON_SCRIPT_PREFIX = re.compile(r"^town-[\w.-]+:\s+")
+MAX_CRON_DETAIL = 80
+
+
+def _cap_cron_detail(detail: str) -> str:
+    if len(detail) <= MAX_CRON_DETAIL:
+        return detail
+    # "context: wrapper: cause" chains: elide the wrappers nearest the cause
+    # so both the failing step and the root error stay visible.
+    parts = detail.split(": ")
+    if len(parts) > 2:
+        head = parts[:-1]
+        while len(head) > 1:
+            head = head[:-1]
+            elided = ": ".join(head) + ": … " + parts[-1]
+            if len(elided) <= MAX_CRON_DETAIL:
+                return elided
+    return detail[: MAX_CRON_DETAIL - 3].rstrip() + "..."
+
+
+def _cron_failure_detail(error: Any, status: str) -> str:
+    """The most specific line of a failed town-* script run, capped at 80 chars.
+
+    Hermes stores a failed script as ``Script exited with code N`` followed by
+    ``stderr:`` and ``stdout:`` sections. Plugin-loader warnings and the stdout
+    JSON contract are noise; the script's own ``town-…:`` line names the real
+    error, else the last remaining line does, else the job status.
+    """
+    sections: dict[str, list[str]] = {"": [], "stderr": [], "stdout": []}
+    section = ""
+    for raw_line in str(error or "").splitlines():
+        line = " ".join(raw_line.split())
+        if line in {"stderr:", "stdout:"}:
+            section = line[:-1]
+            continue
+        if line and not any(pattern.match(line) for pattern in _CRON_ERROR_NOISE):
+            sections[section].append(line)
+    stdout = sections["stdout"]
+    if stdout and stdout[0].startswith(("{", "[")):
+        stdout = []
+    stderr = sections[""] + sections["stderr"]
+    lines = stderr + stdout
+    detail = next(
+        (
+            _CRON_SCRIPT_PREFIX.sub("", line, count=1) or line
+            for line in reversed(stderr)
+            if line.startswith("town-")
+        ),
+        lines[-1] if lines else " ".join(str(status or "").split()),
+    )
+    return _cap_cron_detail(detail)
+
+
 def _scan_cron(
     now: float,
 ) -> tuple[
@@ -931,9 +989,7 @@ def _scan_cron(
                 continue
             job_id = str(job.get("id") or "unknown")
             if is_town_failure:
-                detail = " ".join(str(job.get("last_error") or status).split())
-                if len(detail) > 80:
-                    detail = detail[:77].rstrip() + "..."
+                detail = _cron_failure_detail(job.get("last_error"), status)
                 health_item = _candidate(
                     source=f"cron:{job_id}",
                     headline=f"{name} failing — {detail}",

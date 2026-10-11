@@ -25,25 +25,48 @@ from typing import Any, Callable, Iterator
 
 HERMES_HOME = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")).expanduser()
 HERMES_AGENT = HERMES_HOME / "hermes-agent"
-HERMES_VENV_PYTHON = HERMES_AGENT / ".venv" / "bin" / "python"
-if not HERMES_VENV_PYTHON.exists():
-    HERMES_VENV_PYTHON = HERMES_AGENT / "venv" / "bin" / "python"
-
-# Hermes and Google dependencies live in the Hermes venv. Re-exec once so a
-# manual `python3 ~/.hermes/scripts/town-gmail-scan.py` matches cron execution.
-if (
-    HERMES_VENV_PYTHON.exists()
-    and Path(sys.executable).resolve() != HERMES_VENV_PYTHON.resolve()
-    and os.environ.get("HERMES_GMAIL_SCAN_BOOTSTRAPPED") != "1"
-):
-    os.environ["HERMES_GMAIL_SCAN_BOOTSTRAPPED"] = "1"
-    os.execv(
-        str(HERMES_VENV_PYTHON),
-        [str(HERMES_VENV_PYTHON), __file__, *sys.argv[1:]],
-    )
-
 if HERMES_AGENT.exists():
     sys.path.insert(0, str(HERMES_AGENT))
+
+
+def _foreign_python_error(
+    version: tuple[int, ...] = tuple(sys.version_info[:2]),
+) -> str | None:
+    """Name the managed command when this Python cannot load Hermes' packages.
+
+    hermes_bootstrap activates PM's dependency environment into the running
+    interpreter, so another Python minor version dies on its first compiled
+    import. Cron runs scripts on PM's interpreter; PM's own API names it.
+    """
+    try:
+        from pm.environments import committed_venv, venv_python, venv_python_version
+
+        environment = committed_venv(HERMES_AGENT)
+        wanted = venv_python_version(environment) if environment else None
+    except Exception as exc:
+        return (
+            f"Python {version[0]}.{version[1]} cannot load Hermes "
+            f"({type(exc).__name__}: {exc}); run it the way cron does: "
+            "hermes cron run <job_id>"
+        )
+    if wanted is None or tuple(version[:2]) == tuple(wanted):
+        return None
+    return (
+        f"Python {version[0]}.{version[1]} cannot load Hermes' managed environment "
+        f"(Python {wanted[0]}.{wanted[1]}); run: "
+        f"{venv_python(environment)} {Path(__file__).resolve()}"
+    )
+
+
+# Bootstrap BEFORE importing agent dependencies, exactly like
+# telegram-action-items-v2.py: PM activates its packages in this process.
+# Cron already runs scripts on PM's interpreter, so there is no re-exec here.
+_RUNTIME_ERROR = _foreign_python_error()
+if _RUNTIME_ERROR is None:
+    try:
+        import hermes_bootstrap  # noqa: F401
+    except Exception as exc:
+        _RUNTIME_ERROR = f"cannot bootstrap Hermes: {exc}"
 
 
 PLUGIN_PATH = HERMES_HOME / "plugins" / "town-feed" / "dashboard" / "google_scan.py"
@@ -384,6 +407,83 @@ def _watermarks_advanced(
     return False
 
 
+def _hold_unclassified_watermarks(
+    state: dict[str, Any],
+    before: dict[str, dict[str, int]],
+    labeling_candidates: list[dict[str, Any]],
+    skipped: list[dict[str, Any]],
+) -> None:
+    """Keep messages the classifier failed on retryable by the next run.
+
+    scan_gmail advances an account's inbox watermark to its newest listed
+    message before labeling runs. When the classifier fails, pull it back to
+    the newest handled message older than the account's oldest unclassified
+    one (never below the pre-run watermark: no backfill), and drop the
+    unclassified ids from the lookback seen-list. Sent watermarks are left
+    alone: outbound mail never reaches the classifier.
+    """
+    unclassified: dict[str, set[str]] = {}
+    for item in skipped:
+        if item.get("reason") != "classifier_error":
+            continue
+        account = str(item.get("account") or "").strip().casefold()
+        message_id = str(item.get("message_id") or "").strip()
+        if account and message_id:
+            unclassified.setdefault(account, set()).add(message_id)
+    if not unclassified:
+        return
+
+    dates: dict[str, dict[str, int]] = {}
+    for candidate in labeling_candidates:
+        if not isinstance(candidate, dict):
+            continue
+        account = str(candidate.get("account") or "").strip().casefold()
+        message_id = str(candidate.get("message_id") or "").strip()
+        try:
+            internal_date = max(0, int(candidate.get("internal_date") or 0))
+        except (TypeError, ValueError):
+            internal_date = 0
+        if account and message_id:
+            dates.setdefault(account, {})[message_id] = internal_date
+
+    source_state = state.setdefault("source_state", {})
+    watermarks = source_state.get("gmail")
+    if not isinstance(watermarks, dict):
+        watermarks = source_state["gmail"] = {}
+    lookback_seen = state.get("lookback_seen")
+    lookback_seen = lookback_seen if isinstance(lookback_seen, dict) else {}
+    for account, message_ids in unclassified.items():
+        previous = before.get("gmail", {}).get(account, 0)
+        account_dates = dates.get(account, {})
+        # An unknown date cannot be placed, so it holds the whole account.
+        pending = [
+            account_dates.get(message_id, 0) or previous + 1
+            for message_id in message_ids
+        ]
+        pending = [internal_date for internal_date in pending if internal_date > previous]
+        if pending:
+            oldest = min(pending)
+            handled = [
+                internal_date
+                for message_id, internal_date in account_dates.items()
+                if message_id not in message_ids and previous < internal_date < oldest
+            ]
+            try:
+                current = max(0, int(watermarks.get(account) or 0))
+            except (TypeError, ValueError):
+                current = 0
+            held = min(current, max([previous, *handled]))
+            if held:
+                watermarks[account] = held
+            else:
+                watermarks.pop(account, None)
+        seen = lookback_seen.get(account)
+        if isinstance(seen, list):
+            lookback_seen[account] = [
+                message_id for message_id in seen if str(message_id) not in message_ids
+            ]
+
+
 def _run(
     load_call_llm: Callable[[], Callable[..., Any]],
 ) -> tuple[int, dict[str, Any]]:
@@ -463,6 +563,9 @@ def _run(
                 for item in summary.get("skipped", [])
                 if isinstance(item, dict)
             ]
+            _hold_unclassified_watermarks(
+                state, before_watermarks, labeling_candidates, skipped
+            )
             classifications = {
                 (
                     str(candidate.get("account") or "").strip().casefold(),
@@ -559,6 +662,11 @@ def _run(
 
 
 def main() -> int:
+    if _RUNTIME_ERROR:
+        _eprint(f"town-gmail-scan: {_RUNTIME_ERROR}")
+        print(json.dumps(_empty_payload(), ensure_ascii=False, separators=(",", ":")))
+        return 3
+
     def load_call_llm() -> Callable[..., Any]:
         from agent.auxiliary_client import call_llm
 

@@ -30,6 +30,16 @@ if HERMES_AGENT.exists() and str(HERMES_AGENT) not in sys.path:
 if str(DASHBOARD) not in sys.path:
     sys.path.insert(0, str(DASHBOARD))
 
+# Cron scripts import hermes_bootstrap at module level, as in production. The
+# real module activates PM state under ~/.hermes and, without cron's
+# HERMES_DISABLE_LAZY_INSTALLS=1, relaunches the process onto PM's store
+# Python, so in-process loads get an inert stand-in. Exercise the real
+# bootstrap only in a subprocess with HERMES_HOME pointed at a temp dir.
+if "hermes_bootstrap" not in sys.modules:
+    sys.modules["hermes_bootstrap"] = ModuleType(
+        "hermes_bootstrap", "Inert test stand-in (gateway/tests/support.py)."
+    )
+
 
 def load_module(path: Path, name: str) -> ModuleType:
     spec = importlib.util.spec_from_file_location(name, path)
