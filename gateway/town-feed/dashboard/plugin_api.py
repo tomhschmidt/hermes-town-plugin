@@ -2523,7 +2523,10 @@ def run_curator(llm: Any = None) -> dict[str, Any]:
             "thread_id",
             "chat_name",
             "last_sender",
+            "chat_type",
             "user_spoke_last",
+            "addressed_to_user",
+            "operator_replied_after_ask",
             "action_hint",
         ):
             if field in prior:
@@ -2683,11 +2686,18 @@ def run_curator(llm: Any = None) -> dict[str, Any]:
             for field in ("town_label", "town_label_confidence"):
                 if field in candidate:
                     merged_item[field] = candidate.get(field)
-            for field in ("body", "account", "thread_id", "chat_name", "last_sender", "action_hint"):
+            for field in (
+                "body", "account", "thread_id", "chat_name", "last_sender", "chat_type", "action_hint"
+            ):
                 if candidate.get(field):
                     merged_item[field] = candidate[field]
             if candidate.get("user_spoke_last") is True:
                 merged_item["user_spoke_last"] = True
+            # R1b attribution signals must survive retention so re-ranked chat
+            # items keep their addressing context.
+            for field in ("addressed_to_user", "operator_replied_after_ask"):
+                if isinstance(candidate.get(field), bool):
+                    merged_item[field] = candidate[field]
             candidate_open_loop_key = _open_loop_key(
                 candidate.get("account"), candidate.get("thread_id")
             )

@@ -3,7 +3,8 @@
 Source of truth is ``$HERMES_HOME/town-feed/operator.json`` (user-owned,
 never in the repo). Missing fields fall back to the structured lines of
 ``$HERMES_HOME/memories/USER.md`` (``**Name:**``, ``**What to call them:**``,
-``**Timezone:**``, ``**Telegram:**``), then to the system timezone. Only
+``**Timezone:**``, ``**Telegram:**``), then (timezone only) to Hermes
+``config.yaml`` ``timezone``, then to the system timezone. Only
 those structured fields are read: free-text memory never enters the profile.
 
 Loading is plain file reading: it never raises and never touches the
@@ -79,6 +80,20 @@ def _valid_timezone(value: Any) -> str:
     except Exception:
         return ""
     return words[0]
+
+
+def _config_timezone(home: Path) -> str:
+    """Hermes ``config.yaml`` top-level ``timezone`` (empty when unset)."""
+    try:
+        text = (home / "config.yaml").read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return ""
+    for line in text.splitlines():
+        match = re.match(r"timezone:(.*)$", line)
+        if match:
+            value = re.sub(r"\s+#.*$", "", match.group(1)).strip().strip("'\"")
+            return _valid_timezone(value)
+    return ""
 
 
 def _system_timezone() -> str:
@@ -178,6 +193,7 @@ def load_operator_profile(
         profile["home_timezone"] = (
             _valid_timezone(configured.get("home_timezone"))
             or _valid_timezone(memory.get("home_timezone"))
+            or _config_timezone(home)
             or _system_timezone()
         )
 

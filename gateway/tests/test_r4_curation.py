@@ -300,6 +300,12 @@ class OperatorProfileTest(unittest.TestCase):
         self.assertEqual(len(stderr.getvalue().splitlines()), 1)
         self.assertEqual(profile["assistant_senders"], [])
 
+    def test_config_yaml_timezone_precedes_system_timezone(self) -> None:
+        self.write("config.yaml", "model: x\ntimezone: 'Europe/Lisbon'  # home\n")
+        self.assertEqual(self.profile.load_operator_profile(self.home)["home_timezone"], "Europe/Lisbon")
+        self.write("config.yaml", "timezone: ''\n")
+        self.assertEqual(self.profile.load_operator_profile(self.home)["home_timezone"], "America/Chicago")
+
     def test_user_md_fallback_fields(self) -> None:
         self.write(
             "memories/USER.md",
@@ -502,6 +508,24 @@ class OneItemPerSourceTest(CuratorCase):
         self.assertEqual(len(served), 1)
         self.assertEqual(served[0]["id"], f"ntk_{newer['content_hash'][:16]}")
         self.assertEqual(len([i for i in self.state()["items"] if i["source"] == "telegram:500"]), 1)
+
+    def test_attribution_fields_survive_retention(self) -> None:
+        candidate = dict(
+            telegram_candidate(502, "c1", NOW - 600, "Can you send the deck?", "Bob"),
+            chat_type="group",
+            addressed_to_user=True,
+            operator_replied_after_ask=False,
+        )
+        self.cron.doc(TELEGRAM_JOB, 5, {"candidates": [candidate]})
+        self.api.run_curator(llm=None)
+        # Second cycle: no new docs, so the item re-enters only via retention.
+        self.api.run_curator(llm=None)
+
+        stored = [i for i in self.state()["items"] if i["source"] == "telegram:502"]
+        self.assertEqual(len(stored), 1)
+        self.assertEqual(stored[0]["chat_type"], "group")
+        self.assertIs(stored[0]["addressed_to_user"], True)
+        self.assertIs(stored[0]["operator_replied_after_ask"], False)
 
     def test_new_activity_after_a_dismissal_is_shown_and_the_dismissal_stays(self) -> None:
         older = telegram_candidate(501, "b1", NOW - DAY, "Lunch Tuesday?")
