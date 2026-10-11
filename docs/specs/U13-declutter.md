@@ -84,8 +84,13 @@ day-brief callout filter, suggestion dedupe), tests.
    that is prep for an Up-next event — its label starts with
    prep/prepare/get ready/join (case-insensitive) AND names (substring
    match on the event summary, ≥ 2 words or ≥ 6 chars) a meaningful event
-   starting within the next 18 hours — and drop a suggestion that names both
-   events of a `schedule_context` conflict (the conflict callout covers it).
+   starting within the next 18 hours, or names near-term events only
+   generically ("prepare for tonight's calls") — and drop a suggestion that
+   names both events of a `schedule_context` conflict ONLY when the day brief
+   being served has a `conflict` callout for that pair (otherwise the chip is
+   the only place the conflict shows). Events match by full summary or main
+   title ("Weekly Call - X leads" → "Weekly Call"); conflict pairs may use
+   short names since both must match. *(Amended 2026-10-11 after live runs.)*
    If filtering leaves fewer than 3, keep the remainder (no backfill).
 10. Desktop: suggestion rows are plain rows (no glyph bubble); the hover
     affordance (arrow/insert) stays.

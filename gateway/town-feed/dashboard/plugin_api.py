@@ -2482,8 +2482,11 @@ def _filter_suggestions(
     schedule_events: list[dict[str, Any]],
     schedule_context: Optional[dict[str, Any]],
     now: float,
+    callouts: Optional[list[dict[str, Any]]] = None,
 ) -> list[dict[str, str]]:
-    """Drop prep chips for an Up-next event and chips restating a conflict."""
+    """Drop prep chips for an Up-next event, and chips restating a conflict
+    that a day-brief conflict callout already shows (an uncovered conflict
+    keeps its chip so it is never shown nowhere)."""
     # Up next shows meaningful events under way or starting soon.
     upcoming: list[Any] = []
     for event in schedule_events:
@@ -2497,6 +2500,19 @@ def _filter_suggestions(
         (conflict.get("a"), conflict.get("b"))
         for conflict in (schedule_context or {}).get("conflicts") or []
         if isinstance(conflict, dict)
+    ]
+    callout_texts = [
+        _suggestion_text(callout.get("text"))
+        for callout in callouts or []
+        if isinstance(callout, dict) and callout.get("kind") == "conflict"
+    ]
+    conflicts = [
+        (a, b)
+        for a, b in conflicts
+        if any(
+            _names_event(text, a, distinctive=False) or _names_event(text, b, distinctive=False)
+            for text in callout_texts
+        )
     ]
     kept: list[dict[str, str]] = []
     for suggestion in suggestions:
@@ -2730,9 +2746,9 @@ def _llm_rank(
                 "location, conference, organizer, and attendees to make prep chips "
                 "concrete, and when first_contact_attendees is present you may note "
                 "there is no prior email history with them (never claim that "
-                "otherwise); and (5) schedule_pressure: overlapping events are "
-                "already called out on the dashboard, so never make a pick-a-priority "
-                "chip for them; venue_changes with tight gaps deserve a travel-buffer "
+                "otherwise); and (5) schedule_pressure: overlapping events or tight "
+                "start clusters deserve one pick-a-priority chip naming the competing "
+                "events, and venue_changes with tight gaps deserve a travel-buffer "
                 "chip naming both venues — never invent travel durations. NEVER "
                 "suggest preparation for personal reminders or routine logistics "
                 "(medication, food deliveries, chores, recurring personal tasks) — "
@@ -3325,9 +3341,7 @@ def run_curator(llm: Any = None) -> dict[str, Any]:
         if llm_rows:
             ranking_mode = "llm"
             if suggestions:
-                llm_suggestions = _filter_suggestions(
-                    suggestions, schedule_events, schedule_context, now
-                )
+                llm_suggestions = suggestions
             for candidate in candidates:
                 row = llm_rows.get(candidate["key"])
                 if row:
@@ -3397,6 +3411,17 @@ def run_curator(llm: Any = None) -> dict[str, Any]:
                     errors.append(f"day_brief: {day_brief_error}")
         else:
             day_brief = None
+
+    # U13: filtered after the day brief is settled, so a conflict chip is
+    # dropped only when a callout in the brief being served already shows it.
+    if llm_suggestions is not None:
+        llm_suggestions = _filter_suggestions(
+            llm_suggestions,
+            schedule_events,
+            schedule_context,
+            now,
+            callouts=(day_brief or {}).get("callouts") if isinstance(day_brief, dict) else None,
+        )
 
     with _process_lock():
         state = _read_state_unlocked()

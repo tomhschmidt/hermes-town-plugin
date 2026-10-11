@@ -156,6 +156,7 @@ class BriefLLM:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
         self.suggestions: list[dict[str, str]] = []
+        self.conflict_callout = True
 
     def complete_structured(self, **kwargs: Any) -> Any:
         data = json.loads(kwargs["input"][0]["text"])
@@ -167,8 +168,8 @@ class BriefLLM:
                 "day_summary": "Light day — 2 meetings.",
                 "callouts": [
                     {"kind": "timezone", "text": "Gala is 9:00 PM ET, which is 6:00 PM Pacific."},
-                    {"kind": "conflict", "text": "Design review overlaps Lunch at 12:30 PM."},
-                ],
+                ] + ([{"kind": "conflict", "text": "Design review overlaps Lunch at 12:30 PM."}]
+                     if self.conflict_callout else []),
             })
         rows = data["ranking_candidates"] if isinstance(data, dict) else data
         return SimpleNamespace(parsed={
@@ -228,9 +229,12 @@ class DayBriefTimezoneTest(ApiCase):
 class SuggestionFilterTest(ApiCase):
     CONTEXT = {"conflicts": [{"a": "Design review", "b": "Lunch with Bob"}]}
 
+    CALLOUT = [{"kind": "conflict", "text": "Design review overlaps Lunch with Bob at 12:30 PM."}]
+
     def filtered(self, suggestions: list[dict[str, str]], events: list[dict[str, Any]],
-                 context: Optional[dict[str, Any]] = None) -> list[str]:
-        kept = self.api._filter_suggestions(suggestions, events, context, NOW)
+                 context: Optional[dict[str, Any]] = None,
+                 callouts: Optional[list[dict[str, Any]]] = None) -> list[str]:
+        kept = self.api._filter_suggestions(suggestions, events, context, NOW, callouts=callouts)
         return [entry["id"] for entry in kept]
 
     def test_prep_for_an_event_in_3h_is_dropped(self) -> None:
@@ -261,14 +265,21 @@ class SuggestionFilterTest(ApiCase):
     def test_conflict_pair_dropped_but_single_mention_kept(self) -> None:
         both = suggestion("both", "Pick between Design review and Lunch with Bob", "maintenance")
         one = suggestion("one", "Send Bob the agenda for Lunch with Bob")
-        self.assertEqual(self.filtered([both, one], [], self.CONTEXT), ["one"])
+        self.assertEqual(self.filtered([both, one], [], self.CONTEXT, self.CALLOUT), ["one"])
+
+    def test_conflict_chip_kept_when_no_callout_shows_the_conflict(self) -> None:
+        both = suggestion("both", "Pick between Design review and Lunch with Bob", "maintenance")
+        self.assertEqual(self.filtered([both], [], self.CONTEXT), ["both"])
+        prep_callout = [{"kind": "prep", "text": "Design review notes are in the shared folder."}]
+        self.assertEqual(self.filtered([both], [], self.CONTEXT, prep_callout), ["both"])
 
     def test_conflict_named_by_main_titles_and_short_names_is_dropped(self) -> None:
         context = {"conflicts": [{"a": "Weekly Call - Alice leads", "b": "Lunch"}]}
         both = suggestion("both", "Resolve the Weekly Call and lunch overlap", "maintenance")
         lunch_only = suggestion("lunch", "Book lunch with Carol")
         call_only = suggestion("call", "Send the Weekly Call agenda")
-        self.assertEqual(self.filtered([both, lunch_only, call_only], [], context), ["lunch", "call"])
+        callout = [{"kind": "conflict", "text": "Your Weekly Call overlaps Lunch; pick a priority."}]
+        self.assertEqual(self.filtered([both, lunch_only, call_only], [], context, callout), ["lunch", "call"])
 
     def test_prep_matches_the_main_title(self) -> None:
         events = [row("Weekly Call - Alice leads", 3, 5, conference="Zoom")]
@@ -289,7 +300,7 @@ class SuggestionFilterTest(ApiCase):
             suggestion("reply", "Reply to Carol about the invoice"),
             suggestion("digest", "Summarize this week's investor updates", "digest"),
         ]
-        kept = self.api._filter_suggestions(suggestions, events, self.CONTEXT, NOW)
+        kept = self.api._filter_suggestions(suggestions, events, self.CONTEXT, NOW, callouts=self.CALLOUT)
         self.assertEqual(kept, suggestions[2:])
         self.assertIs(kept[0], suggestions[2])
 
@@ -371,6 +382,20 @@ class CuratorSuggestionTest(ApiCase):
         # Home (no travel evidence): the persisted brief has no timezone callout.
         self.assertEqual([callout["kind"] for callout in state["day_brief"]["callouts"]],
                          ["conflict"])
+
+    def test_conflict_chip_survives_when_the_brief_has_no_conflict_callout(self) -> None:
+        self.calendar_doc([
+            row("Design review", 2, 3, attendees=[SELF, BOB], location="Room 4"),
+            row("Lunch with Bob", 2.5, 3.5, attendees=[SELF, BOB]),
+        ])
+        llm = BriefLLM()
+        llm.conflict_callout = False
+        llm.suggestions = [
+            suggestion("conflict", "Pick between Design review and Lunch with Bob", "maintenance"),
+            suggestion("reply", "Reply to Carol about the invoice"),
+        ]
+        self.api.run_curator(llm=llm)
+        self.assertEqual([entry["id"] for entry in self.state()["suggestions"]], ["conflict", "reply"])
 
     def test_filtered_to_empty_replaces_the_previous_set(self) -> None:
         self.calendar_doc([row("Design review", 2, 3, attendees=[SELF, BOB], location="Room 4")])
