@@ -263,6 +263,18 @@ class SuggestionFilterTest(ApiCase):
         one = suggestion("one", "Send Bob the agenda for Lunch with Bob")
         self.assertEqual(self.filtered([both, one], [], self.CONTEXT), ["one"])
 
+    def test_conflict_named_by_main_titles_and_short_names_is_dropped(self) -> None:
+        context = {"conflicts": [{"a": "Weekly Call - Alice leads", "b": "Lunch"}]}
+        both = suggestion("both", "Resolve the Weekly Call and lunch overlap", "maintenance")
+        lunch_only = suggestion("lunch", "Book lunch with Carol")
+        call_only = suggestion("call", "Send the Weekly Call agenda")
+        self.assertEqual(self.filtered([both, lunch_only, call_only], [], context), ["lunch", "call"])
+
+    def test_prep_matches_the_main_title(self) -> None:
+        events = [row("Weekly Call - Alice leads", 3, 5, conference="Zoom")]
+        prep = suggestion("s1", "Prepare for the Weekly Call")
+        self.assertEqual(self.filtered([prep], events), [])
+
     def test_unrelated_untouched_and_no_backfill(self) -> None:
         events = [row("Example Gala Dinner", 3, 6, location="Example Hall")]
         suggestions = [

@@ -2446,12 +2446,28 @@ def _suggestion_text(value: Any) -> str:
     return " ".join(_SUGGESTION_NAME_SPLIT_RE.sub(" ", str(value or "")).casefold().split())
 
 
-def _names_event(label: str, summary: Any) -> bool:
-    """The label contains the event summary, when the summary is distinctive."""
-    name = _suggestion_text(summary)
-    if not name or (len(str(summary).split()) < 2 and len(name) < 6):
-        return False
-    return name in label
+_EVENT_TITLE_TAIL_RE = re.compile(r"\s+[-\u2013\u2014|]\s+.*$|\s*[:(].*$")
+
+
+def _event_names(summary: Any) -> list[str]:
+    """The full summary and its main title ("Weekly Call - Alice leads" ->
+    "weekly call"), both normalized; chips name events the short way."""
+    full = str(summary or "").strip()
+    names = [_suggestion_text(full), _suggestion_text(_EVENT_TITLE_TAIL_RE.sub("", full))]
+    return [name for index, name in enumerate(names) if name and name not in names[:index]]
+
+
+def _names_event(label: str, summary: Any, *, distinctive: bool = True) -> bool:
+    """The label names the event by its full summary or main title. A lone
+    event needs a distinctive name; a conflict pair (both must match) may use
+    short ones like "Lunch"."""
+    padded = f" {label} "
+    for name in _event_names(summary):
+        if distinctive and len(name.split()) < 2 and len(name) < 6:
+            continue
+        if len(name) >= 3 and f" {name} " in padded:
+            return True
+    return False
 
 
 def _filter_suggestions(
@@ -2483,7 +2499,10 @@ def _filter_suggestions(
             _names_event(label, summary) for summary in upcoming
         ):
             continue
-        if any(_names_event(label, a) and _names_event(label, b) for a, b in conflicts):
+        if any(
+            _names_event(label, a, distinctive=False) and _names_event(label, b, distinctive=False)
+            for a, b in conflicts
+        ):
             continue
         kept.append(suggestion)
     return kept
