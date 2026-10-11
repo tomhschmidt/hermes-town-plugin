@@ -170,6 +170,15 @@ def same_minute_dm():
     ]
 
 
+class DigestHeaderTest(unittest.TestCase):
+    def test_dm_header_marks_awaiting_reply_only_when_other_person_spoke_last(self):
+        waiting = analyze(DM_BOB, [msg(401, 0, "Can you intro me to Carol?", BOB)])
+        answered = analyze(DM_BOB, same_minute_dm())
+        self.assertIn("[awaiting your reply]", digest.chat_header(waiting))
+        self.assertNotIn("[awaiting your reply]", digest.chat_header(answered))
+        self.assertIn("[operator replied after last ask]", digest.chat_header(answered))
+
+
 class GroupAddressingTest(unittest.TestCase):
     def test_group_bob_asks_carol_replies_operator_silent_not_eligible(self):
         thread = analyze(GROUP, bob_asks_carol_replies())

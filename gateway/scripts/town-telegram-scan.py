@@ -35,7 +35,7 @@ MAX_CANDIDATES = 15
 STATE_VERSION = 1
 # Fallback operator name, used only when the daemon's /me is unavailable.
 # Attribution is by Telegram user id (/me), never by display name.
-OWNER_NAME = os.environ.get("TOWN_OWNER_NAME", "Tom Schmidt").strip()
+OWNER_NAME = os.environ.get("TOWN_OWNER_NAME", "").strip()
 MAX_BODY_MESSAGES = 12
 MAX_BODY_CHARS = 1200
 
@@ -350,6 +350,8 @@ def _scan(
     cutoff_ts = int((now - LOOKBACK).timestamp())
     operator = tg.resolve_operator(get_me(), OWNER_NAME)
     chats = get_chats(bot_user_id)
+    # The operator's own Saved Messages chat has their user id.
+    chats.pop(operator.user_id, None)
     active: list[tuple[int, int, dict[str, Any]]] = []
     newest_by_chat: dict[str, str] = {}
     ineligible: dict[str, str] = {}

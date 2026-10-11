@@ -232,7 +232,8 @@ def collect_threads(chats: dict, fetch_messages, operator, cutoff_ts: int) -> tu
 def chat_header(thread: dict) -> str:
     kind = f"[DM with {thread['counterpart']}]" if thread["kind"] == "dm" else "[group]"
     resolved = " [operator replied after last ask]" if thread["operator_replied_after_ask"] else ""
-    return f"=== {thread['title']} {kind}{resolved} ==="
+    awaiting = " [awaiting your reply]" if thread["kind"] == "dm" and not thread["user_spoke_last"] else ""
+    return f"=== {thread['title']} {kind}{resolved}{awaiting} ==="
 
 
 def render_sections(threads: list, tz=None) -> str:
@@ -281,7 +282,7 @@ Marker legend:
 - @you — the message mentions {you} (@username) or names them
 - [photo], [voice], [sticker], … — a media message, followed by its caption when present
 
-Messages are grouped by chat. Each chat section starts with a header, === <chat title> [DM with <name>] === or === <chat title> [group] ===, marked [operator replied after last ask] when {you} spoke after the latest message addressed to them. Messages follow in chronological order formatted as: [YYYY-MM-DD HH:MM] Sender Name: message text (the operator's own lines: [YYYY-MM-DD HH:MM] [YOU] message text).
+Messages are grouped by chat. Each chat section starts with a header, === <chat title> [DM with <name>] === or === <chat title> [group] ===, marked [operator replied after last ask] when {you} spoke after the latest message addressed to them, and [awaiting your reply] on a DM whose newest message is the other person's (rule 3 applies only if that message actually needs a reply). Messages follow in chronological order formatted as: [YYYY-MM-DD HH:MM] Sender Name: message text (the operator's own lines: [YYYY-MM-DD HH:MM] [YOU] message text).
 
 Format your response as a clean, Telegram-friendly Markdown bullet list (no intro sentence):
 🔵 *Chat Name* — _Sender_: brief description of what needs attention
