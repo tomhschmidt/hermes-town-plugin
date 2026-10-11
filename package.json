@@ -5,7 +5,10 @@
   "scripts": {
     "build": "node scripts/build.mjs",
     "deploy": "node scripts/deploy.mjs",
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit",
+    "test": "npm run test:desktop && npm run test:gateway",
+    "test:desktop": "node --test 'tests/desktop/**/*.test.ts'",
+    "test:gateway": "sh scripts/test-gateway.sh"
   },
   "devDependencies": {
     "@types/react": "^19.0.0",

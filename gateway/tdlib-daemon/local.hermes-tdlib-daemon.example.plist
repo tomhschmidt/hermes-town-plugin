@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template for ~/Library/LaunchAgents/local.hermes-tdlib-daemon.plist.
+  Render with the sed command in README.md: the HERMES_HOME placeholder is the
+  absolute Hermes home (e.g. /Users/<user>/.hermes), the TDLIB_PYTHON
+  placeholder is the python3 of the venv that has tdjson installed.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>local.hermes-tdlib-daemon</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__TDLIB_PYTHON__</string>
+    <string>__HERMES_HOME__/scripts/telegram-tdlib-daemon.py</string>
+    <string>start</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HERMES_HOME</key>
+    <string>__HERMES_HOME__</string>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>15</integer>
+  <key>WorkingDirectory</key>
+  <string>__HERMES_HOME__</string>
+  <key>StandardOutPath</key>
+  <string>__HERMES_HOME__/logs/tdlib-daemon.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HERMES_HOME__/logs/tdlib-daemon.log</string>
+</dict>
+</plist>

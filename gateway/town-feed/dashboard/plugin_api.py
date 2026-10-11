@@ -8,17 +8,19 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import importlib.util
 import json
 import math
 import os
 import re
+import sys
 import tempfile
 import threading
 import time
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import Any, Iterable, Iterator, Optional
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -52,6 +54,7 @@ MAX_KNOWN_CONTACTS = 2000
 DAY_BRIEF_MAX_CALLOUTS = 4
 DAY_BRIEF_STALE_SECONDS = 3 * 60 * 60
 DAY_BRIEF_REFRESH_SECONDS = 60 * 60
+DAY_BRIEF_OPENER_CHARS = 140
 SUGGESTION_KINDS = {"followup", "digest", "maintenance"}
 DAY_BRIEF_CALLOUT_KINDS = {"conflict", "travel", "timezone", "prep", "deadline", "trip"}
 BOARD_COLUMNS = (
@@ -125,6 +128,65 @@ def _lock_path() -> Path:
     return _plugin_root() / ".feed-state.lock"
 
 
+_OPERATOR_PROFILE_MODULE = "hermes_town_operator_profile"
+
+
+def _operator_profile_module() -> Optional[Any]:
+    """The sibling operator_profile.py, loaded by path like this module.
+
+    ``None`` when it cannot load: curation then runs without the profile's
+    self/assistant rules instead of failing.
+    """
+    cached = sys.modules.get(_OPERATOR_PROFILE_MODULE)
+    if cached is not None:
+        return cached
+    path = Path(__file__).resolve().with_name("operator_profile.py")
+    try:
+        spec = importlib.util.spec_from_file_location(_OPERATOR_PROFILE_MODULE, path)
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[_OPERATOR_PROFILE_MODULE] = module
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(_OPERATOR_PROFILE_MODULE, None)
+        return None
+    return module
+
+
+def _load_profile(accounts: Iterable[str] = ()) -> dict[str, Any]:
+    module = _operator_profile_module()
+    if module is None:
+        return {"self_addresses": [], "assistant_senders": []}
+    return module.load_operator_profile(get_hermes_home(), account_addresses=accounts)
+
+
+_WHERE_MODULE = "hermes_town_where"
+
+
+def _where_module() -> Optional[Any]:
+    """The sibling where.py (S1 location + meaningful-event rules), by path.
+
+    ``None`` when it cannot load: the feed then omits ``where`` and treats
+    every timed event as meaningful instead of failing.
+    """
+    cached = sys.modules.get(_WHERE_MODULE)
+    if cached is not None:
+        return cached
+    path = Path(__file__).resolve().with_name("where.py")
+    try:
+        spec = importlib.util.spec_from_file_location(_WHERE_MODULE, path)
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[_WHERE_MODULE] = module
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(_WHERE_MODULE, None)
+        return None
+    return module
+
+
 def _empty_state() -> dict[str, Any]:
     return {
         "version": STATE_VERSION,
@@ -139,7 +201,7 @@ def _empty_state() -> dict[str, Any]:
         "label_stats": {},
         "last_labeling_summary": None,
         "next_event": None,
-        "schedule": {"events": [], "generated_at": None, "context": None},
+        "schedule": {"events": [], "generated_at": None, "context": None, "recent_travel": []},
         "day_brief": None,
         "open_loop_suppressed": [],
     }
@@ -224,6 +286,11 @@ def _read_state_unlocked() -> dict[str, Any]:
             state["source_state"]["memory_hashes"] = {}
         state["source_state"].pop("gmail", None)
         state["source_state"].pop("gmail_sent", None)
+        cron_consumed = _merge_cron_consumed(state["source_state"].get("cron_consumed"), {})
+        if cron_consumed:
+            state["source_state"]["cron_consumed"] = cron_consumed
+        else:
+            state["source_state"].pop("cron_consumed", None)
     if not isinstance(state.get("last_curate_errors"), list):
         state["last_curate_errors"] = []
     else:
@@ -252,6 +319,7 @@ def _read_state_unlocked() -> dict[str, Any]:
             _iso_timestamp(schedule_generated_at) if schedule_generated_at else None
         ),
         "context": dict(raw_context) if isinstance(raw_context, dict) else None,
+        "recent_travel": _normalize_schedule_events(raw_schedule.get("recent_travel")),
     }
     state["day_brief"] = _normalize_day_brief(state.get("day_brief"))
     return state
@@ -337,6 +405,16 @@ def _normalize_event_attendees(value: Any) -> list[dict[str, Any]]:
             entry["response"] = response[:24]
         if raw.get("self") is True:
             entry["self"] = True
+        # S2: directory facts from the calendar scan's people enrichment.
+        org = str(raw.get("org") or "").strip()
+        if org:
+            entry["org"] = _compact(org, 80)
+        if raw.get("relationship") in _PEOPLE_RELATIONSHIPS:
+            entry["relationship"] = raw["relationship"]
+        last_contact = raw.get("last_contact_ts")
+        if isinstance(last_contact, (int, float)) and not isinstance(last_contact, bool):
+            if math.isfinite(last_contact) and last_contact > 0:
+                entry["last_contact_ts"] = float(last_contact)
         attendees.append(entry)
     return attendees
 
@@ -392,10 +470,30 @@ def _normalize_schedule_events(value: Any) -> list[dict[str, Any]]:
         event_tz = str(raw_event.get("event_tz") or "").strip()
         if event_tz:
             event["event_tz"] = event_tz[:64]
+        end_tz = str(raw_event.get("end_tz") or "").strip()
+        if end_tz:
+            event["end_tz"] = end_tz[:64]
         if raw_event.get("multi_day") is True:
             event["multi_day"] = True
         if raw_event.get("lodging_hint") is True:
             event["lodging_hint"] = True
+        event_type = str(raw_event.get("event_type") or "").strip()
+        if event_type:
+            event["event_type"] = event_type[:32]
+        working_location = raw_event.get("working_location")
+        if isinstance(working_location, dict) and working_location.get("type") in {
+            "home",
+            "office",
+            "custom",
+        }:
+            event["working_location"] = {"type": working_location["type"]}
+            label = str(working_location.get("label") or "").strip()
+            if label:
+                event["working_location"]["label"] = _compact(label, 120)
+        ical_uid = str(raw_event.get("ical_uid") or "").strip()
+        if ical_uid:
+            event["ical_uid"] = ical_uid[:255]
+        event["event_key"] = _event_key(event)
         events.append(event)
         if len(events) >= MAX_SCHEDULE_EVENTS:
             break
@@ -438,10 +536,18 @@ def _normalize_day_brief(value: Any) -> Optional[dict[str, Any]]:
         "trip": trip,
         "generated_at": _iso_timestamp(generated_at) if generated_at else None,
     }
+    # S1: the where-grounded first line; briefs from before S1 have none.
+    opener = _bounded_compact(str(value.get("opener") or ""), DAY_BRIEF_OPENER_CHARS)
+    if opener:
+        normalized["opener"] = opener
     for field in ("input_hash", "local_date"):
         text = str(value.get(field) or "").strip()
         if text:
             normalized[field] = text
+    # S2: meeting prep (absent from briefs written before S2).
+    prep = _normalize_day_brief_prep(value.get("prep"))
+    if prep:
+        normalized["prep"] = prep
     return normalized
 
 
@@ -554,6 +660,15 @@ def _candidate(
     }
 
 
+# Interrupt/error placeholders the agent appends as a closing assistant row;
+# the session's real outcome is the substantive message before them.
+_SESSION_STUB_RE = re.compile(
+    r"\A\s*(?:operation interrupted\b|interrupted\b|error\s*:|request timed out\b|"
+    r"api call failed\b)",
+    re.IGNORECASE,
+)
+
+
 def _scan_sessions(now: float) -> tuple[list[dict[str, Any]], list[str]]:
     candidates: list[dict[str, Any]] = []
     errors: list[str] = []
@@ -603,7 +718,7 @@ def _scan_sessions(now: float) -> tuple[list[dict[str, Any]], list[str]]:
                         for message in reversed(messages):
                             if str(message.get("role") or "").lower() == "assistant":
                                 candidate_text = _plain_text(message.get("content"))
-                                if candidate_text:
+                                if candidate_text and not _SESSION_STUB_RE.match(candidate_text):
                                     summary = candidate_text
                                     break
                     except Exception as exc:
@@ -663,19 +778,73 @@ def _latest_cron_output_time(output_root: Path, job_id: str) -> Optional[float]:
     return float(latest) if latest else None
 
 
-def _latest_cron_output(output_root: Path, job_id: str) -> str:
-    job_dir = output_root / job_id
+# Scanners run every 10 min, the curator every 30: every output doc a job
+# wrote since the last WRITTEN curation is read (oldest first), bounded to the
+# newest docs, and to recent ones when a job has no consumption watermark.
+MAX_CRON_DOCS_PER_JOB = 12
+CRON_BACKFILL_SECONDS = 6 * 60 * 60
+
+
+def _cron_output_docs(output_root: Path, job_id: str) -> list[tuple[int, Path]]:
+    """A job's output docs as ``(mtime_ns, path)``, oldest first."""
+    docs: list[tuple[int, Path]] = []
     try:
-        latest = max(
-            (path for path in job_dir.glob("*.md") if path.is_file()),
-            key=lambda path: path.stat().st_mtime_ns,
-        )
-    except (ValueError, OSError):
-        return ""
+        paths = list((output_root / job_id).glob("*.md"))
+    except OSError:
+        return docs
+    for path in paths:
+        try:
+            if path.is_file():
+                docs.append((path.stat().st_mtime_ns, path))
+        except OSError:
+            continue
+    docs.sort(key=lambda doc: (doc[0], doc[1].name))
+    return docs
+
+
+def _read_cron_doc(path: Path) -> str:
     try:
-        return latest.read_text(encoding="utf-8", errors="replace")
+        return path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return ""
+
+
+def _unconsumed_cron_docs(
+    docs: list[tuple[int, Path]], watermark: Optional[int], now: float
+) -> list[tuple[int, Path]]:
+    if watermark is None:
+        cutoff_ns = int((now - CRON_BACKFILL_SECONDS) * 1_000_000_000)
+        unread = [doc for doc in docs if doc[0] >= cutoff_ns]
+    else:
+        unread = [doc for doc in docs if doc[0] > watermark]
+    return unread[-MAX_CRON_DOCS_PER_JOB:]
+
+
+def _merge_cron_consumed(current: Any, update: dict[str, int]) -> dict[str, int]:
+    """Per-job consumption watermarks (newest consumed doc mtime_ns); never regress."""
+    merged: dict[str, int] = {}
+    for source in (current, update):
+        if not isinstance(source, dict):
+            continue
+        for raw_job_id, raw_mtime in source.items():
+            job_id = str(raw_job_id or "").strip()
+            if not job_id or isinstance(raw_mtime, bool):
+                continue
+            try:
+                mtime_ns = int(raw_mtime)
+            except (TypeError, ValueError):
+                continue
+            if mtime_ns > 0:
+                merged[job_id] = max(merged.get(job_id, 0), mtime_ns)
+    return merged
+
+
+def _newest_doc_with(docs: list[tuple[str, Optional[dict[str, Any]]]], key: str) -> str:
+    """The newest doc text whose town-scan payload carries ``key`` ("" if none)."""
+    for text, payload in docs:
+        if payload is not None and key in payload:
+            return text
+    return ""
 
 
 def _town_scan_payload(output: str) -> Optional[dict[str, Any]]:
@@ -792,7 +961,7 @@ def _town_scan_awaiting_reply(output: str) -> Optional[list[dict[str, Any]]]:
                 "last_sent_ts": last_sent_ts,
             }
         )
-    entries.sort(key=lambda entry: float(entry["last_sent_ts"]))
+    entries.sort(key=lambda entry: float(entry["last_sent_ts"]), reverse=True)
     return entries[:MAX_AWAITING_REPLY_SIGNALS]
 
 
@@ -826,19 +995,26 @@ def _town_scan_open_loops(output: str) -> Optional[list[dict[str, Any]]]:
             or not last_seen_ts
         ):
             continue
-        entries.append(
-            {
-                "account": account,
-                "thread_id": thread_id,
-                "person": _compact(person, 120),
-                "subject": _compact(subject, 180),
-                "ask": _bounded_compact(ask, 140),
-                "deadline_iso": _iso_timestamp(deadline_ts) if deadline_ts else None,
-                "first_seen_ts": first_seen_ts,
-                "last_seen_ts": last_seen_ts,
-            }
-        )
-    entries.sort(key=lambda entry: float(entry["first_seen_ts"]))
+        entry = {
+            "account": account,
+            "thread_id": thread_id,
+            "person": _compact(person, 120),
+            "subject": _compact(subject, 180),
+            "ask": _bounded_compact(ask, 140),
+            "deadline_iso": _iso_timestamp(deadline_ts) if deadline_ts else None,
+            "first_seen_ts": first_seen_ts,
+            "last_seen_ts": last_seen_ts,
+        }
+        if raw.get("bulk_sender") is True:
+            entry["bulk_sender"] = True
+        from_address = str(raw.get("from_address") or "").strip().casefold()
+        if from_address:
+            entry["from_address"] = from_address
+        entries.append(entry)
+    entries.sort(
+        key=lambda entry: (float(entry["last_seen_ts"]), float(entry["first_seen_ts"])),
+        reverse=True,
+    )
     return entries[:MAX_OPEN_LOOP_SIGNALS]
 
 
@@ -887,8 +1063,76 @@ def _town_scan_schedule_events(output: str) -> Optional[list[dict[str, Any]]]:
     return _normalize_schedule_events(payload.get("events"))
 
 
+def _town_scan_recent_travel(output: str) -> Optional[list[dict[str, Any]]]:
+    payload = _town_scan_payload(output)
+    if payload is None or "recent_travel" not in payload:
+        return None
+    return _normalize_schedule_events(payload.get("recent_travel"))
+
+
+_CRON_ERROR_NOISE = (
+    re.compile(r"^Plugin \S.*?: unknown kind\b"),
+    re.compile(r"^providers\.\S+?: unknown config keys\b"),
+    re.compile(r"^Script exited with code -?\d+$"),
+)
+_CRON_SCRIPT_PREFIX = re.compile(r"^town-[\w.-]+:\s+")
+MAX_CRON_DETAIL = 80
+
+
+def _cap_cron_detail(detail: str) -> str:
+    if len(detail) <= MAX_CRON_DETAIL:
+        return detail
+    # "context: wrapper: cause" chains: elide the wrappers nearest the cause
+    # so both the failing step and the root error stay visible.
+    parts = detail.split(": ")
+    if len(parts) > 2:
+        head = parts[:-1]
+        while len(head) > 1:
+            head = head[:-1]
+            elided = ": ".join(head) + ": … " + parts[-1]
+            if len(elided) <= MAX_CRON_DETAIL:
+                return elided
+    return detail[: MAX_CRON_DETAIL - 3].rstrip() + "..."
+
+
+def _cron_failure_detail(error: Any, status: str) -> str:
+    """The most specific line of a failed town-* script run, capped at 80 chars.
+
+    Hermes stores a failed script as ``Script exited with code N`` followed by
+    ``stderr:`` and ``stdout:`` sections. Plugin-loader warnings and the stdout
+    JSON contract are noise; the script's own ``town-…:`` line names the real
+    error, else the last remaining line does, else the job status.
+    """
+    sections: dict[str, list[str]] = {"": [], "stderr": [], "stdout": []}
+    section = ""
+    for raw_line in str(error or "").splitlines():
+        line = " ".join(raw_line.split())
+        if line in {"stderr:", "stdout:"}:
+            section = line[:-1]
+            continue
+        if line and not any(pattern.match(line) for pattern in _CRON_ERROR_NOISE):
+            sections[section].append(line)
+    stdout = sections["stdout"]
+    if stdout and stdout[0].startswith(("{", "[")):
+        stdout = []
+    stderr = sections[""] + sections["stderr"]
+    lines = stderr + stdout
+    detail = next(
+        (
+            _CRON_SCRIPT_PREFIX.sub("", line, count=1) or line
+            for line in reversed(stderr)
+            if line.startswith("town-")
+        ),
+        lines[-1] if lines else " ".join(str(status or "").split()),
+    )
+    return _cap_cron_detail(detail)
+
+
 def _scan_cron(
     now: float,
+    consumed: Optional[dict[str, int]] = None,
+    profile: Optional[dict[str, Any]] = None,
+    snapshot: Optional[dict[str, Any]] = None,
 ) -> tuple[
     list[dict[str, Any]],
     list[str],
@@ -898,7 +1142,19 @@ def _scan_cron(
     list[dict[str, Any]],
     set[str],
     bool,
+    dict[str, int],
 ]:
+    """Collect cron candidates and the current snapshot signals.
+
+    Candidates come from every output doc newer than the job's ``consumed``
+    watermark (oldest first); the last element is the watermark update to
+    persist once the curation is written. Snapshot fields (awaiting reply,
+    open loops, known contacts, next event, schedule) come from the newest doc
+    that carries each. When ``snapshot`` is a dict it also receives
+    ``recent_travel`` (S1), so the tuple shape stays stable for callers.
+    """
+    consumed = _merge_cron_consumed(consumed, {})
+    consumed_out: dict[str, int] = {}
     candidates: list[dict[str, Any]] = []
     errors: list[str] = []
     next_events: list[dict[str, str]] = []
@@ -906,6 +1162,7 @@ def _scan_cron(
     awaiting_reply: list[dict[str, Any]] = []
     open_loops: list[dict[str, Any]] = []
     known_contacts: set[str] = set()
+    recent_travel: list[dict[str, Any]] = []
     has_enriched_contract = False
     try:
         from cron.jobs import get_cron_output_dir, list_jobs
@@ -931,9 +1188,7 @@ def _scan_cron(
                 continue
             job_id = str(job.get("id") or "unknown")
             if is_town_failure:
-                detail = " ".join(str(job.get("last_error") or status).split())
-                if len(detail) > 80:
-                    detail = detail[:77].rstrip() + "..."
+                detail = _cron_failure_detail(job.get("last_error"), status)
                 health_item = _candidate(
                     source=f"cron:{job_id}",
                     headline=f"{name} failing — {detail}",
@@ -969,28 +1224,54 @@ def _scan_cron(
                     if health_item:
                         candidates.append(health_item)
 
-            output = _latest_cron_output(output_root, job_id)
-            scan_candidates = _town_scan_candidates(output)
-            if scan_candidates is not None:
-                candidates.extend(scan_candidates)
-            has_enriched_contract = (
-                has_enriched_contract or _town_scan_has_enriched_contract(output)
+            docs = _cron_output_docs(output_root, job_id)
+            watermark = consumed.get(job_id)
+            unconsumed = _unconsumed_cron_docs(docs, watermark, now)
+            texts = {path: _read_cron_doc(path) for _, path in unconsumed}
+            for _, path in unconsumed:
+                scan_candidates = _town_scan_candidates(texts[path])
+                if scan_candidates is not None:
+                    candidates.extend(scan_candidates)
+            if unconsumed:
+                consumed_out[job_id] = max(watermark or 0, unconsumed[-1][0])
+            elif watermark is None and docs:
+                consumed_out[job_id] = docs[-1][0]
+            if docs and docs[-1][1] not in texts:
+                texts[docs[-1][1]] = _read_cron_doc(docs[-1][1])
+            snapshot_docs = [
+                (texts[path], _town_scan_payload(texts[path]))
+                for _, path in reversed(docs)
+                if path in texts
+            ]
+            has_enriched_contract = has_enriched_contract or any(
+                _town_scan_has_enriched_contract(text) for text, _ in snapshot_docs
             )
-            scan_awaiting_reply = _town_scan_awaiting_reply(output)
+            scan_awaiting_reply = _town_scan_awaiting_reply(
+                _newest_doc_with(snapshot_docs, "awaiting_reply")
+            )
             if scan_awaiting_reply is not None:
                 awaiting_reply.extend(scan_awaiting_reply)
-            scan_open_loops = _town_scan_open_loops(output)
+            scan_open_loops = _town_scan_open_loops(_newest_doc_with(snapshot_docs, "open_loops"))
             if scan_open_loops is not None:
                 open_loops.extend(scan_open_loops)
-            scan_known_contacts = _town_scan_known_contacts(output)
+            scan_known_contacts = _town_scan_known_contacts(
+                _newest_doc_with(snapshot_docs, "known_contacts")
+            )
             if scan_known_contacts is not None:
                 known_contacts.update(scan_known_contacts)
-            next_event = _town_scan_next_event(output)
+            next_event = _town_scan_next_event(_newest_doc_with(snapshot_docs, "next_event"))
             if next_event:
                 next_events.append(next_event)
-            scan_schedule_events = _town_scan_schedule_events(output)
+            scan_schedule_events = _town_scan_schedule_events(
+                _newest_doc_with(snapshot_docs, "events")
+            )
             if scan_schedule_events is not None:
                 schedule_events.extend(scan_schedule_events)
+            scan_recent_travel = _town_scan_recent_travel(
+                _newest_doc_with(snapshot_docs, "recent_travel")
+            )
+            if scan_recent_travel is not None:
+                recent_travel.extend(scan_recent_travel)
             if is_town_failure:
                 continue
     except Exception as exc:
@@ -1001,24 +1282,23 @@ def _scan_cron(
         default=None,
     )
     schedule_events.sort(key=lambda event: _parse_timestamp(event["start_iso"]))
+    if snapshot is not None:
+        recent_travel.sort(key=lambda event: _parse_timestamp(event["start_iso"]))
+        snapshot["recent_travel"] = recent_travel[-MAX_SCHEDULE_EVENTS:]
     awaiting_by_thread: dict[tuple[str, str], dict[str, Any]] = {}
     for entry in awaiting_reply:
         key = (str(entry["account"]), str(entry["thread_id"]))
         existing = awaiting_by_thread.get(key)
         if existing is None or float(entry["last_sent_ts"]) < float(existing["last_sent_ts"]):
             awaiting_by_thread[key] = entry
-    awaiting_reply = sorted(
-        awaiting_by_thread.values(), key=lambda entry: float(entry["last_sent_ts"])
-    )
+    awaiting_reply = _filter_awaiting_signals(list(awaiting_by_thread.values()), now, profile)
     open_loops_by_thread: dict[tuple[str, str], dict[str, Any]] = {}
     for entry in open_loops:
         key = (str(entry["account"]), str(entry["thread_id"]))
         existing = open_loops_by_thread.get(key)
         if existing is None or float(entry["last_seen_ts"]) > float(existing["last_seen_ts"]):
             open_loops_by_thread[key] = entry
-    open_loops = sorted(
-        open_loops_by_thread.values(), key=lambda entry: float(entry["first_seen_ts"])
-    )
+    open_loops = _filter_open_loop_signals(list(open_loops_by_thread.values()), now, profile)
     return (
         candidates,
         errors,
@@ -1028,7 +1308,69 @@ def _scan_cron(
         open_loops[:MAX_OPEN_LOOP_SIGNALS],
         known_contacts,
         has_enriched_contract,
+        consumed_out,
     )
+
+
+SIGNAL_MAX_AGE_SECONDS = 21 * 24 * 60 * 60
+
+
+def _filter_awaiting_signals(
+    entries: list[dict[str, Any]], now: float, profile: Optional[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Recent, real awaiting-reply threads, newest send first.
+
+    Junk tracked before the R4 scanner rules (self-only mail, unsubscribe
+    requests, FYI forwards) is left out here at read time; Gmail is untouched.
+    """
+    rules = _operator_profile_module()
+    self_addresses = (
+        rules.self_address_set(profile, [entry["account"] for entry in entries])
+        if rules
+        else set()
+    )
+    kept: list[dict[str, Any]] = []
+    for entry in entries:
+        if now - float(entry["last_sent_ts"]) > SIGNAL_MAX_AGE_SECONDS:
+            continue
+        if rules and rules.awaiting_reply_junk_reason(
+            rules.addresses(str(entry.get("to") or "")), entry.get("subject"), self_addresses
+        ):
+            continue
+        kept.append(entry)
+    kept.sort(key=lambda entry: float(entry["last_sent_ts"]), reverse=True)
+    return kept
+
+
+def _filter_open_loop_signals(
+    entries: list[dict[str, Any]], now: float, profile: Optional[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Recent open loops from real senders, newest activity first."""
+    rules = _operator_profile_module()
+    self_addresses = (
+        rules.self_address_set(profile, [entry["account"] for entry in entries])
+        if rules
+        else set()
+    )
+    assistant_senders = rules.assistant_sender_set(profile) if rules else set()
+    kept: list[dict[str, Any]] = []
+    for entry in entries:
+        if now - float(entry["last_seen_ts"]) > SIGNAL_MAX_AGE_SECONDS:
+            continue
+        if entry.get("bulk_sender") is True:
+            continue
+        sender = str(entry.get("from_address") or "").strip().casefold()
+        if not sender:
+            person = str(entry.get("person") or "").strip().casefold()
+            sender = person if "@" in person and " " not in person else ""
+        if sender and (sender in self_addresses or sender in assistant_senders):
+            continue
+        kept.append(entry)
+    kept.sort(
+        key=lambda entry: (float(entry["last_seen_ts"]), float(entry["first_seen_ts"])),
+        reverse=True,
+    )
+    return kept
 
 
 def _memory_files() -> list[Path]:
@@ -1177,31 +1519,232 @@ def _relative_future(timestamp: float, now: float) -> str:
     return f"in {days} days"
 
 
-def _local_timezone() -> Any:
-    return datetime.now(timezone.utc).astimezone().tzinfo
+def _zone_or_none(name: Any) -> Any:
+    text = str(name or "").strip()
+    if not text:
+        return None
+    try:
+        from zoneinfo import ZoneInfo
+
+        return ZoneInfo(text)
+    except Exception:
+        return None
+
+
+def _local_timezone(profile: Optional[dict[str, Any]] = None) -> Any:
+    """The operator's home zone (zoneinfo, DST-aware) from their profile.
+
+    The host's current offset is only the last resort, when no profile source
+    (operator.json, USER.md, config.yaml, system zone) names a valid zone.
+    """
+    if profile is None:
+        profile = _load_profile()
+    zone = _zone_or_none((profile or {}).get("home_timezone"))
+    return zone or datetime.now(timezone.utc).astimezone().tzinfo
+
+
+# --- S1: where the operator is, and their local "now" -----------------------
+
+# Instants in LLM inputs and the local-time string written beside each (S1:
+# the models never convert UTC themselves). Date-only values stay as they are.
+_LOCAL_TIME_FIELDS = {
+    "created_at": "created_local",
+    "start_at": "start_local",
+    "start_iso": "start_local",
+    "end_iso": "end_local",
+    "received_at": "received_local",
+    "first_seen_at": "first_seen_local",
+    "last_seen_at": "last_seen_local",
+    "last_sent_at": "last_sent_local",
+    "sent_at": "sent_local",
+    "deadline": "deadline_local",
+    "a_start_iso": "a_start_local",
+    "b_start_iso": "b_start_local",
+    "starts_iso": "starts_local",
+    "first_start_iso": "first_start_local",
+    "last_end_iso": "last_end_local",
+    "since": "since_local",
+    "until": "until_local",
+}
+
+_OPERATOR_RULES = (
+    "Operator context: operator says who the operator is and where they are "
+    "right now (operator.where: status home, away, traveling_today, or "
+    "just_returned, with its evidence). They live in operator.home_city: never "
+    "describe home_city as a destination, a visit, a trip, or somewhere they "
+    "are 'in town' — going back there is coming home. Every instant in the "
+    "input has a *_local string in the operator's current zone "
+    "(operator.local_now_label is now): use those for every time you write and "
+    "never convert UTC yourself. When operator.where.status is not home, "
+    "mention home time (the *_home strings) only where it matters, such as a "
+    "call with people back home. "
+)
+
+
+def _infer_where(
+    profile: Optional[dict[str, Any]],
+    schedule_events: list[dict[str, Any]],
+    recent_travel: list[dict[str, Any]],
+    now: float,
+) -> Optional[dict[str, Any]]:
+    module = _where_module()
+    if module is None:
+        return None
+    try:
+        return module.infer_where(schedule_events, recent_travel, profile or {}, now)
+    except Exception:
+        return None
+
+
+def _display_timezone(profile: Optional[dict[str, Any]], where: Optional[dict[str, Any]]) -> Any:
+    """Where "local" is: the away zone while the operator is away, else home."""
+    if isinstance(where, dict) and where.get("status") == "away":
+        zone = _zone_or_none(where.get("timezone"))
+        if zone is not None:
+            return zone
+    return _local_timezone(profile)
+
+
+def _operator_block(
+    profile: Optional[dict[str, Any]], now: float, where: Optional[dict[str, Any]]
+) -> dict[str, Any]:
+    module = _operator_profile_module()
+    if module is None or not hasattr(module, "operator_context"):
+        return {}
+    try:
+        return module.operator_context(profile or {}, now, where)
+    except Exception:
+        return {}
+
+
+def _localize_times(value: Any, zone_name: str, home_zone_name: str = "") -> Any:
+    """A copy of an LLM input with ``*_local`` (and, away, ``*_home``) strings.
+
+    Every instant in ``_LOCAL_TIME_FIELDS`` gains a label such as "Mon Oct 12,
+    9:00 AM ET" in ``zone_name``; existing labels are never overwritten.
+    """
+    module = _operator_profile_module()
+    if module is None or not hasattr(module, "local_time_label") or not zone_name:
+        return value
+    with_home = bool(home_zone_name) and home_zone_name != zone_name
+
+    def labels(raw: Any) -> tuple[str, str]:
+        text = str(raw or "").strip()
+        timestamp = _parse_timestamp(text) if "T" in text else 0.0
+        if not timestamp:
+            return "", ""
+        home = module.local_time_label(timestamp, home_zone_name) if with_home else ""
+        return module.local_time_label(timestamp, zone_name), home
+
+    def walk(node: Any) -> Any:
+        if isinstance(node, list):
+            return [walk(item) for item in node]
+        if not isinstance(node, dict):
+            return node
+        localized = {key: walk(item) for key, item in node.items()}
+        for field, target in _LOCAL_TIME_FIELDS.items():
+            if field not in node or target in node:
+                continue
+            raw = node[field]
+            if isinstance(raw, list):
+                local_values = [labels(item)[0] for item in raw]
+                if any(local_values):
+                    localized[target] = local_values
+                continue
+            local, home = labels(raw)
+            if local:
+                localized[target] = local
+            if home:
+                localized[target[: -len("_local")] + "_home"] = home
+        return localized
+
+    return walk(value)
+
+
+def _is_meaningful(event: dict[str, Any]) -> bool:
+    module = _where_module()
+    if module is None:
+        return not event.get("all_day")
+    try:
+        return bool(module.is_meaningful(event))
+    except Exception:
+        return not event.get("all_day")
+
+
+def _meaningful_counts(
+    schedule_events: list[dict[str, Any]], now: float, local_tz: Any
+) -> Optional[dict[str, int]]:
+    module = _where_module()
+    if module is None:
+        return None
+    try:
+        return module.meaningful_counts(schedule_events, now, local_tz)
+    except Exception:
+        return None
+
+
+def _next_meaningful_event(
+    schedule_events: list[dict[str, Any]], now: float
+) -> Optional[dict[str, str]]:
+    """The scanner's slim ``next_event`` shape, for the next meaningful event."""
+    module = _where_module()
+    if module is None:
+        return None
+    try:
+        event = module.next_meaningful_event(schedule_events, now)
+    except Exception:
+        return None
+    return _normalize_next_event(event) if isinstance(event, dict) else None
+
+
+# Context rows, not commitments: never conflicts, clusters, load, or trips.
+_SCHEDULE_IGNORED_EVENT_TYPES = {"workingLocation", "birthday"}
+
+
+def _schedule_identity_keys(
+    event: dict[str, Any], start_ts: float, end_ts: float
+) -> set[tuple[Any, ...]]:
+    """One occurrence's identities: iCalUID + start, or summary + start + end."""
+    keys: set[tuple[Any, ...]] = set()
+    ical_uid = str(event.get("ical_uid") or "").strip()
+    if ical_uid:
+        keys.add(("ical", ical_uid, start_ts))
+    summary = " ".join(str(event.get("summary") or "").split()).casefold()
+    if summary:
+        keys.add(("text", summary, start_ts, end_ts))
+    return keys
 
 
 def _schedule_context(
-    schedule_events: list[dict[str, Any]], now: float
+    schedule_events: list[dict[str, Any]], now: float, local_tz: Any = None
 ) -> Optional[dict[str, Any]]:
     """Deterministic day-shape facts computed from the normalized schedule.
 
     Pure interval math — the day-brief LLM narrates these facts but cannot
     invent them (the G6R sensing/judgment split, applied to synthesis).
+    ``local_tz`` is the operator's display zone (home, or away zone).
     """
     if not schedule_events:
         return None
-    local_tz = _local_timezone()
+    local_tz = local_tz or _local_timezone()
     local_now = datetime.fromtimestamp(now, tz=local_tz)
     today = local_now.date()
 
     timed: list[dict[str, Any]] = []
     all_day: list[dict[str, Any]] = []
+    seen_identities: set[tuple[Any, ...]] = set()
     for event in schedule_events:
+        if str(event.get("event_type") or "") in _SCHEDULE_IGNORED_EVENT_TYPES:
+            continue
         start_ts = _parse_timestamp(event.get("start_iso"))
         end_ts = _parse_timestamp(event.get("end_iso"))
         if not start_ts or not end_ts or end_ts <= start_ts:
             continue
+        identities = _schedule_identity_keys(event, start_ts, end_ts)
+        if identities & seen_identities:
+            seen_identities |= identities
+            continue
+        seen_identities |= identities
         row = dict(event)
         row["_start_ts"] = start_ts
         row["_end_ts"] = end_ts
@@ -1360,7 +1903,10 @@ def _schedule_context(
 
 
 def _day_brief_input_hash(
-    schedule_events: list[dict[str, Any]], schedule_context: Optional[dict[str, Any]]
+    schedule_events: list[dict[str, Any]],
+    schedule_context: Optional[dict[str, Any]],
+    where: Optional[dict[str, Any]] = None,
+    local_date: str = "",
 ) -> str:
     identity = {
         "events": [
@@ -1374,8 +1920,288 @@ def _day_brief_input_hash(
         ],
         "context": schedule_context or {},
     }
+    # S1: a move (home -> away, landing) or a new local day re-briefs.
+    if isinstance(where, dict):
+        identity["where"] = [str(where.get("status") or ""), str(where.get("city") or "")]
+    if local_date:
+        identity["local_date"] = local_date
     canonical = json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+# --- S2: who people are (directory facts for both LLM lanes) --------------
+
+_PEOPLE_MODULE = "hermes_town_people"
+_PEOPLE_RELATIONSHIPS = {"colleague", "contact", "correspondent", "new"}
+_MEETING_EVENT_TYPES = {"", "default", "fromGmail"}
+MAX_ROW_PEOPLE_ATTENDEES = 5
+MAX_MEETING_PEOPLE_EVENTS = 4
+MAX_MEETING_PEOPLE = 6
+DAY_BRIEF_MAX_PREP = 2
+DAY_BRIEF_PREP_LINE_CHARS = 90
+DAY_BRIEF_TALKING_POINT_CHARS = 140
+
+
+def _people_module() -> Optional[Any]:
+    """The sibling people.py, loaded by path; ``None`` means no people facts."""
+    cached = sys.modules.get(_PEOPLE_MODULE)
+    if cached is not None:
+        return cached
+    path = Path(__file__).resolve().with_name("people.py")
+    try:
+        spec = importlib.util.spec_from_file_location(_PEOPLE_MODULE, path)
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[_PEOPLE_MODULE] = module
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(_PEOPLE_MODULE, None)
+        return None
+    return module
+
+
+def _people_index(
+    profile: dict[str, Any],
+    accounts: Iterable[Any],
+    known_contacts: Optional[set[str]],
+    now: float,
+) -> Optional[Any]:
+    """One curation pass's view of the people directory (None without it).
+
+    Connected accounts count as the operator's own addresses (their custom
+    domains make colleagues), exactly as when the directory was built.
+    """
+    module = _people_module()
+    if module is None:
+        return None
+    try:
+        own = list(profile.get("self_addresses") or [])
+        own.extend(str(account or "").strip().casefold() for account in accounts if account)
+        return module.PeopleIndex(
+            module.load_directory(get_hermes_home()),
+            dict(profile, self_addresses=own),
+            now=now,
+            known=known_contacts or (),
+        )
+    except Exception:
+        return None
+
+
+def _event_key(event: dict[str, Any]) -> str:
+    """A stable id for one occurrence, shared by /feed rows and day-brief prep."""
+    identity = str(event.get("ical_uid") or "").strip() or " ".join(
+        str(event.get("summary") or "").split()
+    ).casefold()
+    start = _parse_timestamp(event.get("start_iso"))
+    digest = hashlib.sha256(f"{identity}\n{start:.0f}".encode("utf-8")).hexdigest()
+    return f"ev_{digest[:12]}"
+
+
+def _schedule_event_for(
+    candidate: dict[str, Any], schedule_events: list[dict[str, Any]]
+) -> Optional[dict[str, Any]]:
+    """The schedule row behind a ``calendar:`` candidate (account + start, then title)."""
+    kind, _, rest = str(candidate.get("source") or "").partition(":")
+    if kind != "calendar" or not rest:
+        return None
+    account = rest.partition(":")[0].strip().casefold()
+    start = float(candidate.get("created_at_ts") or 0.0)
+    matches = [
+        event
+        for event in schedule_events
+        if str(event.get("account") or "").strip().casefold() == account
+        and abs(_parse_timestamp(event.get("start_iso")) - start) < 1.0
+    ]
+    if len(matches) <= 1:
+        return matches[0] if matches else None
+    headline = " ".join(str(candidate.get("headline") or "").split()).casefold()
+    for event in matches:
+        summary = " ".join(str(event.get("summary") or "").split()).casefold()
+        if summary and headline.startswith(summary):
+            return event
+    return None
+
+
+def _row_people(
+    item: dict[str, Any], people: Any, schedule_events: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Ranking-row people: a Gmail sender + up to 4 recipients, or up to 5 attendees."""
+    source = str(item.get("source") or "")
+    if source.startswith("gmail:"):
+        return people.message_people(item)
+    event = _schedule_event_for(item, schedule_events)
+    entries: list[dict[str, Any]] = []
+    for attendee in (event or {}).get("attendees") or []:
+        entry = people.attendee_entry(attendee) if isinstance(attendee, dict) else None
+        if entry:
+            entries.append(entry)
+        if len(entries) >= MAX_ROW_PEOPLE_ATTENDEES:
+            break
+    return entries
+
+
+_PEOPLE_RANKING_RULES = (
+    "A row's people entries describe its sender, recipients, or attendees: "
+    "name, org, relationship (colleague, contact, correspondent, or new), "
+    "last_contact, and title when known. Introduce people by name, with their "
+    "org or relationship when supplied. Never invent roles, titles, orgs, or "
+    "relationships beyond those fields. Say there is no prior email history "
+    "with someone only when their relationship is new — never for a "
+    "colleague, contact, or correspondent. "
+)
+
+
+def _meeting_people(
+    schedule_events: list[dict[str, Any]], people: Any, now: float, local_tz: Any
+) -> list[dict[str, Any]]:
+    """Day-brief input: up to 4 meetings in the next 24 h x up to 6 people each."""
+    meetings: list[dict[str, Any]] = []
+    for event in sorted(schedule_events, key=lambda row: _parse_timestamp(row.get("start_iso"))):
+        if event.get("all_day") is True:
+            continue
+        if str(event.get("event_type") or "") not in _MEETING_EVENT_TYPES:
+            continue
+        start_ts = _parse_timestamp(event.get("start_iso"))
+        if not start_ts or start_ts < now or start_ts > now + 24 * 3600:
+            continue
+        entries: list[dict[str, Any]] = []
+        for attendee in event.get("attendees") or []:
+            entry = people.attendee_entry(attendee, with_email=True) if isinstance(attendee, dict) else None
+            if entry and entry.get("email"):
+                entries.append(entry)
+            if len(entries) >= MAX_MEETING_PEOPLE:
+                break
+        if not entries:
+            continue
+        meeting: dict[str, Any] = {
+            "event_key": str(event.get("event_key") or "") or _event_key(event),
+            "summary": _compact(str(event.get("summary") or ""), 160),
+            "start_local": datetime.fromtimestamp(start_ts, tz=local_tz).strftime("%a %-I:%M %p"),
+            "people": entries,
+        }
+        count = event.get("attendee_count")
+        if isinstance(count, int) and count > len(entries) + 1:
+            meeting["attendee_count"] = count
+        details = str(event.get("description_excerpt") or "").strip()
+        if details:
+            meeting["details"] = _compact(details, 400)
+        meetings.append(meeting)
+        if len(meetings) >= MAX_MEETING_PEOPLE_EVENTS:
+            break
+    return meetings
+
+
+_DAY_BRIEF_PREP_SCHEMA = {
+    "type": "array",
+    "maxItems": DAY_BRIEF_MAX_PREP,
+    "items": {
+        "type": "object",
+        "properties": {
+            "event_key": {"type": "string"},
+            "people": {
+                "type": "array",
+                "maxItems": MAX_MEETING_PEOPLE,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "email": {"type": "string"},
+                        "line": {"type": "string", "maxLength": DAY_BRIEF_PREP_LINE_CHARS},
+                    },
+                    "required": ["email", "line"],
+                    "additionalProperties": False,
+                },
+            },
+            "talking_point": {"type": "string", "maxLength": DAY_BRIEF_TALKING_POINT_CHARS},
+        },
+        "required": ["event_key", "people"],
+        "additionalProperties": False,
+    },
+}
+
+_DAY_BRIEF_PEOPLE_RULES = (
+    " meeting_people lists the people in the next meetings with name, org, "
+    "relationship (colleague, contact, correspondent, or new), last_contact, "
+    "and title when known: introduce attendees by name with that org or "
+    "relationship, and never invent roles or relationships. The prep field "
+    "(separate from prep callouts): for at most the next two meetings in "
+    "meeting_people, return event_key copied unchanged, people as {email "
+    "copied unchanged, line} for attendees worth a word, and an optional "
+    "talking_point. Each line is at most 90 characters and grounded only in "
+    "that person's supplied facts and the meeting details; say there is no "
+    "prior email history only when relationship is new. talking_point is one "
+    "concrete opener grounded in the meeting details or the people facts; "
+    "omit it when nothing grounded fits. Skip declined attendees. With no "
+    "meeting_people, return an empty prep array."
+)
+
+
+def _normalize_day_brief_prep(value: Any) -> list[dict[str, Any]]:
+    """``[{event_key, people: [{email, line}], talking_point?}]``, at most 2."""
+    if not isinstance(value, list):
+        return []
+    prep: list[dict[str, Any]] = []
+    seen_keys: set[str] = set()
+    for raw in value:
+        if not isinstance(raw, dict):
+            continue
+        event_key = str(raw.get("event_key") or "").strip()[:64]
+        if not event_key or event_key in seen_keys:
+            continue
+        people: list[dict[str, str]] = []
+        emails: set[str] = set()
+        raw_people = raw.get("people")
+        for person in raw_people[:MAX_MEETING_PEOPLE] if isinstance(raw_people, list) else []:
+            if not isinstance(person, dict):
+                continue
+            email = str(person.get("email") or "").strip().casefold()[:254]
+            line = _bounded_compact(str(person.get("line") or ""), DAY_BRIEF_PREP_LINE_CHARS)
+            if "@" in email and line and email not in emails:
+                emails.add(email)
+                people.append({"email": email, "line": line})
+        entry: dict[str, Any] = {"event_key": event_key, "people": people}
+        talking_point = _bounded_compact(
+            str(raw.get("talking_point") or ""), DAY_BRIEF_TALKING_POINT_CHARS
+        )
+        if talking_point:
+            entry["talking_point"] = talking_point
+        if people or talking_point:
+            prep.append(entry)
+            seen_keys.add(event_key)
+        if len(prep) >= DAY_BRIEF_MAX_PREP:
+            break
+    return prep
+
+
+def _ground_prep(value: Any, meetings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Raw LLM prep kept only for the next two supplied meetings and their people.
+
+    Grounding runs before normalization caps the list, so an invented entry
+    can never crowd out a real one.
+    """
+    allowed = {
+        meeting["event_key"]: {
+            person["email"] for person in meeting["people"] if person.get("email")
+        }
+        for meeting in meetings[:DAY_BRIEF_MAX_PREP]
+    }
+    grounded: list[dict[str, Any]] = []
+    for raw in value if isinstance(value, list) else []:
+        if not isinstance(raw, dict):
+            continue
+        event_key = str(raw.get("event_key") or "").strip()
+        emails = allowed.get(event_key)
+        if emails is None:
+            continue
+        raw_people = raw.get("people") if isinstance(raw.get("people"), list) else []
+        people = [
+            person
+            for person in raw_people
+            if isinstance(person, dict)
+            and str(person.get("email") or "").strip().casefold() in emails
+        ]
+        grounded.append(dict(raw, event_key=event_key, people=people))
+    return _normalize_day_brief_prep(grounded)
 
 
 def _suggestion_signal_groups(
@@ -1388,6 +2214,7 @@ def _suggestion_signal_groups(
     now: float,
     known_contacts: Optional[set[str]] = None,
     schedule_context: Optional[dict[str, Any]] = None,
+    people: Optional[Any] = None,
 ) -> dict[str, Any]:
     action_mail: list[dict[str, Any]] = []
     orders: list[dict[str, Any]] = []
@@ -1540,15 +2367,17 @@ def _suggestion_signal_groups(
                 name = str(attendee.get("name") or "").strip()
                 if name or email:
                     display.append(name or email)
-                if known_contacts and email and email not in known_contacts:
+                # S2: first contact = relationship ``new`` in the people
+                # directory; colleagues, contacts, and correspondents never are.
+                if people is not None and email and people.is_first_contact(attendee):
                     first_contact.append(email)
             if display:
                 signal["attendees"] = display
             count = event.get("attendee_count")
             if isinstance(count, int) and count > len(display):
                 signal["attendee_count"] = count
-            # Grounded first-contact: claimable only against the sent-mail
-            # correspondent set — absent that set, no claim is possible.
+            # Grounded first-contact: claimable only against the people
+            # directory — absent it, no claim is possible.
             if first_contact:
                 signal["first_contact_attendees"] = first_contact
         description = str(event.get("description_excerpt") or "").strip()
@@ -1606,6 +2435,160 @@ def _normalize_suggestions(value: Any) -> list[dict[str, str]]:
     return suggestions
 
 
+# U13: deterministic post-filter so a suggestion never repeats what Up next
+# or a conflict callout already says. No backfill: fewer chips beat padding.
+SUGGESTION_PREP_WINDOW_SECONDS = 18 * 60 * 60
+_SUGGESTION_PREP_RE = re.compile(r"(?:prep|prepare|get\s+ready|join)\b", re.IGNORECASE)
+# "Prepare for tonight's calls": prep for near-term events named only
+# generically — Up next already shows them.
+_SUGGESTION_GENERIC_PREP_RE = re.compile(
+    r"\b(?:tonight|today|this\s+(?:morning|afternoon|evening))\b.*"
+    r"\b(?:calls?|meetings?|syncs?|events?|schedule)\b",
+    re.IGNORECASE,
+)
+_SUGGESTION_NAME_SPLIT_RE = re.compile(r"[\W_]+", re.UNICODE)
+
+
+def _suggestion_text(value: Any) -> str:
+    return " ".join(_SUGGESTION_NAME_SPLIT_RE.sub(" ", str(value or "")).casefold().split())
+
+
+_EVENT_TITLE_TAIL_RE = re.compile(r"\s+[-\u2013\u2014|]\s+.*$|\s*[:(].*$")
+
+
+def _event_names(summary: Any) -> list[str]:
+    """The full summary and its main title ("Weekly Call - Alice leads" ->
+    "weekly call"), both normalized; chips name events the short way."""
+    full = str(summary or "").strip()
+    names = [_suggestion_text(full), _suggestion_text(_EVENT_TITLE_TAIL_RE.sub("", full))]
+    return [name for index, name in enumerate(names) if name and name not in names[:index]]
+
+
+def _names_event(label: str, summary: Any, *, distinctive: bool = True) -> bool:
+    """The label names the event by its full summary or main title. A lone
+    event needs a distinctive name; a conflict pair (both must match) may use
+    short ones like "Lunch"."""
+    padded = f" {label} "
+    for name in _event_names(summary):
+        if distinctive and len(name.split()) < 2 and len(name) < 6:
+            continue
+        if len(name) >= 3 and f" {name} " in padded:
+            return True
+    return False
+
+
+def _ensure_conflict_callout(
+    day_brief: Optional[dict[str, Any]],
+    schedule_context: Optional[dict[str, Any]],
+    now: float,
+    local_tz: Any,
+) -> Optional[dict[str, Any]]:
+    """Guarantee a conflict starting within 24h is called out once.
+
+    Callouts are LLM-chosen and vary run to run; the conflict callout is the
+    one place a schedule conflict shows (U13), so when the brief omits it the
+    curator adds a plain factual one first.
+    """
+    if not isinstance(day_brief, dict):
+        return day_brief
+    callouts = [callout for callout in day_brief.get("callouts") or [] if isinstance(callout, dict)]
+    covered = [
+        _suggestion_text(callout.get("text"))
+        for callout in callouts
+        if callout.get("kind") == "conflict"
+    ]
+    added: list[dict[str, str]] = []
+    for conflict in (schedule_context or {}).get("conflicts") or []:
+        if not isinstance(conflict, dict):
+            continue
+        a, b = conflict.get("a"), conflict.get("b")
+        a_start = _parse_timestamp(conflict.get("a_start_iso"))
+        b_start = _parse_timestamp(conflict.get("b_start_iso"))
+        if not a or not b or not a_start or not b_start:
+            continue
+        first = min(a_start, b_start)
+        if max(a_start, b_start) <= now or first > now + 24 * 60 * 60:
+            continue
+        # A conflict callout naming either event already shows this overlap
+        # (the LLM often shortens "Lunch with Bob" to "Lunch").
+        if any(
+            _names_event(text, a, distinctive=False) or _names_event(text, b, distinctive=False)
+            for text in covered
+        ):
+            continue
+        start = datetime.fromtimestamp(first, tz=local_tz)
+        today = datetime.fromtimestamp(now, tz=local_tz).date()
+        day = "today" if start.date() == today else (
+            "tomorrow" if (start.date() - today).days == 1 else start.strftime("%a")
+        )
+        clock = start.strftime("%-I:%M %p")
+        title_a = _EVENT_TITLE_TAIL_RE.sub("", str(a)).strip() or str(a)
+        title_b = _EVENT_TITLE_TAIL_RE.sub("", str(b)).strip() or str(b)
+        added.append({
+            "kind": "conflict",
+            "text": f"{title_a} overlaps {title_b} {day} at {clock}; pick a priority.",
+        })
+        covered.append(_suggestion_text(f"{a} {b}"))
+    if not added:
+        return day_brief
+    return {**day_brief, "callouts": (added + callouts)[:DAY_BRIEF_MAX_CALLOUTS]}
+
+
+def _filter_suggestions(
+    suggestions: list[dict[str, str]],
+    schedule_events: list[dict[str, Any]],
+    schedule_context: Optional[dict[str, Any]],
+    now: float,
+    callouts: Optional[list[dict[str, Any]]] = None,
+) -> list[dict[str, str]]:
+    """Drop prep chips for an Up-next event, and chips restating a conflict
+    that a day-brief conflict callout already shows (an uncovered conflict
+    keeps its chip so it is never shown nowhere)."""
+    # Up next shows meaningful events under way or starting soon.
+    upcoming: list[Any] = []
+    for event in schedule_events:
+        if not isinstance(event, dict) or not _is_meaningful(event):
+            continue
+        start_ts = _parse_timestamp(event.get("start_iso"))
+        end_ts = _parse_timestamp(event.get("end_iso"))
+        if start_ts and end_ts > now and start_ts <= now + SUGGESTION_PREP_WINDOW_SECONDS:
+            upcoming.append(event.get("summary"))
+    conflicts = [
+        (conflict.get("a"), conflict.get("b"))
+        for conflict in (schedule_context or {}).get("conflicts") or []
+        if isinstance(conflict, dict)
+    ]
+    callout_texts = [
+        _suggestion_text(callout.get("text"))
+        for callout in callouts or []
+        if isinstance(callout, dict) and callout.get("kind") == "conflict"
+    ]
+    conflicts = [
+        (a, b)
+        for a, b in conflicts
+        if any(
+            _names_event(text, a, distinctive=False) or _names_event(text, b, distinctive=False)
+            for text in callout_texts
+        )
+    ]
+    kept: list[dict[str, str]] = []
+    for suggestion in suggestions:
+        raw_label = str(suggestion.get("label") or "").strip()
+        label = _suggestion_text(raw_label)
+        if _SUGGESTION_PREP_RE.match(raw_label) and (
+            any(_names_event(label, summary) for summary in upcoming)
+            or _SUGGESTION_GENERIC_PREP_RE.search(raw_label)
+        ):
+            continue
+        if any(
+            _names_event(label, a, distinctive=False) and _names_event(label, b, distinctive=False)
+            for a, b in conflicts
+        ):
+            continue
+        kept.append(suggestion)
+    return kept
+
+
 # C7: the one voice, injected into every Town LLM lane (ranking + day brief).
 TOWN_VOICE = (
     "Voice: you write for one operator, in second person, as a sharp chief of "
@@ -1629,12 +2612,21 @@ _RANKING_RULES = (
     "deadlines, and names—and never echo a vague snippet. For an orders message "
     "with an amount of at least $100, lead the headline with the amount and "
     "merchant. For chat threads (telegram sources), never echo raw message "
-    "lines: use the supplied body to say what happened and what the user must "
-    "do, attributing every statement to its sender by name. When "
-    "user_spoke_last is true the newest message is the user's own — phrase the "
-    "item as an open loop ('You told Hunter you're free tomorrow and offered to "
-    "bring dinner; waiting on his confirm'), never as news from the other "
-    "person. Summaries are the takeaway plus its implication or next step, "
+    "lines: use the supplied body to say what happened and what, if anything, "
+    "the user must do, attributing every statement to its sender by name. In "
+    "a telegram body, [YOU] marks the user's own messages, '↩ <name>' a reply "
+    "to <name> ('↩ you' is a reply to the user), and '@you' a message that "
+    "mentions or names the user. When user_spoke_last is true the newest "
+    "message is the user's own — phrase the item as an open loop ('You told "
+    "Bob you're free tomorrow and offered to bring dinner; waiting on his "
+    "confirm'), never as news from the other person. When a telegram row has "
+    "chat_type group and addressed_to_user false, nobody in it addressed the "
+    "user: never phrase it as the user's task — score it below 20 or omit "
+    "it; only the user's own unanswered promise there may appear, as an open "
+    "loop. When operator_replied_after_ask is true the user already answered "
+    "the latest ask: do not present that ask as open — at most an open loop "
+    "if the user's reply promised something. Summaries are the takeaway plus "
+    "its implication or next step, "
     "never a restatement of the source; when a source states a deadline and a "
     "consequence, carry both ('trial ends Jul 29 — routines lock'). Summaries "
     "must be concrete and at most two sentences. For an item with an obvious "
@@ -1663,6 +2655,8 @@ def _llm_rank(
     known_contacts: Optional[set[str]] = None,
     schedule_context: Optional[dict[str, Any]] = None,
     has_enriched_contract: bool = False,
+    people: Optional[Any] = None,
+    operator: Optional[dict[str, Any]] = None,
 ) -> tuple[dict[str, dict[str, Any]], list[dict[str, str]], Optional[str]]:
     schema = {
         "type": "object",
@@ -1727,16 +2721,23 @@ def _llm_rank(
         ):
             row["body"] = _bounded_compact(str(item["body"]), 1500)
         if source.startswith("telegram:"):
-            for field in ("chat_name", "last_sender"):
+            for field in ("chat_name", "last_sender", "chat_type"):
                 if str(item.get(field) or "").strip():
                     row[field] = _compact(str(item[field]), 80)
-            if isinstance(item.get("user_spoke_last"), bool):
-                row["user_spoke_last"] = item["user_spoke_last"]
+            for field in ("user_spoke_last", "addressed_to_user", "operator_replied_after_ask"):
+                if isinstance(item.get(field), bool):
+                    row[field] = item[field]
+        # S2: who the people on this row are.
+        if people is not None:
+            row_people = _row_people(item, people, schedule_events or [])
+            if row_people:
+                row["people"] = row_people
         payload.append(row)
 
     legacy_instructions = (
         TOWN_VOICE
         + _RANKING_RULES
+        + _PEOPLE_RANKING_RULES
         + (
             "Also return 3-5 contextual suggestions fully grounded in the items you "
             "return and, whenever possible, derived from the top-ranked items. Write "
@@ -1763,6 +2764,7 @@ def _llm_rank(
             time.time() if now is None else now,
             known_contacts=known_contacts,
             schedule_context=schedule_context,
+            people=people,
         )
         llm_input = {
             "ranking_candidates": payload,
@@ -1779,6 +2781,7 @@ def _llm_rank(
                 "urgent reason, except an order of at least $100 is notable. "
             )
             + _RANKING_RULES
+            + _PEOPLE_RANKING_RULES
             + (
                 "Also return 3-5 suggestions by independently analyzing "
                 "suggestion_signals. Use the capped groups before "
@@ -1792,7 +2795,11 @@ def _llm_rank(
                 "makes a verification or investigation notably worthwhile—never merely "
                 "summarize a routine receipt; (4) events in the next 48 hours that "
                 "genuinely merit preparation: meetings, syncs, gatherings, travel, or "
-                "anything involving other people or a deliverable — use the supplied "
+                "anything involving other people or a deliverable — events starting "
+                "within the next 18 hours are already on the dashboard's Up next "
+                "list, so suggest prep for one only when there is a concrete "
+                "deliverable to produce and the chip names it (never a generic "
+                "'prepare for tonight's calls') — use the supplied "
                 "location, conference, organizer, and attendees to make prep chips "
                 "concrete, and when first_contact_attendees is present you may note "
                 "there is no prior email history with them (never claim that "
@@ -1819,6 +2826,19 @@ def _llm_rank(
             )
             + _CLOSING_RULES
         )
+    # S1: who and where the operator is, and local strings for every instant.
+    if operator is None:
+        operator = _operator_block(_load_profile(), time.time() if now is None else now, None)
+    if operator:
+        zones = (str(operator.get("timezone") or ""), str(operator.get("home_timezone") or ""))
+        operator = _localize_times(operator, *zones)
+        llm_input = _localize_times(llm_input, *zones)
+        if isinstance(llm_input, dict):
+            llm_input = {"operator": operator, **llm_input}
+        else:
+            # The legacy contract's input is the bare candidate list.
+            instructions += " Operator (JSON): " + json.dumps(operator, ensure_ascii=False) + ". "
+        instructions += " " + _OPERATOR_RULES
     try:
         result = llm.complete_structured(
             instructions=instructions,
@@ -1845,6 +2865,53 @@ def _llm_rank(
         return ranked, suggestions, None
     except Exception as exc:
         return {}, [], str(exc)
+
+
+# S1: the brief opens from where the operator is, and counts only real events.
+_DAY_BRIEF_S1_RULES = (
+    "opener: ONE sentence of at most 140 characters that orients the operator "
+    "from operator.where and the shape of the schedule, grounded ONLY in "
+    "operator.where (status, city, label, evidence) and the events: "
+    "just_returned names the return and where from; away says where they are "
+    "(and the time offset when it matters); traveling_today names the flight; "
+    "a working location says where they are working; otherwise lead with the "
+    "first meaningful commitment. Never invent travel, weather, places, or "
+    "events, and never restate the date. Meaningful events are timed "
+    "commitments with another person, a place or call link, or at least 30 "
+    "minutes; events marked minor are personal reminders — never count, lead "
+    "with, or call them meetings. day_summary counts ONLY meaningful events: "
+    "use meaningful_today and meaningful_tomorrow, never "
+    "schedule_context.load.events_today. When meaningful_today is below 3 and "
+    "meaningful_tomorrow is 5 or more, day_summary says tomorrow is the "
+    "heavier day ('Light day — 2 meetings; tomorrow has 8'). "
+)
+
+# U13: at home (or just back) the operator lives in their home zone, so an
+# invite's foreign organizer zone is not worth converting.
+_HOME_WHERE_STATUSES = {"home", "just_returned"}
+_DAY_BRIEF_U13_RULES = (
+    "When operator.where.status is home or just_returned, produce NO timezone "
+    "callout: the operator is in their home zone, and an invite's organizer "
+    "zone is not worth converting. "
+)
+
+
+def _drop_home_timezone_callouts(
+    brief: Optional[dict[str, Any]], where: Optional[dict[str, Any]]
+) -> Optional[dict[str, Any]]:
+    """Drop ``timezone`` callouts while the operator is home or just back."""
+    if not isinstance(brief, dict) or not isinstance(where, dict):
+        return brief
+    if str(where.get("status") or "") not in _HOME_WHERE_STATUSES:
+        return brief
+    callouts = brief.get("callouts")
+    if isinstance(callouts, list):
+        brief["callouts"] = [
+            callout
+            for callout in callouts
+            if not (isinstance(callout, dict) and callout.get("kind") == "timezone")
+        ]
+    return brief
 
 
 def _day_brief_event_projection(
@@ -1889,6 +2956,8 @@ def _day_brief_event_projection(
         details = str(event.get("description_excerpt") or "").strip()
         if details:
             row["details"] = _compact(details, 240)
+        if not event.get("all_day") and not _is_meaningful(event):
+            row["minor"] = True
         rows.append(row)
     return rows
 
@@ -1903,13 +2972,18 @@ def _generate_day_brief(
     top_headlines: list[str],
     known_contacts: Optional[set[str]],
     now: float,
+    people: Optional[Any] = None,
+    operator: Optional[dict[str, Any]] = None,
+    local_tz: Any = None,
+    meaningful: Optional[dict[str, int]] = None,
 ) -> tuple[Optional[dict[str, Any]], Optional[str]]:
     """One narrative sentence + grounded callouts for the dashboard header."""
-    local_tz = _local_timezone()
+    local_tz = local_tz or _local_timezone()
     local_now = datetime.fromtimestamp(now, tz=local_tz)
     schema = {
         "type": "object",
         "properties": {
+            "opener": {"type": "string", "maxLength": DAY_BRIEF_OPENER_CHARS},
             "day_summary": {"type": "string", "maxLength": 220},
             "callouts": {
                 "type": "array",
@@ -1943,20 +3017,25 @@ def _generate_day_brief(
                 ]
             },
         },
-        "required": ["day_summary", "callouts"],
+        "required": ["opener", "day_summary", "callouts"],
         "additionalProperties": False,
     }
+    # S2: meeting prep output; first contact = relationship ``new`` only.
+    schema["properties"]["prep"] = _DAY_BRIEF_PREP_SCHEMA
+    meeting_people = (
+        _meeting_people(schedule_events, people, now, local_tz) if people is not None else []
+    )
     first_contact: list[str] = []
-    if known_contacts:
+    if people is not None:
         for event in schedule_events:
             attendees = event.get("attendees")
             if not isinstance(attendees, list):
                 continue
             for attendee in attendees:
-                if not isinstance(attendee, dict) or attendee.get("self") is True:
+                if not isinstance(attendee, dict) or not people.is_first_contact(attendee):
                     continue
                 email = str(attendee.get("email") or "").strip().casefold()
-                if email and email not in known_contacts and email not in first_contact:
+                if email and email not in first_contact:
                     first_contact.append(email)
     llm_input = {
         "local_now": local_now.strftime("%A %b %-d, %-I:%M %p"),
@@ -1974,7 +3053,16 @@ def _generate_day_brief(
         ],
         "first_contact_attendees": first_contact[:8],
         "top_need_to_know": top_headlines[:5],
+        "meeting_people": meeting_people,
     }
+    # S1: where the operator is, meaningful-event counts, local strings.
+    if operator:
+        zones = (str(operator.get("timezone") or ""), str(operator.get("home_timezone") or ""))
+        llm_input = {"operator": operator, **llm_input}
+        llm_input = _localize_times(llm_input, *zones)
+    if meaningful is not None:
+        llm_input["meaningful_today"] = int(meaningful.get("today") or 0)
+        llm_input["meaningful_tomorrow"] = int(meaningful.get("tomorrow") or 0)
     instructions = (
         TOWN_VOICE
         + (
@@ -2008,6 +3096,11 @@ def _generate_day_brief(
             "from the trip event or location text ('SF trip', 'SBC week'); copy "
             "day_n and total_days from the trip entry."
         )
+        + _DAY_BRIEF_PEOPLE_RULES
+        + " "
+        + _OPERATOR_RULES
+        + _DAY_BRIEF_S1_RULES
+        + _DAY_BRIEF_U13_RULES
     )
     try:
         result = llm.complete_structured(
@@ -2016,13 +3109,19 @@ def _generate_day_brief(
             json_schema=schema,
             schema_name="town_day_brief",
             temperature=0.2,
-            max_tokens=700,
+            # S2: room for prep lines (2 meetings x up to 6 people) after the callouts.
+            max_tokens=1200,
             purpose="town-day-brief",
         )
         parsed = getattr(result, "parsed", None)
         brief = _normalize_day_brief(parsed if isinstance(parsed, dict) else None)
         if brief is None:
             return None, "day brief response had no usable day_summary"
+        _drop_home_timezone_callouts(brief, (operator or {}).get("where"))
+        brief.pop("prep", None)
+        prep = _ground_prep(parsed.get("prep"), meeting_people)
+        if prep:
+            brief["prep"] = prep
         return brief, None
     except Exception as exc:
         return None, str(exc)
@@ -2047,6 +3146,91 @@ def _prune_decisions(decisions: dict[str, Any], now: Optional[float] = None) -> 
     return dict(ordered[:MAX_DECISIONS])
 
 
+def _identity_key(candidate: dict[str, Any]) -> str:
+    """The source thing an item is about: one live item per identity.
+
+    ``telegram:<chat_id>``, ``session:<session_id>``,
+    ``gmail:<account>:<thread_id>`` (message id when threadless),
+    ``calendar:<account>:<event_id>``; anything else is its own identity.
+    """
+    source = str(candidate.get("source") or "").strip()
+    kind, _, rest = source.partition(":")
+    rest = rest.strip()
+    if kind == "telegram" and rest:
+        return f"telegram:{rest.split(':', 1)[0]}"
+    if kind == "session" and rest and rest != "unknown":
+        return f"session:{rest}"
+    if kind == "gmail" and rest:
+        account_part, _, message_id = rest.partition(":")
+        account = (str(candidate.get("account") or "").strip() or account_part).casefold()
+        thread = str(candidate.get("thread_id") or "").strip() or message_id.strip()
+        if account and thread:
+            return f"gmail:{account}:{thread}"
+    if kind == "calendar" and rest:
+        return f"calendar:{rest}"
+    return f"content:{candidate.get('content_hash') or source}"
+
+
+def _newest_per_identity(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep the newest candidate (by source activity) per identity.
+
+    Ties go to the later entry, so callers list retained items before fresh
+    ones and older scan docs before newer ones.
+    """
+    newest: dict[str, tuple[float, int, dict[str, Any]]] = {}
+    for index, candidate in enumerate(candidates):
+        identity = _identity_key(candidate)
+        activity = float(candidate.get("created_at_ts") or 0.0)
+        current = newest.get(identity)
+        if current is None or (activity, index) > current[:2]:
+            newest[identity] = (activity, index, candidate)
+    return [entry[2] for entry in sorted(newest.values(), key=lambda entry: entry[1])]
+
+
+def _is_dismissed(decisions: dict[str, Any], candidate: dict[str, Any]) -> bool:
+    decision = decisions.get(f"ntk_{candidate['content_hash'][:16]}")
+    return isinstance(decision, dict) and bool(decision.get("dismissed"))
+
+
+def _is_assistant_mail(candidate: dict[str, Any], assistant_senders: set[str]) -> bool:
+    """Mail the operator's assistant sent (e.g. their own briefing) is exhaust."""
+    return (
+        bool(assistant_senders)
+        and str(candidate.get("source") or "").startswith("gmail:")
+        and str(candidate.get("from_address") or "").strip().casefold() in assistant_senders
+    )
+
+
+def _top_headlines(candidates: list[dict[str, Any]], hidden_keys: set[str]) -> list[str]:
+    shown = sorted(
+        (candidate for candidate in candidates if candidate["key"] not in hidden_keys),
+        key=lambda item: (float(item["score"]), float(item["created_at_ts"])),
+        reverse=True,
+    )
+    return [str(candidate.get("headline") or "") for candidate in shown[:5]]
+
+
+MAX_CALENDAR_SERVED = 3
+
+
+def _select_served(visible: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The served top items: at most ``MAX_CALENDAR_SERVED`` calendar items.
+
+    Serve-time only — state keeps every item, so the cap never deletes.
+    """
+    served: list[dict[str, Any]] = []
+    calendar_items = 0
+    for item in visible:
+        if str(item.get("source") or "").startswith("calendar:"):
+            if calendar_items >= MAX_CALENDAR_SERVED:
+                continue
+            calendar_items += 1
+        served.append(item)
+        if len(served) >= MAX_FEED_ITEMS:
+            break
+    return served
+
+
 def run_curator(llm: Any = None) -> dict[str, Any]:
     """Scan sources, rank candidates, merge durable decisions, and persist.
 
@@ -2063,8 +3247,11 @@ def run_curator(llm: Any = None) -> dict[str, Any]:
 
     source_state = snapshot.get("source_state") or {}
     previous_hashes = source_state.get("memory_hashes") or {}
+    profile = _load_profile()
+    assistant_senders = set(profile.get("assistant_senders") or [])
 
     session_items, session_errors = _scan_sessions(now)
+    scan_snapshot: dict[str, Any] = {}
     (
         cron_items,
         cron_errors,
@@ -2074,19 +3261,38 @@ def run_curator(llm: Any = None) -> dict[str, Any]:
         open_loops,
         known_contacts,
         has_enriched_contract,
-    ) = _scan_cron(now)
+        cron_consumed,
+    ) = _scan_cron(now, source_state.get("cron_consumed"), profile, scan_snapshot)
     memory_items, memory_hashes, memory_errors = _scan_memory(now, previous_hashes)
     errors = session_errors + cron_errors + memory_errors
-    schedule_context = _schedule_context(schedule_events, now)
+    # S1: where the operator is decides what "local" means for this cycle.
+    recent_travel = list(scan_snapshot.get("recent_travel") or [])
+    where = _infer_where(profile, schedule_events, recent_travel, now)
+    local_tz = _display_timezone(profile, where)
+    operator = _operator_block(profile, now, where)
+    schedule_context = _schedule_context(schedule_events, now, local_tz)
+    # S2: one people-directory view for both LLM lanes.
+    people_index = _people_index(
+        profile,
+        [event.get("account") for event in schedule_events]
+        + [
+            item.get("account")
+            for item in cron_items
+            if str(item.get("source") or "").startswith("gmail:")
+        ],
+        known_contacts,
+        now,
+    )
 
     by_hash: dict[str, dict[str, Any]] = {}
     for candidate in session_items + cron_items + memory_items:
-        if not _is_ntk_candidate(candidate):
+        if not _is_ntk_candidate(candidate) or _is_assistant_mail(candidate, assistant_senders):
             continue
         candidate["score"] = _heuristic_score(candidate, now)
         existing = by_hash.get(candidate["content_hash"])
         if existing is None or candidate["created_at_ts"] > existing["created_at_ts"]:
             by_hash[candidate["content_hash"]] = candidate
+    fresh_hashes = set(by_hash)
 
     # A memory change is an event, not a continuously changing source. Keep
     # recent prior items until they age out or are dismissed; otherwise a
@@ -2124,20 +3330,35 @@ def run_curator(llm: Any = None) -> dict[str, Any]:
             "thread_id",
             "chat_name",
             "last_sender",
+            "chat_type",
             "user_spoke_last",
+            "addressed_to_user",
+            "operator_replied_after_ask",
             "action_hint",
+            "from",
+            "from_address",
+            "recipients",
         ):
             if field in prior:
                 candidate[field] = prior.get(field)
-        if not _is_ntk_candidate(candidate):
+        # Group chat items from before addressing data existed (R1b) cannot be
+        # shown to address the operator; the scanner re-emits any that do.
+        if candidate["source"].startswith("telegram:-") and "addressed_to_user" not in prior:
+            continue
+        if not _is_ntk_candidate(candidate) or _is_assistant_mail(candidate, assistant_senders):
             continue
         candidate["score"] = _heuristic_score(candidate, now)
         by_hash[digest] = candidate
 
+    # One live item per source: a newer message in the same chat, thread,
+    # session, or event supersedes the older item instead of stacking beside it.
     candidates = sorted(
         (
             candidate
-            for candidate in by_hash.values()
+            for candidate in _newest_per_identity(
+                [by_hash[digest] for digest in by_hash if digest not in fresh_hashes]
+                + [by_hash[digest] for digest in by_hash if digest in fresh_hashes]
+            )
             if now - float(candidate["created_at_ts"]) <= RECENT_SECONDS
         ),
         key=lambda item: (float(item["score"]), float(item["created_at_ts"])),
@@ -2146,20 +3367,22 @@ def run_curator(llm: Any = None) -> dict[str, Any]:
 
     ranking_mode = "heuristic"
     llm_suggestions: Optional[list[dict[str, str]]] = None
-    if llm is not None and candidates:
-        snapshot_decisions = snapshot.get("decisions") or {}
-        suggestion_candidates = [
-            candidate
-            for candidate in candidates
-            if not (
-                isinstance(snapshot_decisions.get(f"ntk_{candidate['content_hash'][:16]}"), dict)
-                and snapshot_decisions[f"ntk_{candidate['content_hash'][:16]}"].get("dismissed")
-            )
-        ]
+    snapshot_decisions = snapshot.get("decisions") or {}
+    dismissed_keys = {
+        candidate["key"] for candidate in candidates if _is_dismissed(snapshot_decisions, candidate)
+    }
+    # Not returned by the LLM (declined, or beyond its cap): not shown (LLM mode only).
+    declined_keys: set[str] = set()
+    # Dismissed candidates are never shown, so they inform neither the ranking
+    # nor the suggestions (whose fallback reads the ranking payload).
+    ranking_candidates = [
+        candidate for candidate in candidates if candidate["key"] not in dismissed_keys
+    ]
+    if llm is not None and ranking_candidates:
         llm_rows, suggestions, llm_error = _llm_rank(
-            candidates,
+            ranking_candidates,
             llm,
-            suggestion_candidates=suggestion_candidates,
+            suggestion_candidates=ranking_candidates,
             awaiting_reply=awaiting_reply,
             open_loops=open_loops,
             open_loop_suppressed=snapshot.get("open_loop_suppressed") or [],
@@ -2169,10 +3392,13 @@ def run_curator(llm: Any = None) -> dict[str, Any]:
             known_contacts=known_contacts,
             schedule_context=schedule_context,
             has_enriched_contract=has_enriched_contract,
+            people=people_index,
+            operator=operator,
         )
         if llm_rows:
             ranking_mode = "llm"
-            llm_suggestions = suggestions
+            if suggestions:
+                llm_suggestions = suggestions
             for candidate in candidates:
                 row = llm_rows.get(candidate["key"])
                 if row:
@@ -2191,7 +3417,9 @@ def run_curator(llm: Any = None) -> dict[str, Any]:
                     except (KeyError, TypeError, ValueError):
                         pass
                 else:
-                    candidate["score"] = max(0.0, float(candidate["score"]) - 20.0)
+                    # Declined, or beyond the LLM cap and never vetted: in LLM
+                    # mode only judged items are shown.
+                    declined_keys.add(candidate["key"])
         elif llm_error:
             ranking_mode = "heuristic (LLM fallback)"
             errors.append(f"llm: {llm_error}")
@@ -2201,8 +3429,10 @@ def run_curator(llm: Any = None) -> dict[str, Any]:
     day_brief = _normalize_day_brief(snapshot.get("day_brief"))
     if llm is not None:
         if schedule_events:
-            local_date = datetime.fromtimestamp(now, tz=_local_timezone()).date().isoformat()
-            input_hash = _day_brief_input_hash(schedule_events, schedule_context)
+            local_date = datetime.fromtimestamp(now, tz=local_tz).date().isoformat()
+            input_hash = _day_brief_input_hash(
+                schedule_events, schedule_context, where=where, local_date=local_date
+            )
             current = day_brief if isinstance(day_brief, dict) else {}
             fresh_enough = (
                 current.get("input_hash") == input_hash
@@ -2215,13 +3445,19 @@ def run_curator(llm: Any = None) -> dict[str, Any]:
                     llm,
                     schedule_events=schedule_events,
                     schedule_context=schedule_context,
-                    next_event=next_event,
+                    next_event=(
+                        _next_meaningful_event(schedule_events, now)
+                        if _where_module() is not None
+                        else next_event
+                    ),
                     awaiting_reply=awaiting_reply,
-                    top_headlines=[
-                        str(candidate.get("headline") or "") for candidate in candidates[:5]
-                    ],
+                    top_headlines=_top_headlines(candidates, dismissed_keys | declined_keys),
                     known_contacts=known_contacts,
                     now=now,
+                    people=people_index,
+                    operator=operator,
+                    local_tz=local_tz,
+                    meaningful=_meaningful_counts(schedule_events, now, local_tz),
                 )
                 if generated is not None:
                     generated["generated_at"] = _iso_timestamp(now)
@@ -2232,6 +3468,19 @@ def run_curator(llm: Any = None) -> dict[str, Any]:
                     errors.append(f"day_brief: {day_brief_error}")
         else:
             day_brief = None
+
+    day_brief = _ensure_conflict_callout(day_brief, schedule_context, now, local_tz)
+
+    # U13: filtered after the day brief is settled, so a conflict chip is
+    # dropped only when a callout in the brief being served already shows it.
+    if llm_suggestions is not None:
+        llm_suggestions = _filter_suggestions(
+            llm_suggestions,
+            schedule_events,
+            schedule_context,
+            now,
+            callouts=(day_brief or {}).get("callouts") if isinstance(day_brief, dict) else None,
+        )
 
     with _process_lock():
         state = _read_state_unlocked()
@@ -2248,6 +3497,8 @@ def run_curator(llm: Any = None) -> dict[str, Any]:
         open_loop_keys.discard("")
         merged: list[dict[str, Any]] = []
         for candidate in candidates:
+            if candidate["key"] in declined_keys:
+                continue
             item_id = f"ntk_{candidate['content_hash'][:16]}"
             decision = decisions.get(item_id) if isinstance(decisions.get(item_id), dict) else {}
             source_activity_at = _iso_timestamp(float(candidate["created_at_ts"]))
@@ -2272,11 +3523,23 @@ def run_curator(llm: Any = None) -> dict[str, Any]:
             for field in ("town_label", "town_label_confidence"):
                 if field in candidate:
                     merged_item[field] = candidate.get(field)
-            for field in ("body", "account", "thread_id", "chat_name", "last_sender", "action_hint"):
+            for field in (
+                "body", "account", "thread_id", "chat_name", "last_sender", "chat_type", "action_hint"
+            ):
                 if candidate.get(field):
                     merged_item[field] = candidate[field]
             if candidate.get("user_spoke_last") is True:
                 merged_item["user_spoke_last"] = True
+            # S2: Gmail addressing survives retention so re-ranked mail keeps its people.
+            if str(candidate.get("source") or "").startswith("gmail:"):
+                for field in ("from", "from_address", "recipients"):
+                    if candidate.get(field):
+                        merged_item[field] = candidate[field]
+            # R1b attribution signals must survive retention so re-ranked chat
+            # items keep their addressing context.
+            for field in ("addressed_to_user", "operator_replied_after_ask"):
+                if isinstance(candidate.get(field), bool):
+                    merged_item[field] = candidate[field]
             candidate_open_loop_key = _open_loop_key(
                 candidate.get("account"), candidate.get("thread_id")
             )
@@ -2292,6 +3555,10 @@ def run_curator(llm: Any = None) -> dict[str, Any]:
         state["decisions"] = _prune_decisions(decisions, now)
         merged_source_state = dict(state.get("source_state") or {})
         merged_source_state["memory_hashes"] = memory_hashes
+        # Persisted only with the curation result: a failed run re-reads the docs.
+        merged_source_state["cron_consumed"] = _merge_cron_consumed(
+            merged_source_state.get("cron_consumed"), cron_consumed
+        )
         state["source_state"] = merged_source_state
         completed_at = _iso_timestamp(time.time())
         state["last_curated_at"] = completed_at
@@ -2301,12 +3568,14 @@ def run_curator(llm: Any = None) -> dict[str, Any]:
             "events": schedule_events,
             "generated_at": completed_at,
             "context": schedule_context,
+            "recent_travel": recent_travel,
         }
         state["day_brief"] = _normalize_day_brief(day_brief)
         # Scanner failures surface via the town-cron-health candidates, not by
         # carrying stale gmail: errors forward (which would never clear).
         state["last_curate_errors"] = errors[:20]
-        if ranking_mode == "llm" and llm_suggestions:
+        # A filtered-empty list still replaces the last set (U13: no backfill).
+        if ranking_mode == "llm" and llm_suggestions is not None:
             state["suggestions"] = llm_suggestions
             state["suggestions_generated_at"] = completed_at
         _write_state_unlocked(state)
@@ -2319,6 +3588,9 @@ def run_curator(llm: Any = None) -> dict[str, Any]:
         "errors": errors[:20],
         "curated_at": state["last_curated_at"],
     }
+
+
+_PUBLIC_SOURCE_FIELDS = ("chat_name", "last_sender", "chat_type", "account", "thread_id")
 
 
 def _public_item(item: dict[str, Any]) -> dict[str, Any]:
@@ -2334,6 +3606,16 @@ def _public_item(item: dict[str, Any]) -> dict[str, Any]:
     action_hint = str(item.get("action_hint") or "").strip()
     if action_hint:
         public["action_hint"] = action_hint
+    # Source context the desktop needs for chips and deep links (R5): chat
+    # titles instead of raw Telegram ids, the Gmail account for /mail/u/<acct>.
+    for field in _PUBLIC_SOURCE_FIELDS:
+        value = item.get(field)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            value = str(value)
+        if isinstance(value, str) and value.strip():
+            public[field] = value.strip()
+    if isinstance(item.get("user_spoke_last"), bool):
+        public["user_spoke_last"] = item["user_spoke_last"]
     return public
 
 
@@ -2363,11 +3645,21 @@ def get_feed() -> dict[str, Any]:
         key=lambda item: (float(item["score"]), _parse_timestamp(item["created_at"])),
         reverse=True,
     )
+    # S1: who/where, recomputed per request from stored rows (cheap, pure).
+    profile = _load_profile()
+    stored_events = schedule.get("events", []) if isinstance(schedule, dict) else []
+    recent_travel = schedule.get("recent_travel", []) if isinstance(schedule, dict) else []
+    where = _infer_where(profile, stored_events or [], recent_travel or [], now)
+    local_tz = _display_timezone(profile, where)
+    operator = {
+        field: str(profile.get(field) or "")
+        for field in ("name", "preferred_name", "home_city", "home_timezone")
+    }
     day_brief = state.get("day_brief")
     day_brief_payload = None
     if isinstance(day_brief, dict):
         brief_generated_at = _parse_timestamp(day_brief.get("generated_at"))
-        local_today = datetime.fromtimestamp(now, tz=_local_timezone()).date().isoformat()
+        local_today = datetime.fromtimestamp(now, tz=local_tz).date().isoformat()
         if (
             brief_generated_at
             and now - brief_generated_at <= DAY_BRIEF_STALE_SECONDS
@@ -2379,14 +3671,23 @@ def get_feed() -> dict[str, Any]:
                 "trip": day_brief.get("trip"),
                 "generated_at": day_brief.get("generated_at"),
             }
+            # S2: per-meeting prep lines, keyed by the schedule rows' event_key.
+            if day_brief.get("prep"):
+                day_brief_payload["prep"] = day_brief["prep"]
+            if day_brief.get("opener"):
+                day_brief_payload["opener"] = day_brief["opener"]
     return {
-        "items": visible[:MAX_FEED_ITEMS],
+        "items": _select_served(visible),
         "curated_at": _iso_timestamp(curated_timestamp) if curated_timestamp else None,
         "suggestions": state["suggestions"],
         "suggestions_generated_at": state["suggestions_generated_at"],
         "next_event": state["next_event"],
         "schedule": schedule_events,
         "day_brief": day_brief_payload,
+        # S1 (additive): older desktops ignore these.
+        "schedule_context": _schedule_context(schedule_events, now, local_tz),
+        "operator": operator,
+        "where": where,
     }
 
 
@@ -2401,6 +3702,63 @@ def get_cron_prompt(job_id: str) -> dict[str, Any]:
     if job is None:
         raise HTTPException(status_code=404, detail=f"cron job {job_id!r} not found")
     return {"ok": True, "job_id": job_id, "prompt": str(job.get("prompt") or "")}
+
+
+CRON_RUN_OUTPUT_LIMIT = 2000
+_RUN_DOC_TAIL_BYTES = 16 * 1024
+_RESPONSE_HEADING_RE = re.compile(r"(?m)^## Response[ \t]*\r?$")
+
+
+def _cap_run_output(text: str, limit: int = CRON_RUN_OUTPUT_LIMIT) -> str:
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
+
+
+def _run_doc_response(path: Path, limit: int = CRON_RUN_OUTPUT_LIMIT) -> str:
+    """The text after the LAST ``## Response`` heading of a cron run document.
+
+    Run docs open with the job's full prompt (often tens of KB, and it can quote
+    the heading itself), so read backwards from the end in growing windows; the
+    response normally sits inside the first one. Docs without a Response section
+    (script-mode runs, blocked runs) yield ``""``.
+    """
+    try:
+        with path.open("rb") as handle:
+            size = handle.seek(0, os.SEEK_END)
+            window = _RUN_DOC_TAIL_BYTES
+            while True:
+                start = max(0, size - window)
+                handle.seek(start)
+                text = handle.read(size - start).decode("utf-8", errors="replace")
+                if start:
+                    # A window can open mid-line; only whole lines may match.
+                    text = text.partition("\n")[2]
+                match = None
+                for match in _RESPONSE_HEADING_RE.finditer(text):
+                    pass
+                if match is not None:
+                    return _cap_run_output(text[match.end():], limit)
+                if not start:
+                    return ""
+                window *= 4
+    except OSError:
+        return ""
+
+
+def _run_delivered(job: dict[str, Any]) -> Optional[bool]:
+    """Whether the job's latest run reached its delivery target, when the record says so."""
+    status = str(job.get("last_status") or "").strip().casefold()
+    if status == "delivery_failed" or str(job.get("last_delivery_error") or "").strip():
+        return False
+    deliver = str(job.get("deliver") or "").strip().casefold()
+    if status != "ok" or not deliver or deliver == "local":
+        return None
+    if deliver == "origin" and not job.get("origin"):
+        # Origin-less "origin" jobs are skipped like local ones (nothing is sent).
+        return None
+    return True
 
 
 @router.get("/cron-runs/{job_id}")
@@ -2430,19 +3788,16 @@ def get_cron_runs(job_id: str) -> dict[str, Any]:
             started = datetime.strptime(path.stem, "%Y-%m-%d_%H-%M-%S").astimezone().timestamp()
         except ValueError:
             continue
-        try:
-            with path.open("r", encoding="utf-8", errors="replace") as handle:
-                output = handle.read(2000)
-        except OSError:
-            output = ""
-        runs.append(
-            {
-                "started_at": _iso_timestamp(started),
-                "status": str(job.get("last_status") or "unknown") if not runs else "unknown",
-                "error": str(job.get("last_error") or "") if not runs else "",
-                "output": output,
-            }
-        )
+        run: dict[str, Any] = {
+            "started_at": _iso_timestamp(started),
+            "status": str(job.get("last_status") or "unknown") if not runs else "unknown",
+            "error": str(job.get("last_error") or "") if not runs else "",
+            "output": _run_doc_response(path),
+        }
+        delivered = _run_delivered(job) if not runs else None
+        if delivered is not None:
+            run["delivered"] = delivered
+        runs.append(run)
 
     return {
         "ok": True,
@@ -2526,10 +3881,29 @@ def undismiss_item(payload: ItemRequest) -> dict[str, Any]:
     }
 
 
+def _kanban_connect() -> Any:
+    """A closing kanban DB connection, wherever this Hermes keeps the helper.
+
+    Hermes moved ``connect_closing`` to ``hermes_cli.kanban_db_connect`` and
+    dropped the ``kanban_db`` alias in v0.21.x; older installs only have the
+    original. Every kanban route opens its connection here (U13).
+    """
+    try:
+        from hermes_cli import kanban_db_connect
+    except ImportError:
+        kanban_db_connect = None
+    connect_closing = getattr(kanban_db_connect, "connect_closing", None)
+    if connect_closing is None:
+        from hermes_cli import kanban_db
+
+        connect_closing = kanban_db.connect_closing
+    return connect_closing()
+
+
 def _create_kanban_task(item: dict[str, Any]) -> dict[str, Any]:
     from hermes_cli import kanban_db
 
-    with kanban_db.connect_closing() as conn:
+    with _kanban_connect() as conn:
         task_id = kanban_db.create_task(
             conn,
             title=str(item["headline"]),
@@ -2560,7 +3934,7 @@ def create_composer_task(payload: TaskRequest) -> dict[str, Any]:
         body += f"\nSession: session:{payload.session_id}"
 
     try:
-        with kanban_db.connect_closing() as conn:
+        with _kanban_connect() as conn:
             task_id = kanban_db.create_task(
                 conn,
                 title=payload.title,
@@ -2628,7 +4002,7 @@ def promote_to_task(payload: ItemRequest) -> dict[str, Any]:
 def complete_kanban_task(payload: ItemRequest) -> dict[str, Any]:
     from hermes_cli import kanban_db
 
-    with kanban_db.connect_closing() as conn:
+    with _kanban_connect() as conn:
         task = kanban_db.get_task(conn, payload.id)
         if task is None:
             raise HTTPException(status_code=404, detail=f"kanban task {payload.id!r} not found")
@@ -2685,7 +4059,7 @@ def complete_kanban_task(payload: ItemRequest) -> dict[str, Any]:
 def get_kanban_summary() -> dict[str, Any]:
     from hermes_cli import kanban_db
 
-    with kanban_db.connect_closing() as conn:
+    with _kanban_connect() as conn:
         tasks = kanban_db.list_tasks(conn, include_archived=False)
         task_ids = [task.id for task in tasks]
         updated_at_by_task: dict[str, int] = {}
@@ -2733,9 +4107,79 @@ def get_kanban_summary() -> dict[str, Any]:
         }
 
 
+CURATE_JOB_NAME = "town-feed-curate"
+CURATE_JOB_SCRIPT = "town-curate.py"
+_CURATE_TRIGGER_LOCK = threading.Lock()
+_curate_trigger_thread: Optional[threading.Thread] = None
+
+
+def _find_curate_job(jobs: Any) -> Optional[dict[str, Any]]:
+    matches = [
+        job
+        for job in jobs or []
+        if isinstance(job, dict)
+        and (
+            str(job.get("name") or "").strip().casefold() == CURATE_JOB_NAME
+            or Path(str(job.get("script") or "")).name == CURATE_JOB_SCRIPT
+        )
+    ]
+    # Prefer a live job when a paused duplicate lingers.
+    matches.sort(key=lambda job: job.get("enabled") is False)
+    return matches[0] if matches else None
+
+
+def _run_curate_job(job: dict[str, Any], execute: Any) -> None:
+    try:
+        outcome = execute(job)
+        if isinstance(outcome, dict) and outcome.get("error"):
+            import logging
+
+            logging.getLogger(__name__).warning("town-feed curate run: %s", outcome["error"])
+    except Exception:
+        import logging
+
+        logging.getLogger(__name__).exception("town-feed curate run failed")
+
+
 @router.post("/curate")
 def curate_feed() -> dict[str, Any]:
-    # Dashboard API modules are mounted without PluginContext, so this direct
-    # route intentionally uses the documented heuristic fallback. The scheduled
-    # town_feed_curate tool passes ctx.llm into the same run_curator function.
-    return run_curator(llm=None)
+    # Never curate inline: dashboard routes have no LLM, so run_curator(llm=None)
+    # would overwrite LLM headlines with heuristic ones, and an LLM pass outlives
+    # the renderer's ~15 s IPC timeout. Fire the curate cron job (same
+    # _execute_job_now path as /cron-trigger) on a thread; the desktop polls /feed
+    # until curated_at moves past `since`.
+    global _curate_trigger_thread
+    try:
+        from cron.jobs import list_jobs
+        from tools.cronjob_tools import _execute_job_now
+
+        job = _find_curate_job(list_jobs(include_disabled=True))
+    except Exception as exc:
+        return {"ok": False, "error": f"Could not read routines: {exc}"}
+    if job is None:
+        return {
+            "ok": False,
+            "error": f"No {CURATE_JOB_NAME} routine is scheduled; reinstall the town-feed plugin.",
+        }
+    if job.get("enabled") is False:
+        # A paused job would lose the manual-run claim; say so instead of a silent timeout.
+        return {"ok": False, "error": f"The {CURATE_JOB_NAME} routine is paused; resume it to refresh."}
+
+    with _process_lock():
+        state = _read_state_unlocked()
+    curated_timestamp = _parse_timestamp(state.get("last_curated_at"))
+    since = _iso_timestamp(curated_timestamp) if curated_timestamp else None
+
+    with _CURATE_TRIGGER_LOCK:
+        running = _curate_trigger_thread
+        if running is not None and running.is_alive():
+            return {"ok": True, "triggered": False, "since": since}
+        thread = threading.Thread(
+            target=_run_curate_job,
+            args=(job, _execute_job_now),
+            name="town-feed-curate-trigger",
+            daemon=True,
+        )
+        thread.start()
+        _curate_trigger_thread = thread
+    return {"ok": True, "triggered": True, "since": since}

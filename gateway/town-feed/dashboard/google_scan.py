@@ -6,12 +6,16 @@ import base64
 import email.utils
 import hashlib
 import html
+import importlib.util
 import json
 import math
 import os
 import re
+import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
+from types import ModuleType
 from typing import Any, MutableMapping
 
 
@@ -21,6 +25,29 @@ except Exception:  # pragma: no cover - fallback for standalone tests.
     def get_hermes_home() -> Path:
         value = os.environ.get("HERMES_HOME", "").strip()
         return Path(value).expanduser() if value else Path.home() / ".hermes"
+
+
+def _load_operator_profile_module() -> ModuleType:
+    """The sibling operator_profile.py; cron scripts load this file by path."""
+    name = "hermes_town_operator_profile"
+    cached = sys.modules.get(name)
+    if cached is not None:
+        return cached
+    path = Path(__file__).resolve().with_name("operator_profile.py")
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(name, None)
+        raise
+    return module
+
+
+operator_profile = _load_operator_profile_module()
 
 
 GMAIL_SCOPES = (
@@ -35,7 +62,10 @@ MAX_GMAIL_LOOKBACK_MESSAGES = 40
 MAX_LOOKBACK_SEEN = 500
 MAX_OPEN_LOOPS_PER_ACCOUNT = 40
 MAX_OPEN_LOOPS_PAYLOAD = 15
+MAX_AWAITING_REPLY_PAYLOAD = 10
+SIGNAL_MAX_AGE_SECONDS = 21 * 24 * 60 * 60
 MAX_LABEL_DEPREFIX_MESSAGES = 200
+MAX_CANDIDATE_RECIPIENTS = 8
 MIN_LABEL_CONFIDENCE = 0.6
 MAX_LABELING_LOG = 500
 NEW_SENDER_LABEL = "new sender"
@@ -82,6 +112,8 @@ _GMAIL_SYSTEM_LABELS = {
 }
 
 _LABEL_IDS_BY_ACCOUNT: dict[str, dict[str, str]] = {}
+# Token file behind each scanned account, for the S2 People API refresh.
+_TOKEN_PATHS_BY_ACCOUNT: dict[str, Path] = {}
 _LABEL_RESOURCES_BY_ACCOUNT: dict[str, list[dict[str, Any]]] = {}
 _NO_REPLY_RE = re.compile(
     r"(?:^|[._+-])(?:no[._-]?reply|do[._-]?not[._-]?reply|donotreply)(?:[._+-]|$)",
@@ -115,6 +147,26 @@ def _headers(raw_headers: Any) -> dict[str, list[str]]:
 def _first_header(headers: dict[str, list[str]], name: str) -> str:
     values = headers.get(name.lower()) or []
     return values[0] if values else ""
+
+
+def _recipient_entries(headers: dict[str, list[str]]) -> list[dict[str, str]]:
+    """To/Cc recipients with their display names, for the people context (S2)."""
+    entries: list[dict[str, str]] = []
+    seen: set[str] = set()
+    raw = [value for name in ("to", "cc") for value in headers.get(name) or []]
+    for name, address in email.utils.getaddresses(raw):
+        address = address.strip().strip("<>").casefold()
+        if "@" not in address or address in seen:
+            continue
+        seen.add(address)
+        entry = {"email": address}
+        display = _compact(name, 80)
+        if display and "@" not in display:
+            entry["name"] = display
+        entries.append(entry)
+        if len(entries) >= MAX_CANDIDATE_RECIPIENTS:
+            break
+    return entries
 
 
 def _decode_gmail_body(data: str) -> str:
@@ -350,7 +402,11 @@ def _gmail_candidate(
     }
     system_label_ids = {label.upper() for label in label_ids}
     from_address = from_address.strip().casefold()
-    has_list_unsubscribe = bool(_first_header(headers, "list-unsubscribe").strip())
+    list_unsubscribe = _first_header(headers, "list-unsubscribe")
+    has_list_unsubscribe = bool(list_unsubscribe.strip())
+    recipient_headers = [
+        value for name in ("to", "cc", "bcc") for value in headers.get(name) or []
+    ]
     created_at = internal_date / 1000.0
     return {
         "key": digest[:16],
@@ -364,6 +420,11 @@ def _gmail_candidate(
         "subject": subject_text,
         "date": date,
         "_awaiting_reply_to": _compact(recipient, 200),
+        # Internal addressing facts for the self-exhaust and awaiting-reply
+        # junk rules; scan_gmail strips them before candidates are emitted.
+        "_recipients": operator_profile.addresses(recipient_headers or [recipient]),
+        "_list_unsubscribe": operator_profile.list_unsubscribe_addresses(list_unsubscribe),
+        "recipients": _recipient_entries(headers),
         "snippet": snippet,
         "body": body_for_classification,
         "message_id": message_id,
@@ -388,12 +449,17 @@ def scan_gmail(
     state: MutableMapping[str, Any],
     gmail_services: MutableMapping[str, Any] | None = None,
     labeling_messages: list[dict[str, Any]] | None = None,
+    *,
+    profile: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """Fetch new inbox messages and advance per-email internalDate watermarks.
 
     ``state`` is explicit script-owned state. Its Gmail watermarks are mutated
     only for accounts that resolve and scan successfully; the caller persists
     the state after scanning and labeling finish.
+
+    The operator's own exhaust (assistant-sent mail, self-to-self mail) is
+    neither emitted as a candidate nor queued for labeling.
     """
     del now
     errors: list[str] = []
@@ -415,7 +481,7 @@ def scan_gmail(
             + ", ".join(str(path) for path in token_paths)
         ]
 
-    by_hash: dict[str, dict[str, Any]] = {}
+    scanned: list[dict[str, Any]] = []
     seen_labeling_messages: set[tuple[str, str]] = set()
     seen_candidate_messages: set[tuple[str, str]] = set()
     seen_accounts: set[str] = set()
@@ -439,14 +505,15 @@ def scan_gmail(
                 raise RuntimeError("OAuth credentials are invalid or expired and could not be refreshed")
 
             service = build("gmail", "v1", credentials=creds, cache_discovery=False)
-            profile = service.users().getProfile(userId="me").execute()
-            account = str(profile.get("emailAddress") or "").strip().casefold()
+            gmail_profile = service.users().getProfile(userId="me").execute()
+            account = str(gmail_profile.get("emailAddress") or "").strip().casefold()
             if not account:
                 raise RuntimeError("Gmail profile did not return an account email")
             if account in seen_accounts:
                 continue
             if gmail_services is not None:
                 gmail_services[account] = service
+            _TOKEN_PATHS_BY_ACCOUNT[account] = token_path
 
             previous_watermark = _watermark(watermarks.get(account))
             listed = service.users().messages().list(
@@ -479,12 +546,7 @@ def scan_gmail(
                 ):
                     labeling_messages.append(dict(candidate))
                     seen_labeling_messages.add(labeling_key)
-                existing = by_hash.get(candidate["content_hash"])
-                if (
-                    existing is None
-                    or candidate["created_at_ts"] > existing["created_at_ts"]
-                ):
-                    by_hash[candidate["content_hash"]] = candidate
+                scanned.append(candidate)
             if next_watermark:
                 watermarks[account] = next_watermark
 
@@ -550,12 +612,7 @@ def scan_gmail(
                             if candidate_key not in seen_labeling_messages:
                                 labeling_messages.append(dict(candidate))
                                 seen_labeling_messages.add(candidate_key)
-                            existing = by_hash.get(candidate["content_hash"])
-                            if (
-                                existing is None
-                                or candidate["created_at_ts"] > existing["created_at_ts"]
-                            ):
-                                by_hash[candidate["content_hash"]] = candidate
+                            scanned.append(candidate)
 
                         account_lookback_seen.append(lookback_message_id)
                         account_lookback_seen_set.add(lookback_message_id)
@@ -600,6 +657,36 @@ def scan_gmail(
         except Exception as exc:
             errors.append(f"gmail: {token_path}: {exc}")
 
+    # Filter once every connected account is known: mail between two of the
+    # operator's own mailboxes is self-to-self too.
+    if profile is None:
+        profile = operator_profile.load_operator_profile(account_addresses=seen_accounts)
+    self_addresses = operator_profile.self_address_set(profile, seen_accounts)
+    assistant_senders = operator_profile.assistant_sender_set(profile)
+
+    def is_exhaust(candidate: dict[str, Any]) -> bool:
+        return bool(
+            operator_profile.self_exhaust_reason(
+                candidate.get("from_address"),
+                candidate.get("_recipients") or [],
+                self_addresses,
+                assistant_senders,
+            )
+        )
+
+    if labeling_messages is not None:
+        labeling_messages[:] = [
+            message for message in labeling_messages if not is_exhaust(message)
+        ]
+    by_hash: dict[str, dict[str, Any]] = {}
+    for candidate in scanned:
+        if is_exhaust(candidate):
+            continue
+        candidate.pop("_recipients", None)
+        candidate.pop("_list_unsubscribe", None)
+        existing = by_hash.get(candidate["content_hash"])
+        if existing is None or candidate["created_at_ts"] > existing["created_at_ts"]:
+            by_hash[candidate["content_hash"]] = candidate
     candidates = sorted(
         by_hash.values(), key=lambda candidate: float(candidate["created_at_ts"]), reverse=True
     )
@@ -1009,6 +1096,16 @@ def _latest_thread_candidate(service: Any, account: str, thread_id: str) -> dict
     candidate = _gmail_candidate(latest, account, allow_empty_body=True)
     if candidate is None:
         raise RuntimeError(f"Gmail thread {thread_id!r} latest message is invalid")
+    unsubscribe_targets: list[str] = []
+    for message in messages:
+        payload = message.get("payload") if isinstance(message.get("payload"), dict) else {}
+        headers = _headers(payload.get("headers") or message.get("headers") or [])
+        for address in operator_profile.list_unsubscribe_addresses(
+            _first_header(headers, "list-unsubscribe")
+        ):
+            if address not in unsubscribe_targets:
+                unsubscribe_targets.append(address)
+    candidate["_thread_list_unsubscribe"] = unsubscribe_targets
     return candidate
 
 
@@ -1091,7 +1188,20 @@ def _deadline_iso(value: Any) -> str | None:
     return text
 
 
-def _open_loop_entries(open_loops: MutableMapping[str, Any]) -> list[dict[str, Any]]:
+def _open_loop_entries(
+    open_loops: MutableMapping[str, Any],
+    *,
+    profile: dict[str, Any] | None = None,
+    now: float | None = None,
+) -> list[dict[str, Any]]:
+    """Payload view of the open-loop memory, filtered at read time only.
+
+    Bulk-sender and self/assistant loops and loops idle for more than 21 days
+    stay in state but are not reported; the newest activity comes first.
+    """
+    now = time.time() if now is None else now
+    self_addresses = operator_profile.self_address_set(profile, open_loops.keys())
+    assistant_senders = operator_profile.assistant_sender_set(profile)
     entries: list[dict[str, Any]] = []
     for raw_account, raw_threads in open_loops.items():
         if not isinstance(raw_threads, MutableMapping):
@@ -1115,6 +1225,10 @@ def _open_loop_entries(open_loops: MutableMapping[str, Any]) -> list[dict[str, A
                 or last_seen_ts < 0
             ):
                 continue
+            if now - last_seen_ts > SIGNAL_MAX_AGE_SECONDS:
+                continue
+            if _is_junk_open_loop(raw_loop, self_addresses, assistant_senders):
+                continue
             entries.append(
                 {
                     "account": account,
@@ -1127,9 +1241,34 @@ def _open_loop_entries(open_loops: MutableMapping[str, Any]) -> list[dict[str, A
                     "last_seen_ts": last_seen_ts,
                 }
             )
-    return sorted(entries, key=lambda entry: entry["first_seen_ts"])[
-        :MAX_OPEN_LOOPS_PAYLOAD
-    ]
+    return sorted(
+        entries,
+        key=lambda entry: (entry["last_seen_ts"], entry["first_seen_ts"]),
+        reverse=True,
+    )[:MAX_OPEN_LOOPS_PAYLOAD]
+
+
+def _is_junk_open_loop(
+    loop: dict[str, Any], self_addresses: set[str], assistant_senders: set[str]
+) -> bool:
+    """Bulk or self/assistant mail is not an open loop worth raising.
+
+    Loops recorded before ``from_address``/``bulk_sender`` existed fall back
+    to the ``person`` field when it is a bare address.
+    """
+    if loop.get("bulk_sender") is True:
+        return True
+    sender = str(loop.get("from_address") or "").strip().casefold()
+    if not sender:
+        person = str(loop.get("person") or "").strip().casefold()
+        sender = person if "@" in person and " " not in person else ""
+    if not sender:
+        return False
+    return (
+        sender in assistant_senders
+        or sender in self_addresses
+        or _is_bulk_sender(sender, False)
+    )
 
 
 def _cap_account_open_loops(account_loops: MutableMapping[str, Any]) -> None:
@@ -1157,6 +1296,7 @@ def _labeling_result(
     awaiting_reply_threads: MutableMapping[str, Any],
     open_loops: MutableMapping[str, Any],
     state: MutableMapping[str, Any],
+    profile: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     summary["applied"] = len(log_entries)
     current_log = state.get("labeling_log")
@@ -1179,14 +1319,27 @@ def _labeling_result(
         "log_entries": log_entries,
         "known_correspondents": dict(known_correspondents),
         "awaiting_reply_threads": dict(awaiting_reply_threads),
-        "awaiting_reply": _awaiting_reply_entries(awaiting_reply_threads),
-        "open_loops": _open_loop_entries(open_loops),
+        "awaiting_reply": _awaiting_reply_entries(awaiting_reply_threads, profile=profile),
+        "open_loops": _open_loop_entries(open_loops, profile=profile),
     }
 
 
 def _awaiting_reply_entries(
     awaiting_reply_threads: MutableMapping[str, Any],
+    *,
+    profile: dict[str, Any] | None = None,
+    now: float | None = None,
 ) -> list[dict[str, Any]]:
+    """Payload view of tracked awaiting-reply threads, filtered at read time.
+
+    Junk entries tracked before the R4 rules (self-only, unsubscribe, FYI
+    forwards) and entries older than 21 days stay in state and keep their
+    Gmail labels; they are only left out here. Newest sends come first.
+    """
+    now = time.time() if now is None else now
+    self_addresses = operator_profile.self_address_set(
+        profile, awaiting_reply_threads.keys()
+    )
     entries: list[dict[str, Any]] = []
     for raw_account, raw_threads in awaiting_reply_threads.items():
         if not isinstance(raw_threads, MutableMapping):
@@ -1210,16 +1363,26 @@ def _awaiting_reply_entries(
                     last_sent_ts = 0.0
             if not math.isfinite(last_sent_ts) or last_sent_ts < 0:
                 last_sent_ts = 0.0
+            if not last_sent_ts or now - last_sent_ts > SIGNAL_MAX_AGE_SECONDS:
+                continue
+            recipient = str(raw_thread.get("to") or "")
+            subject = str(raw_thread.get("subject") or "")
+            if operator_profile.awaiting_reply_junk_reason(
+                operator_profile.addresses(recipient), subject, self_addresses
+            ):
+                continue
             entries.append(
                 {
                     "account": account,
                     "thread_id": thread_id,
-                    "to": str(raw_thread.get("to") or ""),
-                    "subject": str(raw_thread.get("subject") or ""),
+                    "to": recipient,
+                    "subject": subject,
                     "last_sent_ts": last_sent_ts,
                 }
             )
-    return sorted(entries, key=lambda entry: entry["last_sent_ts"])[:10]
+    return sorted(entries, key=lambda entry: entry["last_sent_ts"], reverse=True)[
+        :MAX_AWAITING_REPLY_PAYLOAD
+    ]
 
 
 def label_gmail_messages(
@@ -1227,10 +1390,31 @@ def label_gmail_messages(
     gmail_services: MutableMapping[str, Any],
     state: MutableMapping[str, Any],
     llm: Any,
+    *,
+    profile: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Classify one scan batch and add Town labels without changing Gmail state otherwise."""
+    """Classify one scan batch and add Town labels without changing Gmail state otherwise.
+
+    The operator's own exhaust never gets a label, and outbound mail that
+    awaits nobody (self-only, unsubscribe, FYI forward) never gets the
+    awaiting-reply label or a tracked entry. Nothing here removes a label
+    except the existing awaiting-reply lifecycle on an inbound reply.
+    """
     cycle_ts = _iso_timestamp()
     labeling_enabled, confidence_min, taxonomy = get_town_inbox_settings()
+    connected_accounts = {
+        str(account or "").strip().casefold() for account in gmail_services
+    } | {str(candidate.get("account") or "").strip().casefold() for candidate in candidates}
+    connected_accounts.discard("")
+    if profile is None:
+        profile = operator_profile.load_operator_profile(account_addresses=connected_accounts)
+    self_addresses = operator_profile.self_address_set(profile, connected_accounts)
+    assistant_senders = operator_profile.assistant_sender_set(profile)
+    batch_unsubscribe_targets = {
+        address
+        for candidate in candidates
+        for address in candidate.get("_list_unsubscribe") or []
+    }
     candidate_outputs: dict[tuple[str, str], dict[str, Any]] = {}
     for candidate in candidates:
         candidate["town_label"] = None
@@ -1286,6 +1470,7 @@ def label_gmail_messages(
             awaiting_threads,
             open_loops,
             state,
+            profile,
         )
 
     candidates_by_account: dict[str, list[dict[str, Any]]] = {}
@@ -1406,6 +1591,26 @@ def label_gmail_messages(
                 skipped.append(_skipped_message(candidate, "missing_thread_id"))
                 continue
             account_open_loops.pop(thread_id, None)
+            junk_reason = operator_profile.awaiting_reply_junk_reason(
+                candidate.get("_recipients") or [],
+                candidate.get("subject"),
+                self_addresses,
+                [
+                    *batch_unsubscribe_targets,
+                    *(candidate.get("_thread_list_unsubscribe") or []),
+                ],
+            )
+            if junk_reason or not candidate.get("_recipients"):
+                # Going forward only: never add the label or a tracked entry,
+                # and never touch labels or entries recorded earlier.
+                skipped.append(
+                    _skipped_message(
+                        candidate,
+                        f"not_awaiting_reply:{junk_reason or 'self_only'}",
+                        label=AWAITING_REPLY_LABEL,
+                    )
+                )
+                continue
             awaiting_label_id = label_map.get(AWAITING_REPLY_LABEL)
             if awaiting_label_id and awaiting_label_id in current_label_ids:
                 account_threads[thread_id] = {
@@ -1453,6 +1658,16 @@ def label_gmail_messages(
             skipped.append(_skipped_message(scanned_candidate, "not_latest_in_thread"))
             continue
 
+        exhaust_reason = operator_profile.self_exhaust_reason(
+            candidate.get("from_address") or candidate.get("from"),
+            candidate.get("_recipients") or [],
+            self_addresses,
+            assistant_senders,
+        )
+        if exhaust_reason:
+            skipped.append(_skipped_message(candidate, exhaust_reason))
+            continue
+
         town_label_ids = {
             label_map[name]
             for name in taxonomy
@@ -1490,6 +1705,8 @@ def label_gmail_messages(
                         "deadline_iso": existing_loop.get("deadline_iso"),
                         "first_seen_ts": first_seen_ts,
                         "last_seen_ts": float(candidate.get("created_at_ts") or observed_ts),
+                        "from_address": loop_address.strip().casefold(),
+                        "bulk_sender": bool(candidate.get("bulk_sender")),
                     }
                 skipped.append(
                     _skipped_message(candidate, "already_action_labeled", label="action needed")
@@ -1556,6 +1773,7 @@ def label_gmail_messages(
             awaiting_threads,
             open_loops,
             state,
+            profile,
         )
 
     content_taxonomy = {
@@ -1635,6 +1853,7 @@ def label_gmail_messages(
             awaiting_threads,
             open_loops,
             state,
+            profile,
         )
 
     parsed = getattr(result, "parsed", None)
@@ -1652,6 +1871,7 @@ def label_gmail_messages(
             awaiting_threads,
             open_loops,
             state,
+            profile,
         )
 
     eligible_refs = {message_ref for message_ref, _ in eligible}
@@ -1755,6 +1975,10 @@ def label_gmail_messages(
                     "deadline_iso": _deadline_iso(row.get("deadline")),
                     "first_seen_ts": first_seen_ts,
                     "last_seen_ts": observed_ts,
+                    "from_address": str(
+                        candidate.get("from_address") or from_address
+                    ).strip().casefold(),
+                    "bulk_sender": bool(candidate.get("bulk_sender")),
                 }
                 _cap_account_open_loops(account_loops)
 
@@ -1765,4 +1989,107 @@ def label_gmail_messages(
         awaiting_threads,
         open_loops,
         state,
+        profile,
+    )
+
+
+# --- S2: people directory refresh --------------------------------------------
+
+_PEOPLE_MODULE_NAME = "hermes_town_people"
+
+
+def _load_people_module() -> ModuleType:
+    """The sibling people.py, loaded lazily so a broken copy never stops a scan."""
+    cached = sys.modules.get(_PEOPLE_MODULE_NAME)
+    if cached is not None:
+        return cached
+    path = Path(__file__).resolve().with_name("people.py")
+    spec = importlib.util.spec_from_file_location(_PEOPLE_MODULE_NAME, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[_PEOPLE_MODULE_NAME] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(_PEOPLE_MODULE_NAME, None)
+        raise
+    return module
+
+
+def _stored_scopes(token: dict[str, Any]) -> set[str]:
+    raw = token.get("scopes", token.get("scope", []))
+    if isinstance(raw, str):
+        values = raw.split()
+    elif isinstance(raw, list):
+        values = [value for value in raw if isinstance(value, str)]
+    else:
+        values = []
+    return {value.strip() for value in values if value.strip()}
+
+
+def _people_service(account: str, contacts_scopes: frozenset[str]) -> Any:
+    """A People API client for ``account``; None when its token lacks contacts scope.
+
+    Built from the token's own stored scopes (the Gmail client is downscoped
+    to Gmail). Credentials refresh in memory only, like every Town scanner.
+    """
+    token_path = _TOKEN_PATHS_BY_ACCOUNT.get(account)
+    if token_path is None:
+        return None
+    token = json.loads(token_path.read_text(encoding="utf-8"))
+    if not isinstance(token, dict):
+        raise RuntimeError("token file is not a JSON object")
+    scopes = _stored_scopes(token)
+    if not scopes & contacts_scopes:
+        return None
+    from google.auth.transport.requests import Request
+    from google.oauth2.credentials import Credentials
+    from googleapiclient.discovery import build
+
+    creds = Credentials.from_authorized_user_info(token, scopes=sorted(scopes))
+    if creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+    if not creds.valid:
+        raise RuntimeError("OAuth credentials are invalid or expired and could not be refreshed")
+    return build("people", "v1", credentials=creds, cache_discovery=False)
+
+
+def refresh_people(
+    hermes_home: Path,
+    now: float,
+    *,
+    gmail_services: MutableMapping[str, Any],
+    inbound: list[dict[str, Any]],
+    outbound: list[dict[str, Any]],
+    known_contacts: list[str],
+    log: Any,
+    profile: dict[str, Any] | None = None,
+    people_service: Any = None,
+) -> dict[str, int]:
+    """Refresh ``people-cache.json`` for the accounts this scan reached.
+
+    Read-only Google calls (People ``connections.list``; Gmail sent-mail
+    ``messages.list``/``get(format=metadata)``), each at most once per 24 h per
+    account. Returns counts only; raises only on an unusable people module.
+    """
+    people = _load_people_module()
+    accounts = sorted(str(account or "").strip().casefold() for account in gmail_services)
+    if profile is None:
+        profile = operator_profile.load_operator_profile(hermes_home, account_addresses=accounts)
+    if people_service is None:
+        def people_service(account: str) -> Any:
+            return _people_service(account, people.CONTACTS_SCOPES)
+
+    return people.refresh_people_cache(
+        hermes_home,
+        now,
+        accounts=accounts,
+        gmail_services=gmail_services,
+        people_service=people_service,
+        inbound=inbound,
+        outbound=outbound,
+        known_contacts=known_contacts,
+        profile=profile,
+        log=log,
     )

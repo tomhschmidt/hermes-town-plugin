@@ -41,6 +41,40 @@ import {
 import type * as React from 'react'
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 
+import { compactAge, isStale } from '../shared/age.ts'
+import {
+  normalizeAttendeeDetails,
+  normalizeMeetingPrep,
+  type AttendeeDetail,
+  type MeetingPrep
+} from '../shared/people.ts'
+import { refetchEventTypes, shouldRefetchForEvent, type RefetchTopic } from '../shared/refetch-events.ts'
+import {
+  normalizeOperator,
+  normalizeScheduleContext,
+  normalizeWhere,
+  type TownOperator,
+  type TownScheduleContext,
+  type TownWhere
+} from '../shared/situation.ts'
+import { gmailUrl, sourceAction } from '../shared/sources.ts'
+import {
+  contextLineSource,
+  greetingBase,
+  greetingName,
+  locationChipLabel,
+  shouldShowLocationChip,
+  visibleCallouts
+} from './lib/header.ts'
+import { isInternalTownJob } from './lib/jobs.ts'
+import { scheduleAttendeeSummary } from './lib/people.ts'
+import { humanRunStatus, runOutputPreview, runStatusTone, stripMarkdownToText } from './lib/run-output.ts'
+import { sessionSource, tasksFallbackSessions } from './lib/tasks.ts'
+import { pickUpNext } from './lib/upnext.ts'
+import { displayTimeZone, safeTimeZone } from './lib/when.ts'
+import { MeetingPeople } from './people.tsx'
+import { UpNext } from './upnext.tsx'
+
 const MIN_POLL_INTERVAL_MS = 15_000
 const EVENT_REFRESH_DEBOUNCE_MS = 2_000
 const SESSION_LIST_PARAMS = { limit: 12 }
@@ -59,12 +93,9 @@ const CARD_IDS = ['tasks', 'recents', 'need-to-know', 'suggestions', 'routines',
 const MAIN_CARD_IDS = new Set<CardId>(['tasks', 'recents', 'briefing'])
 const SIDE_CARD_IDS = new Set<CardId>(['need-to-know', 'suggestions', 'routines'])
 const DONE_TASK_WINDOW_HOURS = [12, 24, 48, 168] as const
-const TOWN_SCANNER_JOB_NAMES = new Set([
-  'town-gmail-scan',
-  'town-telegram-scan',
-  'town-calendar-scan',
-  'town-feed-curate'
-])
+// How long after registration a missing town-feed bridge reads as "connecting"
+// (it may simply register after us) before the "not connected" copy shows.
+const BRIDGE_READY_TIMEOUT_MS = 3_000
 
 type CardId = (typeof CARD_IDS)[number]
 type DoneTaskWindowHours = (typeof DONE_TASK_WINDOW_HOURS)[number]
@@ -73,6 +104,7 @@ interface TownHomePreferences {
   cardOrder: CardId[]
   cardVisibility: Record<CardId, boolean>
   doneTaskWindowHours: DoneTaskWindowHours
+  upNextVisible: boolean
   userName: string
 }
 
@@ -93,6 +125,7 @@ const DEFAULT_TOWN_HOME_PREFERENCES: TownHomePreferences = {
     briefing: true
   },
   doneTaskWindowHours: 48,
+  upNextVisible: true,
   userName: ''
 }
 
@@ -105,6 +138,7 @@ const $now = atom(Date.now())
 let nowSubscriberCount = 0
 let nowInterval: ReturnType<typeof setInterval> | null = null
 let pluginContext: PluginContext | null = null
+let bridgeWaitDeadline = 0
 
 type UnknownRecord = Record<string, unknown>
 
@@ -169,6 +203,7 @@ function defaultTownHomePreferences(): TownHomePreferences {
     cardOrder: [...DEFAULT_TOWN_HOME_PREFERENCES.cardOrder],
     cardVisibility: { ...DEFAULT_TOWN_HOME_PREFERENCES.cardVisibility },
     doneTaskWindowHours: DEFAULT_TOWN_HOME_PREFERENCES.doneTaskWindowHours,
+    upNextVisible: DEFAULT_TOWN_HOME_PREFERENCES.upNextVisible,
     userName: DEFAULT_TOWN_HOME_PREFERENCES.userName
   }
 }
@@ -229,6 +264,7 @@ function normalizeTownHomePreferences(value: unknown): TownHomePreferences {
     doneTaskWindowHours: isDoneTaskWindowHours(record.doneTaskWindowHours)
       ? record.doneTaskWindowHours
       : defaults.doneTaskWindowHours,
+    upNextVisible: typeof record.upNextVisible === 'boolean' ? record.upNextVisible : defaults.upNextVisible,
     userName: normalizeUserName(record.userName)
   }
 }
@@ -294,6 +330,7 @@ interface CronRow {
   prompt: string
   promptPreview: string
   schedule: string
+  script: string
   state: string
 }
 
@@ -315,6 +352,7 @@ interface RecentRoutineActivity {
 type RecentActivity = RecentSessionActivity | RecentRoutineActivity
 
 interface CronRun {
+  delivered?: boolean | null
   error: string
   output: string
   startedAt: number
@@ -354,6 +392,8 @@ interface TownFeedItem {
   source: string
   createdAt: number | null
   actionHint: string | null
+  chatName: string | null
+  account: string | null
 }
 
 interface RecentlyDismissedEntry {
@@ -386,7 +426,13 @@ interface TownScheduleEvent {
   location: string | null
   conference: string | null
   attendees: string[]
+  attendeeCount: number | null
   multiDay: boolean
+  // S2: directory-enriched attendees (self/declined kept) and the prep key.
+  attendeeDetails: AttendeeDetail[]
+  eventKey: string | null
+  eventType: string | null
+  eventTz: string | null
 }
 
 interface TownDayBriefCallout {
@@ -404,6 +450,8 @@ interface TownDayBrief {
   daySummary: string
   callouts: TownDayBriefCallout[]
   trip: TownDayBriefTrip | null
+  prep: MeetingPrep[]
+  opener: string | null
 }
 
 type TownSuggestionKind = 'followup' | 'digest' | 'maintenance'
@@ -423,10 +471,13 @@ interface TownFeedState {
   items: TownFeedItem[]
   loading: boolean
   nextEvent: TownNextEvent | null
+  operator: TownOperator | null
   schedule: TownScheduleEvent[]
+  scheduleContext: TownScheduleContext | null
   suggestions: TownSuggestion[]
   suggestionsGeneratedAt: number | null
   unavailable: boolean
+  where: TownWhere | null
 }
 
 interface KanbanTask {
@@ -613,13 +664,16 @@ function townScanPayload(output: string): UnknownRecord | null {
 
 function presentRunOutput(output: string): string {
   const lines = output.replace(/\r\n?/g, '\n').split('\n')
-  if (lines[0]?.trim().startsWith('# Cron Job:')) {
+  // Current gateways send only the reply; legacy whole-doc output keeps its header cleanup
+  // (a reply's own "**Weather:** …" lines must survive).
+  const wholeDoc = lines[0]?.trim().startsWith('# Cron Job:') ?? false
+  if (wholeDoc) {
     const blankLineIndex = lines.findIndex(line => line.trim() === '')
     lines.splice(0, blankLineIndex >= 0 ? blankLineIndex + 1 : lines.length)
   }
 
   const cleaned = lines
-    .filter(line => !/^\s*\*\*[^*]+:\*\*\s*.*$/.test(line))
+    .filter(line => !wholeDoc || !/^\s*\*\*[^*]+:\*\*\s*.*$/.test(line))
     .join('\n')
     .trim()
   const payload = townScanPayload(cleaned)
@@ -716,6 +770,7 @@ function normalizeTownSchedule(value: unknown): TownScheduleEvent[] {
         const display = stringValue(attendee.name).trim() || stringValue(attendee.email).trim()
         return display ? [display] : []
       }).slice(0, 8)
+      const attendeeCount = event.attendeeCount ?? event.attendee_count
       schedule.push({
         account,
         allDay,
@@ -725,7 +780,12 @@ function normalizeTownSchedule(value: unknown): TownScheduleEvent[] {
         location: stringValue(event.location).trim() || null,
         conference: stringValue(event.conference).trim() || null,
         attendees,
-        multiDay: event.multiDay === true || event.multi_day === true
+        multiDay: event.multiDay === true || event.multi_day === true,
+        attendeeDetails: normalizeAttendeeDetails(event.attendeeDetails ?? event.attendees),
+        attendeeCount: typeof attendeeCount === 'number' && Number.isFinite(attendeeCount) ? attendeeCount : null,
+        eventKey: stringValue(event.eventKey ?? event.event_key).trim() || null,
+        eventType: stringValue(event.eventType ?? event.event_type).trim() || null,
+        eventTz: stringValue(event.eventTz ?? event.event_tz).trim() || null
       })
     }
   }
@@ -759,7 +819,8 @@ function normalizeTownDayBrief(value: unknown): TownDayBrief | null {
       }
     : null
 
-  return { daySummary, callouts, trip }
+  const opener = stringValue(brief.opener).trim().slice(0, 140) || null
+  return { daySummary, callouts, trip, prep: normalizeMeetingPrep(brief.prep), opener }
 }
 
 function normalizeTownFeedState(value: unknown): TownFeedState {
@@ -779,7 +840,9 @@ function normalizeTownFeedState(value: unknown): TownFeedState {
       summary: stringValue(item.summary),
       source: stringValue(item.source) || 'Hermes',
       createdAt: timestampValue(item.createdAt),
-      actionHint: stringValue(item.actionHint ?? item.action_hint).trim() || null
+      actionHint: stringValue(item.actionHint ?? item.action_hint).trim() || null,
+      chatName: stringValue(item.chatName ?? item.chat_name).trim() || null,
+      account: stringValue(item.account).trim() || null
     }]
   })
   const suggestionRows = Array.isArray(state?.suggestions) ? state.suggestions : []
@@ -811,10 +874,13 @@ function normalizeTownFeedState(value: unknown): TownFeedState {
     items,
     loading: state?.loading === true,
     nextEvent,
+    operator: normalizeOperator(state?.operator),
     schedule: normalizeTownSchedule(state?.schedule),
+    scheduleContext: normalizeScheduleContext(state?.scheduleContext ?? state?.schedule_context),
     suggestions,
     suggestionsGeneratedAt: timestampValue(state?.suggestionsGeneratedAt ?? state?.suggestions_generated_at),
-    unavailable: state?.unavailable === true
+    unavailable: state?.unavailable === true,
+    where: normalizeWhere(state?.where)
   }
 }
 
@@ -872,13 +938,25 @@ function normalizeKanbanState(value: unknown): KanbanState {
   }
 }
 
-function useTownFeedBridge(): { bridge: TownFeedBridge | null; feed: TownFeedState | null } {
-  const [bridge, setBridge] = useState<TownFeedBridge | null>(null)
-  const [feed, setFeed] = useState<TownFeedState | null>(null)
+// A missing bridge reads as "connecting" until the ready event or the
+// post-registration grace period ends; only then do cards say "not connected".
+function bridgeWaitRemainingMs(): number {
+  return Math.max(0, bridgeWaitDeadline - Date.now())
+}
+
+function useTownFeedBridge(): { bridge: TownFeedBridge | null; connecting: boolean; feed: TownFeedState | null } {
+  // Read the already-published bridge on first render so connected cards paint immediately.
+  const [bridge, setBridge] = useState<TownFeedBridge | null>(() => windowTownFeedBridge())
+  const [feed, setFeed] = useState<TownFeedState | null>(() => {
+    const candidate = windowTownFeedBridge()
+    return candidate ? normalizeTownFeedState(candidate.$feed?.get?.()) : null
+  })
+  const [connecting, setConnecting] = useState(() => !windowTownFeedBridge() && bridgeWaitRemainingMs() > 0)
 
   useEffect(() => {
     let activeBridge: TownFeedBridge | null = null
     let unsubscribe: (() => void) | null = null
+    let readyTimer: ReturnType<typeof setTimeout> | null = null
 
     const attach = () => {
       if (activeBridge) {
@@ -907,15 +985,20 @@ function useTownFeedBridge(): { bridge: TownFeedBridge | null; feed: TownFeedSta
         setBridge(null)
         setFeed(null)
       }
+      setConnecting(false)
     }
 
     attach()
     if (!activeBridge) {
       window.addEventListener('hermes-town-feed-ready', attach, { once: true })
+      readyTimer = setTimeout(() => setConnecting(false), bridgeWaitRemainingMs())
     }
 
     return () => {
       window.removeEventListener('hermes-town-feed-ready', attach)
+      if (readyTimer !== null) {
+        clearTimeout(readyTimer)
+      }
       try {
         unsubscribe?.()
       } catch {
@@ -929,16 +1012,21 @@ function useTownFeedBridge(): { bridge: TownFeedBridge | null; feed: TownFeedSta
     }
   }, [])
 
-  return { bridge, feed }
+  return { bridge, connecting, feed }
 }
 
-function useTownKanbanBridge(): { bridge: TownFeedBridge | null; kanban: KanbanState | null } {
-  const [bridge, setBridge] = useState<TownFeedBridge | null>(null)
-  const [kanban, setKanban] = useState<KanbanState | null>(null)
+function useTownKanbanBridge(): { bridge: TownFeedBridge | null; connecting: boolean; kanban: KanbanState | null } {
+  const [bridge, setBridge] = useState<TownFeedBridge | null>(() => windowTownKanbanBridge())
+  const [kanban, setKanban] = useState<KanbanState | null>(() => {
+    const candidate = windowTownKanbanBridge()
+    return candidate ? normalizeKanbanState(candidate.$kanban?.get?.()) : null
+  })
+  const [connecting, setConnecting] = useState(() => !windowTownKanbanBridge() && bridgeWaitRemainingMs() > 0)
 
   useEffect(() => {
     let activeBridge: TownFeedBridge | null = null
     let unsubscribe: (() => void) | null = null
+    let readyTimer: ReturnType<typeof setTimeout> | null = null
 
     const attach = () => {
       if (activeBridge) {
@@ -967,15 +1055,20 @@ function useTownKanbanBridge(): { bridge: TownFeedBridge | null; kanban: KanbanS
         setBridge(null)
         setKanban(null)
       }
+      setConnecting(false)
     }
 
     attach()
     if (!activeBridge) {
       window.addEventListener('hermes-town-feed-ready', attach, { once: true })
+      readyTimer = setTimeout(() => setConnecting(false), bridgeWaitRemainingMs())
     }
 
     return () => {
       window.removeEventListener('hermes-town-feed-ready', attach)
+      if (readyTimer !== null) {
+        clearTimeout(readyTimer)
+      }
       try {
         unsubscribe?.()
       } catch {
@@ -989,13 +1082,13 @@ function useTownKanbanBridge(): { bridge: TownFeedBridge | null; kanban: KanbanS
     }
   }, [])
 
-  return { bridge, kanban }
+  return { bridge, connecting, kanban }
 }
 
 function useRpc<T>(
   method: string,
   params: Record<string, unknown>,
-  { intervalMs = MIN_POLL_INTERVAL_MS }: { intervalMs?: number } = {}
+  { intervalMs = MIN_POLL_INTERVAL_MS, topic }: { intervalMs?: number; topic?: RefetchTopic } = {}
 ): RpcState<T> {
   const requestRef = useRef({ method, params })
   const [state, setState] = useState<RpcState<T>>({ data: null, error: null, loading: true })
@@ -1021,8 +1114,13 @@ function useRpc<T>(
       }
     }
 
-    const scheduleEventRefresh = () => {
-      if (host.state.gateway.get() !== 'open' || refreshTimer !== null) {
+    const scheduleEventRefresh = (event: unknown) => {
+      if (
+        !topic
+        || !shouldRefetchForEvent(event, topic)
+        || host.state.gateway.get() !== 'open'
+        || refreshTimer !== null
+      ) {
         return
       }
 
@@ -1034,17 +1132,20 @@ function useRpc<T>(
 
     void refresh()
     const interval = setInterval(() => void refresh(), pollIntervalMs)
-    const offEvent = host.onEvent('*', scheduleEventRefresh)
+    // Only events that can change this data; streaming deltas never refetch.
+    const offEvents: Array<() => void> = topic
+      ? refetchEventTypes(topic).map(type => host.onEvent(type, scheduleEventRefresh))
+      : []
 
     return () => {
       live = false
       clearInterval(interval)
-      offEvent()
+      offEvents.forEach(off => off())
       if (refreshTimer !== null) {
         clearTimeout(refreshTimer)
       }
     }
-  }, [intervalMs])
+  }, [intervalMs, topic])
 
   return state
 }
@@ -1190,6 +1291,7 @@ function normalizeCronRows(value: unknown): CronRow[] {
         prompt: promptPreview.endsWith('...') ? '' : promptPreview,
         promptPreview,
         schedule: schedule || 'Schedule unavailable',
+        script: stringValue(item.script),
         state: stringValue(item.state)
       }
     ]
@@ -1237,10 +1339,6 @@ function recentRoutineOutcome(row: CronRow): 'completed' | 'failed' | null {
   return null
 }
 
-function formatSessionAge(timestamp: number | null, now = Date.now()): string {
-  return timestamp === null ? 'Time unavailable' : relativeTime(timestamp, now)
-}
-
 function sessionIdFromSource(source: string): string | null {
   const match = source.trim().match(/^session:(.+)$/i)
   return match?.[1]?.trim() || null
@@ -1253,70 +1351,9 @@ function gmailSourceFromSource(source: string): { account: string; messageId: st
   return account && messageId ? { account, messageId } : null
 }
 
-function telegramChatIdFromSource(source: string): string | null {
-  const match = source.trim().match(/^telegram:(.+)$/i)
-  return match?.[1]?.trim() || null
-}
-
 function cronJobIdFromSource(source: string): string | null {
   const match = source.trim().match(/^cron:(.+)$/i)
   return match?.[1]?.trim() || null
-}
-
-function isCalendarSource(source: string): boolean {
-  return /^calendar:[^:]+:.+$/i.test(source.trim())
-}
-
-function telegramSourceLabel(item: TownFeedItem, chatId: string): string {
-  const summaryName = item.summary.match(/^(?:telegram(?: chat)?|chat)\s*[:\u00b7\u2014-]\s*([^:\n\u00b7\u2014]{1,60})/i)?.[1]?.trim()
-  const headlineName = item.headline.match(/^([^:\n]{1,60}):\s/)?.[1]?.trim()
-  return summaryName || headlineName || chatId
-}
-
-function townFeedSourceReference(item: TownFeedItem, cronRows: CronRow[]): { icon: string; label: string } {
-  if (sessionIdFromSource(item.source)) {
-    return { icon: 'comment-discussion', label: 'Session' }
-  }
-
-  const gmail = gmailSourceFromSource(item.source)
-  if (gmail) {
-    return { icon: 'mail', label: gmail.account.split('@', 1)[0] || 'Gmail' }
-  }
-
-  const telegramChatId = telegramChatIdFromSource(item.source)
-  if (telegramChatId) {
-    return { icon: 'send', label: telegramSourceLabel(item, telegramChatId) }
-  }
-
-  const cronJobId = cronJobIdFromSource(item.source)
-  if (cronJobId) {
-    return { icon: 'clock', label: cronRows.find(row => row.id === cronJobId)?.name || 'Routine' }
-  }
-
-  if (isCalendarSource(item.source)) {
-    return { icon: 'calendar', label: 'Calendar' }
-  }
-
-  return { icon: 'symbol-misc', label: item.source || 'Hermes' }
-}
-
-function referencesTownFeedCurator(value: string): boolean {
-  const folded = value.toLowerCase()
-  return folded.includes('town feed curator') || folded.includes('town_feed_curate')
-}
-
-function stripImportantPreviewBlock(value: string): string {
-  return value.replace(/^\s*\[IMPORTANT:[\s\S]*?\]\s*/i, '')
-}
-
-function sessionFallbackRows(rows: SessionRow[]): SessionRow[] {
-  return rows.flatMap(row => {
-    if (referencesTownFeedCurator(row.title) || referencesTownFeedCurator(row.preview)) {
-      return []
-    }
-
-    return [{ ...row, preview: stripImportantPreviewBlock(row.preview) }]
-  })
 }
 
 const ACTIVE_KANBAN_COLUMNS = ['triage', 'todo', 'scheduled', 'ready', 'running', 'blocked', 'review'] as const
@@ -1461,16 +1498,6 @@ function CardSkeleton({ rows = 3 }: { rows?: number }) {
       ))}
     </div>
   )
-}
-
-function runTone(status: string): 'bad' | 'good' | 'muted' {
-  if (status === 'ok') {
-    return 'good'
-  }
-  if (status === 'error' || status === 'failed') {
-    return 'bad'
-  }
-  return 'muted'
 }
 
 function openRunHistory(event: { currentTarget: { dataset: { jobId?: string; jobName?: string } } }): void {
@@ -1642,16 +1669,14 @@ function RunHistoryDialog() {
             {runs.map(run => (
               <div className="space-y-2" key={`${run.startedAt}-${run.status}`}>
                 <div className="flex items-center gap-2 text-xs text-(--ui-text-secondary)">
-                  <StatusDot tone={runTone(run.status)} />
+                  <StatusDot tone={runStatusTone(run.status, run.delivered)} />
                   <span>{relativeTime(run.startedAt, now)}</span>
-                  <span className="text-(--ui-text-tertiary)">
-                    {run.status && run.status.trim().toLowerCase() !== 'unknown' ? run.status : '—'}
-                  </span>
+                  <span className="text-(--ui-text-tertiary)">{humanRunStatus(run.status, run.delivered)}</span>
                 </div>
                 <ScrollArea className="max-h-40 rounded border border-(--ui-stroke-secondary)">
-                  <pre className="whitespace-pre-wrap break-words p-3 font-mono text-xs text-(--ui-text-secondary)">
-                    {presentRunOutput(run.output || run.error) || 'No output was saved.'}
-                  </pre>
+                  <div className="whitespace-pre-wrap break-words p-3 text-xs leading-5 text-(--ui-text-secondary)">
+                    {stripMarkdownToText(presentRunOutput(run.output || run.error)) || 'No output was saved.'}
+                  </div>
                 </ScrollArea>
               </div>
             ))}
@@ -1730,7 +1755,7 @@ function ScheduleDialog({ schedule }: { schedule: TownScheduleEvent[] }) {
                     const detailParts = [
                       event.conference,
                       event.location,
-                      event.attendees.length > 0 ? `with ${event.attendees.slice(0, 3).join(', ')}${event.attendees.length > 3 ? ` +${event.attendees.length - 3}` : ''}` : null
+                      scheduleAttendeeSummary(event.attendeeDetails, event.attendeeCount)
                     ].filter((part): part is string => Boolean(part))
                     const details = detailParts.join(' · ')
 
@@ -1797,6 +1822,17 @@ function SectionCard({
       <div className="mt-4">{children}</div>
     </section>
   )
+}
+
+const TWO_LINE_CLAMP: React.CSSProperties = { display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }
+
+// U13: a card header's freshness stamp only appears once the data is stale.
+function FreshnessStamp({ at, now }: { at: number | null; now: number }) {
+  if (at === null || !isStale(at, now)) {
+    return null
+  }
+  const age = relativeTime(at, now)
+  return <Badge size="xs" title={`Last refreshed ${age}`} variant="warn">{age}</Badge>
 }
 
 function CardEmptyState({
@@ -1877,6 +1913,9 @@ const COMPOSER_MODES: ReadonlyArray<{ id: ComposerMode; label: string }> = [
   { id: 'chat', label: 'Chat' }
 ]
 
+// U13: two rows at rest; the draft grows it (field-sizing) up to a cap, then it scrolls.
+const COMPOSER_TEXTAREA_STYLE: React.CSSProperties = { minHeight: 'calc(2lh + 0.75rem)', maxHeight: '15rem' }
+
 function composerTitle(prompt: string): string {
   return prompt.trim().split(/\r?\n/, 1)[0].trim().slice(0, 60)
 }
@@ -1903,6 +1942,7 @@ function TaskComposer() {
   const gateway = useValue(host.state.gateway)
   const composer = useValue($composer)
   const [sending, setSending] = useState(false)
+  const [focused, setFocused] = useState(false)
   const textareaRef = useRef<HTMLTextAreaElement | null>(null)
   const handledFocusRequestRef = useRef(composer.focusRequest)
   const sendingRef = useRef(sending)
@@ -1981,6 +2021,7 @@ function TaskComposer() {
 
   const disabled = sending || !composer.draft.trim() || gateway !== 'open'
   const gatewayOpen = gateway === 'open'
+  const showHint = !gatewayOpen || focused || composer.draft.length > 0
 
   return (
     <section
@@ -1988,16 +2029,20 @@ function TaskComposer() {
     >
       <Textarea
         aria-label="Task or chat prompt"
-        className="min-h-20 resize-y !rounded-none !border-0 !bg-transparent !shadow-none focus:!border-transparent focus:!shadow-none"
+        className="field-sizing-content min-h-0 resize-none !rounded-none !border-0 !bg-transparent !shadow-none focus:!border-transparent focus:!shadow-none"
+        onBlur={() => setFocused(false)}
         onChange={(event: { currentTarget: { value: string } }) => updateDraft(event.currentTarget.value)}
+        onFocus={() => setFocused(true)}
         onKeyDown={handleKeyDown}
         placeholder="Give Hermes a task…"
         ref={textareaRef}
+        rows={2}
+        style={COMPOSER_TEXTAREA_STYLE}
         value={composer.draft}
       />
       <div className="flex flex-wrap items-center justify-between gap-3 px-3 pb-3 pt-3">
         <span className="text-xs text-(--ui-text-tertiary)">
-          {gatewayOpen ? 'Enter to start · Shift+Enter for a new line' : 'Gateway offline — reconnecting…'}
+          {showHint ? (gatewayOpen ? 'Enter to start · Shift+Enter for a new line' : 'Gateway offline — reconnecting…') : null}
         </span>
         <div className="flex shrink-0 items-center gap-3">
           <SegmentedControl className="shrink-0" onChange={selectMode} options={COMPOSER_MODES} value={composer.mode} />
@@ -2089,16 +2134,18 @@ function KanbanTaskRow({ bridgeAvailable, column, completed, needsInputItem, onC
 
 function TasksCard({
   activeSessions,
+  cron,
   doneTaskWindowHours,
   sessions,
   waitingItems
 }: {
   activeSessions: RpcState<unknown>
+  cron: RpcState<unknown>
   doneTaskWindowHours: DoneTaskWindowHours
   sessions: RpcState<unknown>
   waitingItems: AttentionItem[]
 }) {
-  const { bridge, kanban } = useTownKanbanBridge()
+  const { bridge, connecting: kanbanConnecting, kanban } = useTownKanbanBridge()
   const now = useNow()
   const [optimisticTaskIds, setOptimisticTaskIds] = useState<Set<string>>(new Set())
   const bridgeRef = useRef(bridge)
@@ -2106,7 +2153,7 @@ function TasksCard({
   bridgeRef.current = bridge
   optimisticTaskIdsRef.current = optimisticTaskIds
   const sessionRows = normalizeSessions(sessions.data)
-  const fallbackRows = sessionFallbackRows(sessionRows)
+  const fallbackRows = tasksFallbackSessions(sessionRows, normalizeCronRows(cron.data))
   const showSessionsFallback = !bridge || !kanban || kanban.unavailable || Boolean(kanban.error)
   const waitingItemAliases = new Map<string, AttentionItem>()
   for (const item of waitingItems) {
@@ -2195,7 +2242,9 @@ function TasksCard({
         </div>
       ) : (
         <>
-          {showSessionsFallback ? (
+          {showSessionsFallback && kanbanConnecting ? (
+            <CardSkeleton rows={4} />
+          ) : showSessionsFallback ? (
             <div>
               <p className="mb-3 text-xs leading-5 text-(--ui-text-tertiary)">
                 Showing recent sessions (kanban bridge offline)
@@ -2212,25 +2261,30 @@ function TasksCard({
                 />
               ) : (
                 <div>
-                  {fallbackRows.slice(0, 5).map(session => (
-                    <button
-                      aria-label={`Open session ${session.title}`}
-                      className="-mx-2 block w-full min-w-0 cursor-pointer rounded-lg px-2 py-2.5 text-left transition-colors duration-150 hover:bg-(--ui-row-hover-background)"
-                      key={session.id}
-                      onClick={() => host.navigate(`/${encodeURIComponent(session.id)}`)}
-                      type="button"
-                    >
-                      <div className="flex min-w-0 items-center gap-3">
-                        <div className="min-w-0 flex-1 truncate text-sm font-medium" title={session.title}>
+                  {fallbackRows.slice(0, 5).map(session => {
+                    const origin = sessionSource(session.source)
+                    return (
+                      <button
+                        aria-label={`Open session ${session.title}`}
+                        className="-mx-2 flex w-full min-w-0 cursor-pointer items-center gap-3 rounded-lg px-2 py-2.5 text-left transition-colors duration-150 hover:bg-(--ui-row-hover-background)"
+                        key={session.id}
+                        onClick={() => host.navigate(`/${encodeURIComponent(session.id)}`)}
+                        type="button"
+                      >
+                        <span className="min-w-0 flex-1 truncate text-sm font-medium" title={session.title}>
                           {session.title}
-                        </div>
-                        <Badge variant="muted">{session.source || 'Session'}</Badge>
-                      </div>
-                      <div className="mt-1 min-w-0 truncate text-xs text-(--ui-text-tertiary)">
-                        {formatSessionAge(session.startedAt, now)}{session.preview ? ` · ${session.preview}` : ''}
-                      </div>
-                    </button>
-                  ))}
+                        </span>
+                        {session.startedAt === null ? null : (
+                          <span className="shrink-0 text-xs text-(--ui-text-tertiary)">{relativeTime(session.startedAt, now)}</span>
+                        )}
+                        <Tip label={origin.label}>
+                          <span aria-label={`Source: ${origin.label}`} className="flex shrink-0 text-(--ui-text-tertiary)" role="img">
+                            <Codicon name={origin.icon} size="0.75rem" />
+                          </span>
+                        </Tip>
+                      </button>
+                    )
+                  })}
                 </div>
               )}
             </div>
@@ -2304,7 +2358,7 @@ function RecentsCard({ cron, sessions }: { cron: RpcState<unknown>; sessions: Rp
   const [expanded, setExpanded] = useState(false)
   const sessionRows = normalizeRecentSessions(sessions.data)
   const routineRows = normalizeCronRows(cron.data).flatMap(row => {
-    if (!row.enabled || row.lastRunAt === null || TOWN_SCANNER_JOB_NAMES.has(row.name)) {
+    if (!row.enabled || row.lastRunAt === null || isInternalTownJob(row)) {
       return []
     }
 
@@ -2427,14 +2481,16 @@ function RecentlyDismissedStrip({
 }
 
 function NeedToKnowCard({ cron }: { cron: RpcState<unknown> }) {
-  const { bridge, feed } = useTownFeedBridge()
+  const { bridge, connecting, feed } = useTownFeedBridge()
   const now = useNow()
   const recentlyDismissed = useValue($recentlyDismissed)
   const bridgeRef = useRef(bridge)
   const feedRef = useRef(feed)
+  const cronRef = useRef(cron)
   const dismissalTimersRef = useRef(new Map<string, ReturnType<typeof setTimeout>>())
   bridgeRef.current = bridge
   feedRef.current = feed
+  cronRef.current = cron
 
   useEffect(() => () => {
     for (const timer of dismissalTimersRef.current.values()) {
@@ -2447,11 +2503,11 @@ function NeedToKnowCard({ cron }: { cron: RpcState<unknown> }) {
   if (!bridge || !feed) {
     return (
       <SectionCard sideRail title="Need to Know">
-        <CardEmptyState
+        {connecting ? <CardSkeleton rows={3} /> : <CardEmptyState
           action={<Button size="inline" type="button" variant="text" onClick={explainTownFeedPane}>How to open it</Button>}
           description="Load the Need to Know pane once to connect its live feed here."
           title="Feed not connected"
-        />
+        />}
       </SectionCard>
     )
   }
@@ -2533,7 +2589,14 @@ function NeedToKnowCard({ cron }: { cron: RpcState<unknown> }) {
     }
     const gmail = gmailSourceFromSource(source)
     if (gmail) {
-      window.open(`https://mail.google.com/mail/#inbox/${encodeURIComponent(gmail.messageId)}`, '_blank', 'noopener,noreferrer')
+      window.open(gmailUrl(item?.account || gmail.account, gmail.messageId), '_blank', 'noopener,noreferrer')
+      return
+    }
+    const jobId = cronJobIdFromSource(source)
+    if (jobId) {
+      const job = normalizeCronRows(cronRef.current.data).find(row => row.id === jobId)
+      $runHistoryTarget.set({ id: jobId, name: job?.name || 'Routine' })
+      $runHistoryDialogOpen.set(true)
     }
   }
 
@@ -2549,13 +2612,14 @@ function NeedToKnowCard({ cron }: { cron: RpcState<unknown> }) {
   const visibleItems = feed.items.slice(0, 3)
   const liveDismissals = recentlyDismissed.filter(entry => entry.expiresAt > now)
   const moreCount = Math.max(0, feed.items.length - visibleItems.length)
-  const cronRows = normalizeCronRows(cron.data)
 
   return (
     <SectionCard
       action={(
         <div className="flex items-center gap-1 text-xs text-(--ui-text-tertiary)">
-          {feed.curatedAt === null ? null : <span>{relativeTime(feed.curatedAt, now)}</span>}
+          {feed.curating
+            ? <span>Refreshing…</span>
+            : <FreshnessStamp at={feed.curatedAt} now={now} />}
           <Tip label={feed.curating ? 'Refreshing Need to Know' : 'Refresh Need to Know'}>
             <Button
               aria-label="Refresh Need to Know"
@@ -2605,106 +2669,76 @@ function NeedToKnowCard({ cron }: { cron: RpcState<unknown> }) {
             <RecentlyDismissedStrip entry={entry} key={entry.id} onUndo={undoDismiss} />
           ))}
           {visibleItems.map(item => {
-            const sessionId = sessionIdFromSource(item.source)
-            const gmail = gmailSourceFromSource(item.source)
-            const cronJobId = cronJobIdFromSource(item.source)
-            const cronJob = cronJobId ? cronRows.find(row => row.id === cronJobId) : null
-            const sourceReference = townFeedSourceReference(item, cronRows)
+            const action = sourceAction(item.source, { runs: true })
             const summary = item.summary || 'No additional summary is available.'
-            const created = item.createdAt === null ? 'Time unavailable' : relativeTime(item.createdAt, now)
+            const age = compactAge(item.createdAt, now)
 
             return (
               <article
                 className="group -mx-2 rounded-lg px-2 py-2.5 transition-colors duration-150 hover:bg-(--ui-row-hover-background)"
                 key={item.id}
               >
-                <h3 className="text-sm font-medium leading-5 text-(--ui-text-primary)">{item.headline}</h3>
-                <p
-                  className="mt-1 text-xs leading-4 text-(--ui-text-secondary)"
-                  style={{ display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}
-                  title={summary}
-                >
-                  {summary}
-                </p>
-                {item.actionHint ? (
-                  <p className="mt-1 truncate text-xs font-medium text-(--ui-accent)" title={item.actionHint}>{item.actionHint}</p>
-                ) : null}
-                <div className="mt-1 flex min-w-0 items-center gap-2 text-xs text-(--ui-text-tertiary)">
-                  {sessionId || gmail ? (
-                    <button
-                      aria-label={`${gmail ? 'Open in Gmail' : 'Open session'} for ${item.headline}`}
-                      className="inline-flex h-5 min-w-0 cursor-pointer items-center gap-1 rounded-full border border-(--ui-stroke-secondary) px-2 text-(--ui-text-secondary) transition-colors duration-150 hover:bg-(--chrome-action-hover) focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-(--ui-accent)"
-                      onClick={() => openSource(item.id)}
-                      type="button"
-                    >
-                      <span
-                        className="flex size-4 shrink-0 items-center justify-center rounded-full text-(--ui-accent) leading-none"
-                        style={{ background: 'var(--town-tint)' }}
+                <h3 className="text-sm font-medium leading-5 text-(--ui-text-primary)" style={TWO_LINE_CLAMP} title={item.headline}>
+                  {item.headline}
+                </h3>
+                <p className="mt-0.5 truncate text-xs leading-4 text-(--ui-text-secondary)" title={summary}>{summary}</p>
+                <div className="mt-1 flex min-w-0 items-center gap-1 text-xs">
+                  <div className="min-w-0 flex-1">
+                    {item.actionHint && action ? (
+                      <button
+                        className="block max-w-full cursor-pointer truncate text-left font-medium text-(--ui-accent) transition-colors duration-150 hover:text-(--ui-text-primary)"
+                        onClick={() => openSource(item.id)}
+                        title={`${item.actionHint} · ${action.label}`}
+                        type="button"
                       >
-                        <Codicon name={sourceReference.icon} size="0.6875rem" />
-                      </span>
-                      <span className="truncate">{sourceReference.label}</span>
-                    </button>
-                  ) : (
-                    <span className="inline-flex h-5 min-w-0 items-center gap-1 rounded-full border border-(--ui-stroke-secondary) px-2 text-(--ui-text-secondary)">
-                      <span
-                        className="flex size-4 shrink-0 items-center justify-center rounded-full text-(--ui-accent) leading-none"
-                        style={{ background: 'var(--town-tint)' }}
-                      >
-                        <Codicon name={sourceReference.icon} size="0.6875rem" />
-                      </span>
-                      <span className="truncate">{sourceReference.label}</span>
-                    </span>
-                  )}
-                  <span className="shrink-0">{created}</span>
-                </div>
-                <div className="mt-2 flex flex-wrap items-center justify-between gap-x-3 gap-y-2">
-                  <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+                        {item.actionHint}
+                      </button>
+                    ) : item.actionHint ? (
+                      <p className="truncate font-medium text-(--ui-accent)" title={item.actionHint}>{item.actionHint}</p>
+                    ) : null}
+                  </div>
+                  <Tip label="Dismiss">
                     <Button
+                      aria-label={`Dismiss ${item.headline}`}
                       className="opacity-0 transition-opacity duration-150 group-hover:opacity-100 focus-visible:opacity-100"
-                      size="inline"
+                      size="icon-xs"
                       type="button"
-                      variant="text"
+                      variant="ghost"
                       onClick={() => runAction(item.id, 'dismiss')}
                     >
-                      Dismiss
+                      <Codicon name="close" size="0.75rem" />
                     </Button>
+                  </Tip>
+                  <Tip label="Turn into task">
                     <Button
+                      aria-label={`Turn ${item.headline} into a task`}
                       className="opacity-0 transition-opacity duration-150 group-hover:opacity-100 focus-visible:opacity-100"
-                      size="inline"
+                      size="icon-xs"
                       type="button"
-                      variant="text"
+                      variant="ghost"
                       onClick={() => runAction(item.id, 'promote')}
                     >
-                      Turn into task
+                      <Codicon name="tasklist" size="0.75rem" />
                     </Button>
-                  </div>
-                  {gmail ? (
-                    <Button
-                      aria-label={`Open in Gmail for ${item.headline}`}
-                      className="h-6 shrink-0 gap-1.5 px-2 text-xs"
-                      size="inline"
-                      type="button"
-                      variant="outline"
-                      onClick={() => openSource(item.id)}
-                    >
-                      <Codicon name="mail" size="0.75rem" />
-                      <span>Open in Gmail</span>
-                    </Button>
-                  ) : cronJobId ? (
-                    <Button
-                      aria-label={`View run for ${item.headline}`}
-                      className="h-6 shrink-0 gap-1.5 px-2 text-xs"
-                      data-job-id={cronJobId}
-                      data-job-name={cronJob?.name || sourceReference.label}
-                      size="inline"
-                      type="button"
-                      variant="outline"
-                      onClick={openRunHistory}
-                    >
-                      <Codicon name="clock" size="0.75rem" />
-                      <span>View run</span>
-                    </Button>
+                  </Tip>
+                  {age !== null && item.createdAt !== null ? (
+                    <span className="shrink-0 px-1 tabular-nums text-(--ui-text-tertiary)" title={relativeTime(item.createdAt, now)}>
+                      {age}
+                    </span>
+                  ) : null}
+                  {action ? (
+                    <Tip label={action.label}>
+                      <Button
+                        aria-label={`${action.label} for ${item.headline}`}
+                        className="shrink-0 text-(--ui-text-secondary)"
+                        size="icon-xs"
+                        type="button"
+                        variant="ghost"
+                        onClick={() => openSource(item.id)}
+                      >
+                        <Codicon name={action.icon} size="0.75rem" />
+                      </Button>
+                    </Tip>
                   ) : null}
                 </div>
               </article>
@@ -2742,23 +2776,8 @@ function dayBriefCalloutIcon(kind: string): string {
   }
 }
 
-function suggestionInitials(label: string): string | null {
-  const match = label.trim().match(/^(\p{Lu}\p{L}*)\s+(\p{Lu}\p{L}*)\b/u)
-  return match ? `${match[1][0]}${match[2][0]}`.toUpperCase() : null
-}
-
-function suggestionIcon(kind: TownSuggestionKind): string {
-  if (kind === 'followup') {
-    return 'person'
-  }
-  if (kind === 'digest') {
-    return 'mail-read'
-  }
-  return 'tools'
-}
-
 function SuggestionsCard() {
-  const { bridge, feed } = useTownFeedBridge()
+  const { bridge, connecting, feed } = useTownFeedBridge()
   const now = useNow()
   const bridgeRef = useRef(bridge)
   const feedRef = useRef(feed)
@@ -2796,7 +2815,9 @@ function SuggestionsCard() {
     <SectionCard
       action={(
         <div className="flex items-center gap-1 text-xs text-(--ui-text-tertiary)">
-          {suggestionsGeneratedAt === null ? null : <span>{relativeTime(suggestionsGeneratedAt, now)}</span>}
+          {feed?.curating
+            ? <span>Refreshing…</span>
+            : <FreshnessStamp at={suggestionsGeneratedAt} now={now} />}
           <Tip label={feed?.curating ? 'Refreshing suggestions' : 'Refresh suggestions'}>
             <Button
               aria-label="Refresh suggestions"
@@ -2815,7 +2836,9 @@ function SuggestionsCard() {
       sideRail
       title="Suggestions"
     >
-      {!bridge || !feed ? (
+      {(!bridge || !feed) && connecting ? (
+        <CardSkeleton rows={2} />
+      ) : !bridge || !feed ? (
         <CardEmptyState
           action={<Button size="inline" type="button" variant="text" onClick={openTownFeed}>Open Need to Know</Button>}
           description="Load the Need to Know pane to connect curated next-step suggestions."
@@ -2848,37 +2871,27 @@ function SuggestionsCard() {
         />
       ) : (
         <div>
-          {suggestions.map(suggestion => {
-            const initials = suggestionInitials(suggestion.label)
-
-            return (
-              <button
-                aria-label={`Prefill composer with ${suggestion.label}`}
-                className="group -mx-2 flex w-full cursor-pointer items-start gap-3 rounded-lg px-2 py-2.5 text-left transition-colors duration-150 hover:bg-(--ui-row-hover-background) focus-visible:bg-(--ui-row-hover-background) focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-(--ui-accent)"
-                data-suggestion-id={suggestion.id}
-                key={suggestion.id}
-                type="button"
-                onClick={selectSuggestion}
+          {suggestions.map(suggestion => (
+            <button
+              aria-label={`Prefill composer with ${suggestion.label}`}
+              className="group -mx-2 flex w-full cursor-pointer items-center gap-3 rounded-lg px-2 py-2.5 text-left transition-colors duration-150 hover:bg-(--ui-row-hover-background) focus-visible:bg-(--ui-row-hover-background) focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-(--ui-accent)"
+              data-suggestion-id={suggestion.id}
+              key={suggestion.id}
+              type="button"
+              onClick={selectSuggestion}
+            >
+              <span className="min-w-0 flex-1 text-sm text-(--ui-text-primary)">
+                {suggestion.label}
+              </span>
+              <span
+                aria-hidden="true"
+                className="flex size-6 shrink-0 items-center justify-center rounded-md text-(--ui-text-tertiary) opacity-0 transition-all duration-150 group-hover:bg-(--ui-control-hover-background) group-hover:opacity-100 group-focus-visible:opacity-100"
+                title="Prefill"
               >
-                <span
-                  className={`flex size-6 shrink-0 items-center justify-center rounded-full text-xs font-medium leading-none ${initials ? 'text-(--ui-text-secondary)' : 'text-(--ui-accent)'}`}
-                  style={{ background: 'var(--town-tint)' }}
-                >
-                  {initials || <Codicon name={suggestionIcon(suggestion.kind)} size="0.75rem" />}
-                </span>
-                <span className="min-w-0 flex-1 text-sm text-(--ui-text-primary)">
-                  {suggestion.label}
-                </span>
-                <span
-                  aria-hidden="true"
-                  className="flex size-6 shrink-0 items-center justify-center rounded-md text-(--ui-text-tertiary) opacity-0 transition-all duration-150 group-hover:bg-(--ui-control-hover-background) group-hover:opacity-100 group-focus-visible:opacity-100"
-                  title="Prefill"
-                >
-                  <Codicon name="edit" size="0.75rem" />
-                </span>
-              </button>
-            )
-          })}
+                <Codicon name="edit" size="0.75rem" />
+              </span>
+            </button>
+          ))}
         </div>
       )}
       <div className="mt-3 flex flex-wrap gap-2 border-t border-(--ui-stroke-secondary) pt-3">
@@ -2921,7 +2934,7 @@ function SuggestionsCard() {
           onClick={refresh}
         >
           <Codicon name="refresh" size="0.75rem" />
-          <span>Refresh feed</span>
+          <span>{feed?.curating ? 'Refreshing…' : 'Refresh feed'}</span>
         </Button>
       </div>
     </SectionCard>
@@ -2929,7 +2942,7 @@ function SuggestionsCard() {
 }
 
 function RoutinesCard({ cron }: { cron: RpcState<unknown> }) {
-  const rows = normalizeCronRows(cron.data)
+  const rows = normalizeCronRows(cron.data).filter(row => !isInternalTownJob(row))
   const cronError = cron.error || payloadError(cron.data)
   const cronBridge = useCronBridgeCapabilities()
   const now = useNow()
@@ -3008,6 +3021,8 @@ function RoutinesCard({ cron }: { cron: RpcState<unknown> }) {
         <div>
           {rows.map(row => {
             const outcome = routineOutcome(row, now)
+            // Failures and paused routines stay visible; healthy outcomes reveal on hover.
+            const outcomeAlwaysVisible = outcome.tone === 'bad' || outcome.tone === 'warn'
             const nextRun = row.nextRunAt === null ? (row.enabled ? 'Next run unavailable' : 'Paused') : relativeTime(row.nextRunAt, now)
             const description = routineDescription(row.promptPreview.replace(/\.\.\.$/, ''))
 
@@ -3052,7 +3067,7 @@ function RoutinesCard({ cron }: { cron: RpcState<unknown> }) {
                   </div>
                 ) : null}
                 <Button
-                  className="mt-1.5 h-auto min-w-0 justify-start gap-1.5 p-0 text-xs text-(--ui-text-secondary) opacity-0 transition-opacity duration-150 group-hover:opacity-100 focus-visible:opacity-100"
+                  className={`mt-1.5 h-auto min-w-0 justify-start gap-1.5 p-0 text-xs text-(--ui-text-secondary) ${outcomeAlwaysVisible ? '' : 'opacity-0 transition-opacity duration-150 group-hover:opacity-100 focus-visible:opacity-100'}`}
                   data-job-id={row.id}
                   data-job-name={row.name}
                   size="inline"
@@ -3127,13 +3142,14 @@ function BriefingCard({ cron }: { cron: RpcState<unknown> }) {
         setLoadingRun(false)
       }
     })
-  }, [briefing?.id, cronBridge.cronRuns])
+    // lastRunAt: a new day's run refetches without a remount.
+  }, [briefing?.id, briefing?.lastRunAt, cronBridge.cronRuns])
 
   const fallbackOutcome = briefing ? routineOutcome(briefing, now) : null
   const status = latestRun?.status || briefing?.lastStatus || 'unknown'
+  const delivered = latestRun?.delivered ?? null
   const timestamp = latestRun?.startedAt ?? briefing?.lastRunAt ?? null
-  const output = (latestRun?.output || latestRun?.error || '').replace(/\s+/g, ' ').trim()
-  const outputPreview = output.length > 200 ? `${output.slice(0, 199).trimEnd()}…` : output
+  const outputPreview = runOutputPreview(latestRun?.output || latestRun?.error || '')
   const clipboardAvailable = clipboardWriteAvailable()
 
   return (
@@ -3143,7 +3159,7 @@ function BriefingCard({ cron }: { cron: RpcState<unknown> }) {
       ) : cronError ? (
         <ErrorState className="py-6" description={cronError} title="Could not check briefing routines" />
       ) : briefing ? (
-        loadingRun ? (
+        loadingRun && !latestRun ? (
           <CardSkeleton rows={2} />
         ) : (
           <Button
@@ -3155,11 +3171,16 @@ function BriefingCard({ cron }: { cron: RpcState<unknown> }) {
             onClick={openRunHistory}
           >
             <span className="flex items-center gap-2 text-xs text-(--ui-text-secondary)">
-              <StatusDot tone={latestRun ? runTone(latestRun.status) : fallbackOutcome?.tone || 'muted'} />
+              <StatusDot tone={latestRun ? runStatusTone(latestRun.status, delivered) : fallbackOutcome?.tone || 'muted'} />
               <span>{timestamp === null ? 'Not run yet' : relativeTime(timestamp, now)}</span>
-              <span className="text-(--ui-text-tertiary)">{status}</span>
+              {timestamp === null ? null : (
+                <span className="text-(--ui-text-tertiary)">{humanRunStatus(status, delivered)}</span>
+              )}
             </span>
-            <span className="line-clamp-3 text-xs leading-5 text-(--ui-text-secondary)">
+            <span
+              className="text-xs leading-5 text-(--ui-text-secondary)"
+              style={{ display: '-webkit-box', WebkitLineClamp: 4, WebkitBoxOrient: 'vertical', overflow: 'hidden', whiteSpace: 'pre-line' }}
+            >
               {outputPreview || runError || 'No output was saved for the latest run.'}
             </span>
           </Button>
@@ -3271,9 +3292,14 @@ function closeCustomizeDialog(): void {
   setCustomizeDialogOpen(false)
 }
 
+function toggleUpNextVisibility(): void {
+  updateTownHomePreferences(current => ({ ...current, upNextVisible: !current.upNextVisible }))
+}
+
 function CustomizeDialog() {
   const open = useValue($customizeDialogOpen)
   const preferences = useValue($townHomePreferences)
+  const model = useValue(host.state.model)
 
   return (
     <Dialog open={open} onOpenChange={setCustomizeDialogOpen}>
@@ -3295,6 +3321,16 @@ function CustomizeDialog() {
         </div>
 
         <div className="space-y-1">
+          <div className="flex items-center gap-3 py-2.5">
+            <Switch
+              aria-label={`${preferences.upNextVisible ? 'Hide' : 'Show'} Up next`}
+              checked={preferences.upNextVisible}
+              onClick={toggleUpNextVisibility}
+              size="xs"
+            />
+            <span className="min-w-0 flex-1 text-sm font-medium">Up next</span>
+            <span className="shrink-0 text-xs text-(--ui-text-tertiary)">Under the header</span>
+          </div>
           {preferences.cardOrder.map((cardId, index) => (
             <div
               className="flex items-center gap-3 border-t border-(--ui-stroke-secondary) py-2.5 first:border-t-0"
@@ -3353,6 +3389,11 @@ function CustomizeDialog() {
           </Select>
         </div>
 
+        <div className="flex min-w-0 items-center justify-between gap-3 border-t border-(--ui-stroke-secondary) pt-4 text-sm">
+          <span className="shrink-0 font-medium">Model</span>
+          <span className="min-w-0 truncate text-(--ui-text-secondary)" title={model || 'No model selected'}>{model || 'Not selected'}</span>
+        </div>
+
         <DialogFooter>
           <Button type="button" onClick={closeCustomizeDialog}>Done</Button>
         </DialogFooter>
@@ -3381,6 +3422,7 @@ function TownHomeCard({
       return (
         <TasksCard
           activeSessions={activeSessions}
+          cron={cron}
           doneTaskWindowHours={doneTaskWindowHours}
           sessions={sessions}
           waitingItems={waitingItems}
@@ -3402,44 +3444,57 @@ function TownHomeCard({
 function TownHome() {
   const nowTimestamp = useNow()
   const gateway = useValue(host.state.gateway)
-  const model = useValue(host.state.model)
   const profile = useValue(host.state.profile)
   const activeSessionId = useValue(host.state.activeSessionId)
   const preferences = useValue($townHomePreferences)
-  const sessions = useRpc<unknown>('session.list', SESSION_LIST_PARAMS)
-  const activeSessions = useRpc<unknown>('session.active_list', ACTIVE_SESSION_PARAMS)
-  const cron = useRpc<unknown>('cron.manage', CRON_LIST_PARAMS)
+  const sessions = useRpc<unknown>('session.list', SESSION_LIST_PARAMS, { topic: 'sessions' })
+  const activeSessions = useRpc<unknown>('session.active_list', ACTIVE_SESSION_PARAMS, { topic: 'activeSessions' })
+  const cron = useRpc<unknown>('cron.manage', CRON_LIST_PARAMS, { topic: 'cron' })
   const { bridge: feedBridge, feed } = useTownFeedBridge()
   const markers = useAttentionMarkers(activeSessionId)
   const sessionRows = normalizeSessions(sessions.data)
   const activeRows = normalizeActiveSessions(activeSessions.data)
   const waitingItems = attentionItems(activeRows, sessionRows, markers, activeSessionId)
   const now = new Date(nowTimestamp)
-  const hour = now.getHours()
-  const greetingBase = hour < 12
-    ? now.getDay() === 1 ? 'Happy Monday' : 'Good morning'
-    : hour < 18 ? 'Good afternoon' : 'Good evening'
-  const greeting = preferences.userName ? `${greetingBase}, ${preferences.userName}.` : `${greetingBase}.`
-  const today = new Intl.DateTimeFormat(undefined, { day: 'numeric', month: 'long', weekday: 'long' }).format(now)
+  // S1: the header speaks in the operator's zone (away zone while away), never
+  // the renderer's implicit one; the renderer zone is only the fallback for a
+  // gateway that predates the operator profile.
+  const operator = feed?.operator ?? null
+  const where = feed?.where ?? null
+  const rendererZone = safeTimeZone(new Intl.DateTimeFormat().resolvedOptions().timeZone)
+  const homeTz = safeTimeZone(operator?.homeTimezone, rendererZone)
+  const displayTz = displayTimeZone(operator, where, rendererZone)
+  const greetingWord = greetingBase(nowTimestamp, displayTz)
+  const name = greetingName(preferences.userName, operator?.preferredName)
+  const greeting = name ? `${greetingWord}, ${name}.` : `${greetingWord}.`
+  const today = new Intl.DateTimeFormat(undefined, { day: 'numeric', month: 'long', weekday: 'long', timeZone: displayTz }).format(now)
   const cronAvailable = !cron.error && !payloadError(cron.data)
   const nextRoutine = cronAvailable
     ? normalizeCronRows(cron.data)
-        .filter(row => row.enabled && row.state !== 'paused' && row.nextRunAt !== null && row.nextRunAt >= now.getTime())
+        .filter(row => row.enabled && row.state !== 'paused' && row.nextRunAt !== null && row.nextRunAt >= now.getTime() && !isInternalTownJob(row))
         .sort((a, b) => (a.nextRunAt ?? Number.POSITIVE_INFINITY) - (b.nextRunAt ?? Number.POSITIVE_INFINITY))[0]
     : undefined
   const dayBrief = feed?.dayBrief ?? null
-  const contextLine = dayBrief?.daySummary
-    ? dayBrief.daySummary
-    : feed?.nextEvent
-      ? `Next: ${feed.nextEvent.summary} · ${relativeTime(feed.nextEvent.startAt, nowTimestamp)}`
-      : waitingItems.length > 0
-        ? `${waitingItems.length} ${waitingItems.length === 1 ? 'item' : 'items'} waiting on you`
-        : nextRoutine?.nextRunAt !== null && nextRoutine?.nextRunAt !== undefined
-          ? `Next routine: ${nextRoutine.name} · ${relativeTime(nextRoutine.nextRunAt, nowTimestamp)}`
-          : null
+  const upNext = feedBridge && feed && feed.schedule.length > 0
+    ? pickUpNext(feed.schedule, feed.scheduleContext, nowTimestamp, { displayTz, homeTz })
+    : null
+  const nextMeaningful = upNext?.rows.find(row => row.event.startAt > nowTimestamp)?.event ?? null
+  const contextLine = contextLineSource({
+    opener: dayBrief?.opener,
+    daySummary: dayBrief?.daySummary,
+    nextMeaningful,
+    legacyNextEvent: feed?.nextEvent ?? null,
+    scheduleLoaded: (feed?.schedule.length ?? 0) > 0,
+    waitingCount: waitingItems.length,
+    nextRoutine: nextRoutine && nextRoutine.nextRunAt !== null ? { name: nextRoutine.name, nextRunAt: nextRoutine.nextRunAt } : null,
+    relative: at => relativeTime(at, nowTimestamp)
+  })?.text ?? null
+  const locationChip = shouldShowLocationChip(where) ? locationChipLabel(where, dayBrief?.trip) : null
+  const callouts = dayBrief ? visibleCallouts(dayBrief.callouts, where) : []
   const accentColor = profileColor(profile)
-  const gatewayTone = gateway === 'open' ? 'good' : gateway === 'connecting' ? 'warn' : 'muted'
-  const gatewayLabel = gateway === 'open' ? 'Gateway online' : `Gateway ${gateway || 'idle'}`
+  const gatewayOffline = gateway !== 'open'
+  const gatewayTone = gateway === 'connecting' ? 'warn' : 'muted'
+  const gatewayLabel = gateway === 'connecting' ? 'Reconnecting' : 'Offline'
   const schedule = feedBridge && feed ? feed.schedule.filter(event => event.endAt >= now.getTime()) : []
   const [boardWide, attachBoard] = useBoardWide()
 
@@ -3463,14 +3518,15 @@ function TownHome() {
                   className="mb-3 block h-1 w-12 rounded-full bg-(--ui-stroke-secondary)"
                   style={accentColor ? { backgroundColor: accentColor } : undefined}
                 />
-                <div className="mb-2 flex items-center gap-2 text-sm text-(--ui-text-secondary)">
+                <div className="mb-2 flex min-w-0 flex-wrap items-center gap-2 text-sm text-(--ui-text-secondary)">
                   <p>{today}</p>
-                  {dayBrief?.trip ? (
-                    <Badge size="xs" variant="muted">
-                      {dayBrief.trip.label}
-                      {dayBrief.trip.dayN !== null
-                        ? ` · day ${dayBrief.trip.dayN}${dayBrief.trip.totalDays !== null ? ` of ${dayBrief.trip.totalDays}` : ''}`
-                        : ''}
+                  {locationChip ? (
+                    <Badge
+                      size="xs"
+                      title={where && where.evidence.length > 0 ? where.evidence.join(' · ') : undefined}
+                      variant="muted"
+                    >
+                      {locationChip}
                     </Badge>
                   ) : null}
                   {schedule.length > 0 ? (
@@ -3493,9 +3549,9 @@ function TownHome() {
                   {greeting}
                 </h1>
                 {contextLine ? <p className="mt-2 truncate text-sm text-(--ui-text-tertiary)" title={contextLine}>{contextLine}</p> : null}
-                {dayBrief && dayBrief.callouts.length > 0 ? (
+                {callouts.length > 0 ? (
                   <div className="mt-3 flex flex-col gap-1.5">
-                    {dayBrief.callouts.slice(0, 3).map((callout, index) => (
+                    {callouts.map((callout, index) => (
                       <button
                         className="flex min-w-0 cursor-pointer items-start gap-2 text-left text-xs text-(--ui-text-secondary) transition-colors duration-150 hover:text-(--ui-text-primary)"
                         key={`${callout.kind}-${index}`}
@@ -3512,17 +3568,12 @@ function TownHome() {
                 ) : null}
               </div>
               <div className="flex min-w-0 flex-wrap items-center gap-2">
-                <div className="inline-flex items-center gap-2 rounded-md border border-(--ui-stroke-secondary) px-2.5 py-1.5 text-xs text-(--ui-text-secondary)">
-                  <StatusDot tone={gatewayTone} />
-                  <span>{gatewayLabel}</span>
-                </div>
-                <div
-                  className="inline-flex min-w-0 items-center gap-2 rounded-md border border-(--ui-stroke-secondary) px-2.5 py-1.5 text-xs text-(--ui-text-secondary)"
-                  title={model || 'No model selected'}
-                >
-                  <span className="text-(--ui-text-tertiary)">Model</span>
-                  <span className="max-w-52 truncate font-medium text-(--ui-text-primary)">{model || 'Not selected'}</span>
-                </div>
+                {gatewayOffline ? (
+                  <span className="inline-flex items-center gap-1.5 text-xs text-(--ui-text-tertiary)" title={`Gateway ${gateway || 'idle'}`}>
+                    <StatusDot tone={gatewayTone} />
+                    <span>{gatewayLabel}</span>
+                  </span>
+                ) : null}
                 <Tip label="Customize Town">
                   <Button
                     aria-label="Customize Town"
@@ -3539,6 +3590,14 @@ function TownHome() {
             </header>
 
             <TaskComposer />
+
+            {preferences.upNextVisible && upNext ? (
+              <UpNext
+                result={upNext}
+                onOpenSchedule={openScheduleDialog}
+                renderPeople={event => <MeetingPeople event={event} prep={dayBrief?.prep} />}
+              />
+            ) : null}
 
             {preferences.cardOrder
               .filter(cardId => preferences.cardVisibility[cardId] && MAIN_CARD_IDS.has(cardId))
@@ -3585,6 +3644,7 @@ export default {
   name: 'Town Home',
   register(ctx: PluginContext) {
     pluginContext = ctx
+    bridgeWaitDeadline = Date.now() + BRIDGE_READY_TIMEOUT_MS
     try {
       $townHomePreferences.set(normalizeTownHomePreferences(ctx.storage.get(TOWN_HOME_PREFERENCES_KEY, defaultTownHomePreferences())))
     } catch {
