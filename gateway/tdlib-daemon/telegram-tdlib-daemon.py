@@ -9,6 +9,10 @@ Usage:
     ./telegram-tdlib-daemon.py login      # One-time login
     ./telegram-tdlib-daemon.py start     # Start daemon
     ./telegram-tdlib-daemon.py get-daily # Get today's messages
+
+Runtime contract and the HTTP response shapes: gateway/tdlib-daemon/README.md.
+Importing this module has no side effects (no tdjson, no directories, no log
+handlers) so the response shaping helpers can be unit tested without TDLib.
 """
 
 import json
@@ -21,22 +25,251 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
-import tdjson
+
+try:
+    import tdjson
+except ImportError:  # unit tests and tooling import the module without TDLib
+    tdjson = None
 
 # Config
 SESSION_DIR = Path(os.path.expanduser("~/.tdlib_daemon"))
 CONFIG_PATH = SESSION_DIR / "config.json"
 STATE_PATH = SESSION_DIR / "sync-state.json"
-LOG_PATH = SESSION_DIR / "daemon.log"
 HTTP_PORT = 18784
 
-SESSION_DIR.mkdir(parents=True, exist_ok=True)
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    handlers=[logging.FileHandler(LOG_PATH), logging.StreamHandler(sys.stdout)],
-)
+# Extra TDLib calls a single /messages request may spend resolving reply targets.
+MAX_REPLY_LOOKUPS = 20
+REPLY_LOOKUP_TIMEOUT = 5.0
+GROUP_LOOKUP_TIMEOUT = 5.0
+
 log = logging.getLogger(__name__)
+
+
+def hermes_home() -> Path:
+    return Path(os.environ.get("HERMES_HOME") or "~/.hermes").expanduser()
+
+
+def log_path() -> Path:
+    return hermes_home() / "logs" / "tdlib-daemon.log"
+
+
+def setup_runtime():
+    """Create the session dir and attach log handlers (called from main only)."""
+    SESSION_DIR.mkdir(parents=True, exist_ok=True)
+    path = log_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # launchd sends stdout/stderr to the same file, so only echo to a terminal.
+    handlers = [logging.FileHandler(path)]
+    if sys.stdout.isatty():
+        handlers.append(logging.StreamHandler(sys.stdout))
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        handlers=handlers,
+    )
+
+
+# --- Response shaping (pure: TDLib dicts + lookup callables in, JSON dicts out)
+
+CHAT_KINDS = {
+    "chatTypePrivate": "private",
+    "chatTypeBasicGroup": "group",
+    "chatTypeSupergroup": "supergroup",
+    "chatTypeSecret": "secret",
+}
+
+CONTENT_KINDS = {
+    "messageText": "text",
+    "messagePhoto": "photo",
+    "messageVideo": "video",
+    "messageVoiceNote": "voice",
+    "messageVideoNote": "video_note",
+    "messageSticker": "sticker",
+    "messageAnimation": "animation",
+    "messageDocument": "document",
+    "messageAudio": "audio",
+    "messagePoll": "poll",
+    "messageLocation": "location",
+    "messageContact": "contact",
+}
+
+
+def _obj(value) -> dict:
+    return value if isinstance(value, dict) else {}
+
+
+def user_display_name(user, user_id) -> str:
+    """First + last name, else the id as a string (the original /messages rule)."""
+    user = _obj(user)
+    if user.get("@type") == "user":
+        name = " ".join(filter(None, [user.get("first_name", ""), user.get("last_name", "")])).strip()
+        return name or str(user_id)
+    return str(user_id)
+
+
+def user_usernames(user) -> list:
+    """Active usernames in TDLib order; falls back to the legacy `username` field."""
+    user = _obj(user)
+    usernames = user.get("usernames")
+    if isinstance(usernames, dict):
+        return [u for u in usernames.get("active_usernames") or [] if isinstance(u, str) and u]
+    legacy = user.get("username")
+    return [legacy] if isinstance(legacy, str) and legacy else []
+
+
+def is_bot_user(user) -> bool:
+    return _obj(_obj(user).get("type")).get("@type") == "userTypeBot"
+
+
+def shape_me(user) -> dict:
+    usernames = user_usernames(user)
+    return {
+        "user_id": user.get("id"),
+        "first_name": user.get("first_name", ""),
+        "last_name": user.get("last_name", ""),
+        "username": usernames[0] if usernames else "",
+        "usernames": usernames,
+    }
+
+
+def chat_kind(chat) -> str:
+    chat_type = _obj(_obj(chat).get("type"))
+    kind = chat_type.get("@type")
+    if kind == "chatTypeSupergroup" and chat_type.get("is_channel"):
+        return "channel"
+    return CHAT_KINDS.get(kind, "unknown")
+
+
+def shape_chat(chat_id, chat, lookup_user=None, lookup_group=None) -> dict:
+    """A /chats or /muted-chats entry.
+
+    lookup_user(user_id) -> TDLib user | None; lookup_group(kind, id) -> TDLib
+    basicGroup/supergroup | None, with kind "basicGroup" or "supergroup".
+    """
+    chat = _obj(chat)
+    chat_type = _obj(chat.get("type"))
+    kind = chat_kind(chat)
+    entry = {"id": chat_id, "title": chat.get("title", "Unknown"), "type": kind}
+    if kind == "private":
+        user_id = chat_type.get("user_id")
+        if user_id:
+            entry["user_id"] = user_id
+            user = lookup_user(user_id) if lookup_user else None
+            if _obj(user).get("@type") == "user":
+                entry["is_bot"] = is_bot_user(user)
+        return entry
+    group = None
+    if lookup_group and kind == "group" and chat_type.get("basic_group_id"):
+        group = lookup_group("basicGroup", chat_type["basic_group_id"])
+    elif lookup_group and kind in ("supergroup", "channel") and chat_type.get("supergroup_id"):
+        group = lookup_group("supergroup", chat_type["supergroup_id"])
+    count = _obj(group).get("member_count")
+    if isinstance(count, int) and count > 0:  # supergroups report 0 when unknown
+        entry["member_count"] = count
+    return entry
+
+
+def content_kind(content) -> str:
+    return CONTENT_KINDS.get(_obj(content).get("@type"), "other")
+
+
+def utf16_slice(text: str, offset: int, length: int) -> str:
+    """Slice by UTF-16 code units, the unit TDLib entity offsets are measured in."""
+    data = text.encode("utf-16-le", "surrogatepass")
+    return data[offset * 2:(offset + length) * 2].decode("utf-16-le", "ignore")
+
+
+def extract_mentions(formatted) -> tuple:
+    """(user ids from MentionName entities, lowercased @usernames from Mention spans)."""
+    formatted = _obj(formatted)
+    text = formatted.get("text") if isinstance(formatted.get("text"), str) else ""
+    user_ids, usernames = [], []
+    for entity in formatted.get("entities") or []:
+        entity = _obj(entity)
+        entity_type = _obj(entity.get("type"))
+        kind = entity_type.get("@type")
+        if kind == "textEntityTypeMentionName":
+            user_id = entity_type.get("user_id")
+            if isinstance(user_id, int) and user_id and user_id not in user_ids:
+                user_ids.append(user_id)
+        elif kind == "textEntityTypeMention":
+            offset, length = entity.get("offset"), entity.get("length")
+            if not isinstance(offset, int) or not isinstance(length, int) or offset < 0 or length <= 0:
+                continue
+            username = utf16_slice(text, offset, length).strip().lstrip("@").lower()
+            if username and username not in usernames:
+                usernames.append(username)
+    return user_ids, usernames
+
+
+def shape_message(m, user_name) -> dict:
+    """A /messages entry without reply resolution. user_name(user_id) -> str."""
+    content = _obj(m.get("content"))
+    is_text = content.get("@type") == "messageText"
+    text = _obj(content.get("text")).get("text", "") if is_text else ""
+    sender = _obj(m.get("sender_id"))
+    sender_user_id = sender.get("user_id") if sender.get("@type") == "messageSenderUser" else None
+    entry = {
+        "id": m.get("id"),
+        "date": m.get("date"),
+        "text": text,
+    }
+    if sender_user_id:
+        entry["sender_user_id"] = sender_user_id
+        entry["sender_name"] = user_name(sender_user_id)
+    if sender.get("@type") == "messageSenderChat" and sender.get("chat_id"):
+        entry["sender_chat_id"] = sender["chat_id"]
+    entry["is_outgoing"] = bool(m.get("is_outgoing"))
+    entry["content_type"] = content_kind(content)
+    formatted = _obj(content.get("text") if is_text else content.get("caption"))
+    caption = formatted.get("text")
+    if not is_text and isinstance(caption, str) and caption:
+        entry["caption"] = caption
+    entry["mention_user_ids"], entry["mention_usernames"] = extract_mentions(formatted)
+    return entry
+
+
+def reply_target_id(m, chat_id):
+    """Id of the replied-to message when it is in the same chat, else None."""
+    reply_to = _obj(m.get("reply_to"))
+    if reply_to.get("@type") != "messageReplyToMessage":
+        return None
+    message_id = reply_to.get("message_id")
+    if not isinstance(message_id, int) or message_id <= 0 or reply_to.get("chat_id") != chat_id:
+        return None
+    return message_id
+
+
+def shape_messages(msgs, chat_id, user_name, fetch_message, max_lookups=MAX_REPLY_LOOKUPS) -> list:
+    """/messages entries, resolving reply senders from the batch first.
+
+    fetch_message(chat_id, message_id) -> TDLib message | None is called at most
+    once per missing reply target and at most max_lookups times in total.
+    """
+    msgs = [m for m in msgs if isinstance(m, dict)]
+    batch = {m.get("id"): m for m in msgs}
+    fetched = {}
+    results = []
+    for m in msgs:
+        entry = shape_message(m, user_name)
+        own_chat_id = m.get("chat_id") or chat_id
+        target_id = reply_target_id(m, own_chat_id)
+        if target_id is not None:
+            entry["reply_to_message_id"] = target_id
+            target = batch.get(target_id)
+            if target is None and target_id not in fetched and len(fetched) < max_lookups:
+                try:
+                    fetched[target_id] = fetch_message(own_chat_id, target_id)
+                except Exception:
+                    fetched[target_id] = None
+            if target is None:
+                target = fetched.get(target_id)
+            sender = _obj(_obj(target).get("sender_id"))
+            if sender.get("@type") == "messageSenderUser" and sender.get("user_id"):
+                entry["reply_to_sender_user_id"] = sender["user_id"]
+                entry["reply_to_sender_name"] = user_name(sender["user_id"])
+        results.append(entry)
+    return results
 
 
 class TDLibClient:
@@ -339,7 +572,56 @@ class SyncState:
 # Global
 _client = None
 _sync_state = None
-_user_name_cache = {}  # persistent user_id → display name cache across requests
+_user_cache = {}  # persistent user_id → TDLib user (None if getUser failed) across requests
+
+
+def get_user(user_id):
+    if user_id not in _user_cache:
+        try:
+            u = _client.send({"@type": "getUser", "user_id": user_id})
+        except Exception:
+            u = None
+        _user_cache[user_id] = u if isinstance(u, dict) and u.get("@type") == "user" else None
+    return _user_cache[user_id]
+
+
+def get_user_name(user_id):
+    return user_display_name(get_user(user_id), user_id)
+
+
+def get_group(kind, group_id):
+    """getBasicGroup / getSupergroup — offline (local) TDLib calls for user accounts."""
+    request = {
+        "basicGroup": {"@type": "getBasicGroup", "basic_group_id": group_id},
+        "supergroup": {"@type": "getSupergroup", "supergroup_id": group_id},
+    }.get(kind)
+    if request is None:
+        return None
+    try:
+        resp = _client.send(request, timeout=GROUP_LOOKUP_TIMEOUT)
+    except Exception:
+        return None
+    return resp if isinstance(resp, dict) and resp.get("@type") == kind else None
+
+
+def message_fetcher():
+    """Per-request getMessage lookup; stops calling TDLib after the first timeout."""
+    timed_out = [False]
+
+    def fetch(chat_id, message_id):
+        if timed_out[0]:
+            return None
+        resp = _client.send(
+            {"@type": "getMessage", "chat_id": chat_id, "message_id": message_id},
+            timeout=REPLY_LOOKUP_TIMEOUT,
+        )
+        if not isinstance(resp, dict):
+            return None
+        if resp.get("@type") == "error" and resp.get("message") == "timeout":
+            timed_out[0] = True
+        return resp if resp.get("@type") == "message" else None
+
+    return fetch
 
 
 def load_config():
@@ -366,7 +648,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 chats = []
                 for cid in chat_ids:
                     chat = _client.get_chat(cid)
-                    chats.append({"id": cid, "title": chat.get("title", "Unknown")})
+                    chats.append(shape_chat(cid, chat, get_user, get_group))
                 self._json({"chats": chats})
             
             elif parsed.path == "/muted-chats":
@@ -376,7 +658,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                     chat = _client.get_chat(cid)
                     ns = chat.get("notification_settings", {})
                     if ns.get("mute_for", 0) > 0:
-                        muted.append({"id": cid, "title": chat.get("title", "Unknown")})
+                        muted.append(shape_chat(cid, chat, get_user, get_group))
                 self._json({"muted_chats": muted})
 
             elif parsed.path == "/messages":
@@ -393,40 +675,9 @@ class RequestHandler(BaseHTTPRequestHandler):
                 from_id = int(from_id_param) if from_id_param else _sync_state.get_last_sync(chat_id)
                 
                 msgs = _client.get_messages(chat_id, from_message_id=from_id, limit=limit, cutoff_ts=cutoff_ts)
-                
-                # Use module-level persistent user name cache
-                global _user_name_cache
-                user_cache = _user_name_cache
-                def get_user_name(uid):
-                    if uid in user_cache:
-                        return user_cache[uid]
-                    try:
-                        u = _client.send({"@type": "getUser", "user_id": uid})
-                        if u and u.get("@type") == "user":
-                            name = " ".join(filter(None, [u.get("first_name",""), u.get("last_name","")])).strip()
-                            user_cache[uid] = name or str(uid)
-                        else:
-                            user_cache[uid] = str(uid)
-                    except:
-                        user_cache[uid] = str(uid)
-                    return user_cache[uid]
 
-                results = []
-                for m in msgs:
-                    content = m.get("content", {})
-                    text = content.get("text", {}).get("text", "") if content.get("@type") == "messageText" else ""
-                    sender = m.get("sender_id", {})
-                    sender_user_id = sender.get("user_id") if sender.get("@type") == "messageSenderUser" else None
-                    entry = {
-                        "id": m.get("id"),
-                        "date": m.get("date"),
-                        "text": text,
-                    }
-                    if sender_user_id:
-                        entry["sender_user_id"] = sender_user_id
-                        entry["sender_name"] = get_user_name(sender_user_id)
-                    results.append(entry)
-                
+                results = shape_messages(msgs, chat_id, get_user_name, message_fetcher())
+
                 # Only update sync state if we weren't doing a manual pagination
                 if not from_id_param and msgs:
                     _sync_state.set_last_sync(chat_id, msgs[0].get("id"))
@@ -442,7 +693,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/me":
                 resp = _client.send({"@type": "getMe"})
                 if resp and resp.get("@type") == "user":
-                    self._json({"user_id": resp.get("id"), "first_name": resp.get("first_name", ""), "last_name": resp.get("last_name", "")})
+                    self._json(shape_me(resp))
                 else:
                     self._json({"error": "Could not get user"}, 500)
             
@@ -585,7 +836,11 @@ def main():
     parser.add_argument("command", choices=["login", "start", "get-daily"])
     parser.add_argument("--days", type=int, default=1)
     args = parser.parse_args()
-    
+
+    if tdjson is None:
+        sys.exit("telegram-tdlib-daemon: tdjson is not importable; run with the TDLib venv's python")
+    setup_runtime()
+
     if args.command == "login":
         cmd_login()
     elif args.command == "start":
