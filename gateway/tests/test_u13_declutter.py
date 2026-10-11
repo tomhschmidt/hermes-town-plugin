@@ -275,6 +275,12 @@ class SuggestionFilterTest(ApiCase):
         prep = suggestion("s1", "Prepare for the Weekly Call")
         self.assertEqual(self.filtered([prep], events), [])
 
+    def test_generic_near_term_prep_is_dropped(self) -> None:
+        generic = suggestion("g", "Prepare for tonight's Example Co calls")
+        today = suggestion("t", "Get ready for today's meetings")
+        specific = suggestion("s", "Prepare the Q4 board deck for Friday")
+        self.assertEqual(self.filtered([generic, today, specific], []), ["s"])
+
     def test_unrelated_untouched_and_no_backfill(self) -> None:
         events = [row("Example Gala Dinner", 3, 6, location="Example Hall")]
         suggestions = [

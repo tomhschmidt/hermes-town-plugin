@@ -2439,6 +2439,13 @@ def _normalize_suggestions(value: Any) -> list[dict[str, str]]:
 # or a conflict callout already says. No backfill: fewer chips beat padding.
 SUGGESTION_PREP_WINDOW_SECONDS = 18 * 60 * 60
 _SUGGESTION_PREP_RE = re.compile(r"(?:prep|prepare|get\s+ready|join)\b", re.IGNORECASE)
+# "Prepare for tonight's calls": prep for near-term events named only
+# generically — Up next already shows them.
+_SUGGESTION_GENERIC_PREP_RE = re.compile(
+    r"\b(?:tonight|today|this\s+(?:morning|afternoon|evening))\b.*"
+    r"\b(?:calls?|meetings?|syncs?|events?|schedule)\b",
+    re.IGNORECASE,
+)
 _SUGGESTION_NAME_SPLIT_RE = re.compile(r"[\W_]+", re.UNICODE)
 
 
@@ -2495,8 +2502,9 @@ def _filter_suggestions(
     for suggestion in suggestions:
         raw_label = str(suggestion.get("label") or "").strip()
         label = _suggestion_text(raw_label)
-        if _SUGGESTION_PREP_RE.match(raw_label) and any(
-            _names_event(label, summary) for summary in upcoming
+        if _SUGGESTION_PREP_RE.match(raw_label) and (
+            any(_names_event(label, summary) for summary in upcoming)
+            or _SUGGESTION_GENERIC_PREP_RE.search(raw_label)
         ):
             continue
         if any(
@@ -2714,13 +2722,17 @@ def _llm_rank(
                 "makes a verification or investigation notably worthwhile—never merely "
                 "summarize a routine receipt; (4) events in the next 48 hours that "
                 "genuinely merit preparation: meetings, syncs, gatherings, travel, or "
-                "anything involving other people or a deliverable — use the supplied "
+                "anything involving other people or a deliverable — events starting "
+                "within the next 18 hours are already on the dashboard's Up next "
+                "list, so suggest prep for one only when there is a concrete "
+                "deliverable to produce and the chip names it (never a generic "
+                "'prepare for tonight's calls') — use the supplied "
                 "location, conference, organizer, and attendees to make prep chips "
                 "concrete, and when first_contact_attendees is present you may note "
                 "there is no prior email history with them (never claim that "
-                "otherwise); and (5) schedule_pressure: overlapping events or tight "
-                "start clusters deserve one pick-a-priority chip naming the competing "
-                "events, and venue_changes with tight gaps deserve a travel-buffer "
+                "otherwise); and (5) schedule_pressure: overlapping events are "
+                "already called out on the dashboard, so never make a pick-a-priority "
+                "chip for them; venue_changes with tight gaps deserve a travel-buffer "
                 "chip naming both venues — never invent travel durations. NEVER "
                 "suggest preparation for personal reminders or routine logistics "
                 "(medication, food deliveries, chores, recurring personal tasks) — "
