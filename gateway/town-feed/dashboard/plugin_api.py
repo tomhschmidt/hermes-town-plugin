@@ -2477,6 +2477,63 @@ def _names_event(label: str, summary: Any, *, distinctive: bool = True) -> bool:
     return False
 
 
+def _ensure_conflict_callout(
+    day_brief: Optional[dict[str, Any]],
+    schedule_context: Optional[dict[str, Any]],
+    now: float,
+    local_tz: Any,
+) -> Optional[dict[str, Any]]:
+    """Guarantee a conflict starting within 24h is called out once.
+
+    Callouts are LLM-chosen and vary run to run; the conflict callout is the
+    one place a schedule conflict shows (U13), so when the brief omits it the
+    curator adds a plain factual one first.
+    """
+    if not isinstance(day_brief, dict):
+        return day_brief
+    callouts = [callout for callout in day_brief.get("callouts") or [] if isinstance(callout, dict)]
+    covered = [
+        _suggestion_text(callout.get("text"))
+        for callout in callouts
+        if callout.get("kind") == "conflict"
+    ]
+    added: list[dict[str, str]] = []
+    for conflict in (schedule_context or {}).get("conflicts") or []:
+        if not isinstance(conflict, dict):
+            continue
+        a, b = conflict.get("a"), conflict.get("b")
+        a_start = _parse_timestamp(conflict.get("a_start_iso"))
+        b_start = _parse_timestamp(conflict.get("b_start_iso"))
+        if not a or not b or not a_start or not b_start:
+            continue
+        first = min(a_start, b_start)
+        if max(a_start, b_start) <= now or first > now + 24 * 60 * 60:
+            continue
+        # A conflict callout naming either event already shows this overlap
+        # (the LLM often shortens "Lunch with Bob" to "Lunch").
+        if any(
+            _names_event(text, a, distinctive=False) or _names_event(text, b, distinctive=False)
+            for text in covered
+        ):
+            continue
+        start = datetime.fromtimestamp(first, tz=local_tz)
+        today = datetime.fromtimestamp(now, tz=local_tz).date()
+        day = "today" if start.date() == today else (
+            "tomorrow" if (start.date() - today).days == 1 else start.strftime("%a")
+        )
+        clock = start.strftime("%-I:%M %p")
+        title_a = _EVENT_TITLE_TAIL_RE.sub("", str(a)).strip() or str(a)
+        title_b = _EVENT_TITLE_TAIL_RE.sub("", str(b)).strip() or str(b)
+        added.append({
+            "kind": "conflict",
+            "text": f"{title_a} overlaps {title_b} {day} at {clock}; pick a priority.",
+        })
+        covered.append(_suggestion_text(f"{a} {b}"))
+    if not added:
+        return day_brief
+    return {**day_brief, "callouts": (added + callouts)[:DAY_BRIEF_MAX_CALLOUTS]}
+
+
 def _filter_suggestions(
     suggestions: list[dict[str, str]],
     schedule_events: list[dict[str, Any]],
@@ -3411,6 +3468,8 @@ def run_curator(llm: Any = None) -> dict[str, Any]:
                     errors.append(f"day_brief: {day_brief_error}")
         else:
             day_brief = None
+
+    day_brief = _ensure_conflict_callout(day_brief, schedule_context, now, local_tz)
 
     # U13: filtered after the day brief is settled, so a conflict chip is
     # dropped only when a callout in the brief being served already shows it.

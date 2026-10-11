@@ -305,6 +305,32 @@ class SuggestionFilterTest(ApiCase):
         self.assertIs(kept[0], suggestions[2])
 
 
+class ConflictCalloutTest(ApiCase):
+    CONTEXT = {"conflicts": [{
+        "a": "Weekly Call - Alice leads", "a_start_iso": "", "b": "Lunch", "b_start_iso": "",
+        "overlap_minutes": 60,
+    }]}
+
+    def context(self, hours: float) -> dict[str, Any]:
+        conflict = dict(self.CONTEXT["conflicts"][0])
+        conflict["a_start_iso"] = self.api._iso_timestamp(NOW + hours * 3600)
+        conflict["b_start_iso"] = self.api._iso_timestamp(NOW + (hours + 1) * 3600)
+        return {"conflicts": [conflict]}
+
+    def test_added_first_when_missing_within_24h(self) -> None:
+        brief = {"opener": "x", "day_summary": "y", "callouts": [{"kind": "prep", "text": "Bring the deck."}]}
+        out = self.api._ensure_conflict_callout(brief, self.context(20), NOW, timezone.utc)
+        self.assertEqual([c["kind"] for c in out["callouts"]], ["conflict", "prep"])
+        self.assertTrue(out["callouts"][0]["text"].startswith("Weekly Call overlaps Lunch "))
+
+    def test_not_added_when_covered_or_far_or_no_brief(self) -> None:
+        covered = {"callouts": [{"kind": "conflict", "text": "Your Weekly Call overlaps Lunch; pick one."}]}
+        self.assertIs(self.api._ensure_conflict_callout(covered, self.context(5), NOW, timezone.utc), covered)
+        far = {"callouts": []}
+        self.assertIs(self.api._ensure_conflict_callout(far, self.context(30), NOW, timezone.utc), far)
+        self.assertIsNone(self.api._ensure_conflict_callout(None, self.context(5), NOW, timezone.utc))
+
+
 class CuratorSuggestionTest(ApiCase):
     """The filter runs inside run_curator, after the LLM, before persisting."""
 
@@ -383,9 +409,9 @@ class CuratorSuggestionTest(ApiCase):
         self.assertEqual([callout["kind"] for callout in state["day_brief"]["callouts"]],
                          ["conflict"])
 
-    def test_conflict_chip_survives_when_the_brief_has_no_conflict_callout(self) -> None:
+    def test_uncovered_conflict_gets_a_callout_and_its_chip_is_dropped(self) -> None:
         self.calendar_doc([
-            row("Design review", 2, 3, attendees=[SELF, BOB], location="Room 4"),
+            row("Design review - Alice leads", 2, 3, attendees=[SELF, BOB], location="Room 4"),
             row("Lunch with Bob", 2.5, 3.5, attendees=[SELF, BOB]),
         ])
         llm = BriefLLM()
@@ -395,7 +421,12 @@ class CuratorSuggestionTest(ApiCase):
             suggestion("reply", "Reply to Carol about the invoice"),
         ]
         self.api.run_curator(llm=llm)
-        self.assertEqual([entry["id"] for entry in self.state()["suggestions"]], ["conflict", "reply"])
+        state = self.state()
+        conflicts = [c for c in state["day_brief"]["callouts"] if c["kind"] == "conflict"]
+        self.assertEqual(len(conflicts), 1)
+        self.assertIn("Design review overlaps Lunch with Bob today at", conflicts[0]["text"])
+        self.assertEqual(state["day_brief"]["callouts"][0]["kind"], "conflict")
+        self.assertEqual([entry["id"] for entry in state["suggestions"]], ["reply"])
 
     def test_filtered_to_empty_replaces_the_previous_set(self) -> None:
         self.calendar_doc([row("Design review", 2, 3, attendees=[SELF, BOB], location="Room 4")])
