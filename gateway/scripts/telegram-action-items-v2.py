@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Daily Telegram action items report v2 - direct Bot API delivery."""
+import argparse
 import json
 import os
 import re
 import subprocess
 import sys
+import urllib.error
 import urllib.request
 import urllib.parse
 from datetime import datetime, timezone, timedelta
@@ -12,26 +14,15 @@ from pathlib import Path
 from urllib.parse import urlencode
 
 HERMES_HOME = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")).expanduser()
+# Persisted summary artifact (read downstream by the Morning briefing cron).
+ARTIFACT_DIR = HERMES_HOME / "cron" / "output" / "telegram-action-items-direct"
 HERMES_AGENT = HERMES_HOME / "hermes-agent"
-HERMES_VENV_PYTHON = HERMES_AGENT / ".venv" / "bin" / "python"
-if not HERMES_VENV_PYTHON.exists():
-    HERMES_VENV_PYTHON = HERMES_AGENT / "venv" / "bin" / "python"
-
-# Re-exec once into the Hermes venv so agent.auxiliary_client is importable.
-if (
-    HERMES_VENV_PYTHON.exists()
-    and Path(sys.executable).resolve() != HERMES_VENV_PYTHON.resolve()
-    and os.environ.get("HERMES_TELEGRAM_ACTION_ITEMS_BOOTSTRAPPED") != "1"
-):
-    os.environ["HERMES_TELEGRAM_ACTION_ITEMS_BOOTSTRAPPED"] = "1"
-    os.execv(
-        str(HERMES_VENV_PYTHON),
-        [str(HERMES_VENV_PYTHON), __file__, *sys.argv[1:]],
-    )
-
 if HERMES_AGENT.exists():
     sys.path.insert(0, str(HERMES_AGENT))
 
+# Bootstrap BEFORE importing agent dependencies. PM chooses a matching Python
+# and activates its packages; forcing the legacy .venv mixes Python ABIs.
+import hermes_bootstrap  # noqa: F401
 from agent import auxiliary_client
 
 DAEMON_URL = "http://127.0.0.1:18784"
@@ -94,14 +85,15 @@ _muted_chat_ids = None
 
 # ── Telegram delivery ────────────────────────────────────────────────────────
 
-def send_telegram(text: str) -> bool:
+def send_telegram(text: str, parse_mode: str | None = "Markdown") -> bool:
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": CHAT_ID,
         "text": text,
-        "parse_mode": "Markdown",
         "disable_web_page_preview": True,
     }
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
     if CRON_THREAD_ID:
         payload["message_thread_id"] = int(CRON_THREAD_ID)
     payload = json.dumps(payload).encode()
@@ -111,9 +103,40 @@ def send_telegram(text: str) -> bool:
         with urllib.request.urlopen(req, timeout=15) as resp:
             result = json.load(resp)
             return result.get("ok", False)
+    except urllib.error.HTTPError as e:
+        # Markdown parse errors are content-specific (unpaired */_ in LLM output);
+        # retry once as plain text so the report still lands.
+        body = ""
+        try:
+            body = e.read().decode(errors="replace")
+        except Exception:
+            pass
+        if "can't parse entities" in body:
+            print("Markdown parse rejected — retrying as plain text.", file=sys.stderr)
+            return send_telegram(text, parse_mode=None)
+        print(f"Telegram send error: {e}", file=sys.stderr)
+        return False
     except Exception as e:
         print(f"Telegram send error: {e}", file=sys.stderr)
         return False
+
+
+def delivery_note(no_send: bool, ok: bool) -> str:
+    if no_send:
+        return "Telegram send skipped (--no-send test run)."
+    return "Delivered to Telegram." if ok else "Telegram delivery FAILED."
+
+
+def persist_summary(summary: str, delivered_note: str) -> None:
+    """Persist the summary so downstream jobs (e.g. Morning briefing) can read it."""
+    try:
+        ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        text = f"# Telegram action items — {stamp}\n{delivered_note}\n\n{summary}\n"
+        (ARTIFACT_DIR / f"{stamp}.md").write_text(text)
+        (ARTIFACT_DIR / "latest.md").write_text(text)
+    except Exception as e:
+        print(f"Artifact write failed: {e}", file=sys.stderr)
 
 
 # ── Daemon helpers ───────────────────────────────────────────────────────────
@@ -190,16 +213,23 @@ Messages:
 {messages_text}
 ---"""
 
+    # Explicit timeout: task='monitor' falls back to _DEFAULT_AUX_TIMEOUT (60s), which
+    # a ~330-message prompt exceeds — 2026-09-15 run delivered "LLM error: Request
+    # timed out." Pass a generous timeout so large message volumes still summarize.
     try:
         response = auxiliary_client.call_llm(
             task="monitor",
             messages=[{"role": "user", "content": prompt}],
             temperature=0,
             max_tokens=1024,
+            timeout=300,
         )
-        return response.choices[0].message.content.strip()
+        summary = (response.choices[0].message.content or "").strip()
+        if not summary or summary.startswith("LLM error:"):
+            raise RuntimeError("Summarizer returned empty or error content")
+        return summary
     except Exception as e:
-        return f"LLM error: {str(e)[:200]}"
+        raise RuntimeError("Telegram action-items summarization failed; no digest published") from e
 
 
 # ── Apple Reminders ──────────────────────────────────────────────────────────
@@ -208,6 +238,20 @@ def add_to_reminders(summary: str) -> int:
     """Parse action item bullets from summary and add each to Daily Followups list.
     Returns number of items added. Sets due date to today at 5 PM."""
     added = 0
+    # Preflight: when TCC Reminders access is "Not determined", remindctl blocks on an
+    # unanswered consent prompt (hangs past timeout, adds nothing). Skip until granted.
+    try:
+        status = subprocess.run(["remindctl", "status"], capture_output=True, text=True, timeout=15)
+        if "Not determined" in (status.stdout or ""):
+            print(
+                "remindctl: Reminders TCC access 'Not determined' — skipping reminder adds "
+                "until permission is granted at the Mac.",
+                file=sys.stderr,
+            )
+            return 0
+    except Exception as e:
+        print(f"remindctl status preflight failed ({e}) — skipping reminder adds.", file=sys.stderr)
+        return 0
     # Due today at 5 PM local time
     due_today = datetime.now().strftime("%Y-%m-%d") + " 17:00"
     for line in summary.splitlines():
@@ -237,6 +281,13 @@ def add_to_reminders(summary: str) -> int:
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--no-send",
+        action="store_true",
+        help="Skip Telegram delivery and reminder adds; still write the artifact.",
+    )
+    args = parser.parse_args()
     cutoff_ts = int((datetime.now(timezone.utc) - timedelta(days=1)).timestamp())
 
     chats = get_chats()
@@ -260,7 +311,10 @@ def main():
     print(f"Collected {len(all_messages)} messages from {len(chats)} non-muted chats.", file=sys.stderr)
 
     if not all_messages:
-        send_telegram("📋 *Action items* _24h_\n\n✅ _No messages found._")
+        ok = False if args.no_send else send_telegram("📋 *Action items* _24h_\n\n✅ _No messages found._")
+        persist_summary("✅ No messages found.", delivery_note(args.no_send, ok))
+        if not args.no_send and not ok:
+            raise RuntimeError("Telegram delivery failed")
         return
 
     # Group by chat, sort each chat chronologically (oldest → newest)
@@ -288,11 +342,18 @@ def main():
         summary = get_llm_summary(messages_text)
 
     date_str = datetime.now(timezone.utc).strftime("%b %d")
-    ok = send_telegram(f"📋 *Action items* — _{date_str}_\n\n{summary}")
-    print("Delivered." if ok else "Delivery failed.", file=sys.stderr)
+    if args.no_send:
+        ok = False
+        print("Dry run: Telegram send skipped.", file=sys.stderr)
+    else:
+        ok = send_telegram(f"📋 *Action items* — _{date_str}_\n\n{summary}")
+        print("Delivered." if ok else "Delivery failed.", file=sys.stderr)
+    persist_summary(summary, delivery_note(args.no_send, ok))
+    if not args.no_send and not ok:
+        raise RuntimeError("Telegram delivery failed")
 
     # Add each action item to Apple Reminders
-    if "✅ No action items" not in summary:
+    if not args.no_send and "✅ No action items" not in summary:
         n = add_to_reminders(summary)
         print(f"Added {n} item(s) to Daily Followups reminders.", file=sys.stderr)
 
