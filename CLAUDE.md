@@ -31,7 +31,7 @@ Build "Town on Hermes": replicate the Town.com dashboard experience (Tasks, Need
 ## Hard rules (violations = broken plugin, from the official skill doc)
 
 1. `plugin.js` loads **uncompiled**. No JSX syntax, no TypeScript — `jsx()`/`jsxs()` calls from `react/jsx-runtime`. (Preferred: author in TSX and bundle with esbuild: `--bundle --format=esm --external:@hermes/plugin-sdk --external:react --external:react/jsx-runtime`, output to the plugins folder.)
-2. Only importable specifiers: `@hermes/plugin-sdk`, `react`, `react/jsx-runtime`. Anything else fails at load.
+2. Only importable specifiers: `@hermes/plugin-sdk`, `react`, `react/jsx-runtime`. Anything else fails at load. All import declarations must sit at the TOP of `plugin.js`: Hermes Desktop clients before hermes-agent #120208 rewrite specifiers with a lexer that a quote inside a regex literal derails, so a later (mid-file) import stays bare and the plugin fails to load (shows its raw id on the Plugins page). `scripts/build.mjs` hoists imports and fails the build otherwise; verify against the CLIENT's loader, not the gateway host's.
 3. Never hardcode colors/backgrounds. Theme vars only: `var(--ui-text-secondary)`, `var(--ui-accent)`, `var(--ui-stroke-secondary)`, etc. Leave pane backgrounds alone.
 4. Prefer SDK components (`Button`, `Badge`, `ScrollArea`, `EmptyState`, `Dialog*`, …) over hand-rolled elements; verify every identifier you render is actually imported (ReferenceError otherwise).
 5. Event/click handlers read state imperatively (`host.state.x.get()`), never from render closures.
