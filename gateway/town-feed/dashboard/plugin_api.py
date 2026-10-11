@@ -2528,10 +2528,15 @@ def run_curator(llm: Any = None) -> dict[str, Any]:
             "addressed_to_user",
             "operator_replied_after_ask",
             "action_hint",
+            "from_address",
         ):
             if field in prior:
                 candidate[field] = prior.get(field)
-        if not _is_ntk_candidate(candidate):
+        # Group chat items from before addressing data existed (R1b) cannot be
+        # shown to address the operator; the scanner re-emits any that do.
+        if candidate["source"].startswith("telegram:-") and "addressed_to_user" not in prior:
+            continue
+        if not _is_ntk_candidate(candidate) or _is_assistant_mail(candidate, assistant_senders):
             continue
         candidate["score"] = _heuristic_score(candidate, now)
         by_hash[digest] = candidate
@@ -2557,7 +2562,7 @@ def run_curator(llm: Any = None) -> dict[str, Any]:
     dismissed_keys = {
         candidate["key"] for candidate in candidates if _is_dismissed(snapshot_decisions, candidate)
     }
-    # Sent to the LLM but not returned: judged not worth showing (LLM mode only).
+    # Not returned by the LLM (declined, or beyond its cap): not shown (LLM mode only).
     declined_keys: set[str] = set()
     # Dismissed candidates are never shown, so they inform neither the ranking
     # nor the suggestions (whose fallback reads the ranking payload).
@@ -2565,9 +2570,6 @@ def run_curator(llm: Any = None) -> dict[str, Any]:
         candidate for candidate in candidates if candidate["key"] not in dismissed_keys
     ]
     if llm is not None and ranking_candidates:
-        sent_keys = {
-            candidate["key"] for candidate in ranking_candidates[:MAX_CANDIDATES_FOR_LLM]
-        }
         llm_rows, suggestions, llm_error = _llm_rank(
             ranking_candidates,
             llm,
@@ -2602,10 +2604,10 @@ def run_curator(llm: Any = None) -> dict[str, Any]:
                         candidate["score"] = round(max(0.0, min(100.0, float(row["score"]))), 2)
                     except (KeyError, TypeError, ValueError):
                         pass
-                elif candidate["key"] in sent_keys:
-                    declined_keys.add(candidate["key"])
                 else:
-                    candidate["score"] = max(0.0, float(candidate["score"]) - 20.0)
+                    # Declined, or beyond the LLM cap and never vetted: in LLM
+                    # mode only judged items are shown.
+                    declined_keys.add(candidate["key"])
         elif llm_error:
             ranking_mode = "heuristic (LLM fallback)"
             errors.append(f"llm: {llm_error}")
@@ -2687,7 +2689,8 @@ def run_curator(llm: Any = None) -> dict[str, Any]:
                 if field in candidate:
                     merged_item[field] = candidate.get(field)
             for field in (
-                "body", "account", "thread_id", "chat_name", "last_sender", "chat_type", "action_hint"
+                "body", "account", "thread_id", "chat_name", "last_sender", "chat_type",
+                "action_hint", "from_address",
             ):
                 if candidate.get(field):
                     merged_item[field] = candidate[field]

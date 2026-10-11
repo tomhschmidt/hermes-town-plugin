@@ -617,16 +617,15 @@ class JunkOutTest(CuratorCase):
         self.api.run_curator(llm=None)
         self.assertEqual(len(self.served()), 5)
 
-    def test_candidates_beyond_the_llm_cap_keep_heuristic_treatment(self) -> None:
+    def test_candidates_beyond_the_llm_cap_are_not_served_in_llm_mode(self) -> None:
         with mock.patch.object(self.api, "MAX_CANDIDATES_FOR_LLM", 3):
             llm = FakeLLM(lambda rows: [rows[0]["key"]])
             self.api.run_curator(llm=llm)
         sent = llm.inputs("town_feed_ranking")[0]
         self.assertEqual(len(sent), 3)
         served = {item["source"] for item in self.served()}
-        self.assertIn(sent[0]["source"], served)
-        self.assertTrue(served.isdisjoint({row["source"] for row in sent[1:]}))
-        self.assertEqual(len(served), 3)
+        # Only the judged pick: neither declined rows nor unvetted overflow.
+        self.assertEqual(served, {sent[0]["source"]})
 
     def test_at_most_three_calendar_items_are_served(self) -> None:
         items = [
@@ -665,6 +664,44 @@ class AssistantMailCuratorTest(CuratorCase):
         self.cron.doc(GMAIL_JOB, 5, {"candidates": [briefing, real]})
         self.api.run_curator(llm=None)
         self.assertEqual([item["source"] for item in self.served()], [f"gmail:{ACCOUNT}:m-2"])
+
+    def test_retained_assistant_mail_is_dropped_once_its_sender_is_known(self) -> None:
+        (self.home / "town-feed").mkdir()
+        (self.home / "town-feed" / "operator.json").write_text(
+            json.dumps({"assistant_senders": [ASSISTANT]}), encoding="utf-8"
+        )
+        self.cron.job(GMAIL_JOB, "town-gmail-scan")
+        real = gmail_candidate("m-3", "t-3", NOW - 300, "Venue deposit")
+        self.cron.doc(GMAIL_JOB, 5, {"candidates": [real]})
+        self.api.run_curator(llm=None)
+        stored = [i for i in self.state()["items"] if i["source"] == f"gmail:{ACCOUNT}:m-3"]
+        self.assertEqual(stored[0]["from_address"], "bob@example.com")  # persisted for later checks
+
+        briefing = self.prior_item(
+            gmail_candidate("m-4", "t-4", NOW - 900, "Morning Briefing", sender=f"Assistant <{ASSISTANT}>")
+        )
+        briefing["from_address"] = ASSISTANT
+        state = self.state()
+        state["items"].append(briefing)
+        self.write_state(state)
+        self.api.run_curator(llm=None)
+        self.assertNotIn(f"gmail:{ACCOUNT}:m-4", {item["source"] for item in self.served()})
+
+
+class LegacyTelegramRetentionTest(CuratorCase):
+    def test_legacy_group_items_without_addressing_data_are_dropped(self) -> None:
+        group = self.prior_item(telegram_candidate(-1001, "g1", NOW - 3600, "so close", "Traders"))
+        dm = self.prior_item(telegram_candidate(4242, "d1", NOW - 3600, "Lunch Tuesday?", "Bob"))
+        addressed = dict(
+            self.prior_item(telegram_candidate(-1002, "g2", NOW - 3600, "@alice thoughts?", "Crew")),
+            addressed_to_user=True,
+        )
+        self.write_state({"version": 6, "items": [group, dm, addressed]})
+        self.api.run_curator(llm=None)
+        served = {item["source"] for item in self.served()}
+        self.assertNotIn("telegram:-1001", served)
+        self.assertIn("telegram:4242", served)
+        self.assertIn("telegram:-1002", served)
 
 
 # --- Signals ------------------------------------------------------------------

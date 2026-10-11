@@ -73,10 +73,15 @@ routes/desktop (R5), bootstrap headers (R2).
    the previous substantive assistant message, else no item.
 
 **Junk out**
-6. In LLM ranking mode, a candidate that was sent to the LLM (within
-   `MAX_CANDIDATES_FOR_LLM`) but not returned is not visible in `/feed`
-   (dropped from items). Candidates beyond the LLM cap keep today's
-   heuristic treatment. Heuristic/fallback mode is unchanged.
+6. In LLM ranking mode, only candidates the LLM returned are visible in
+   `/feed`: candidates sent but not returned (declined) and candidates
+   beyond `MAX_CANDIDATES_FOR_LLM` (never vetted) are dropped from items.
+   *(Amended 2026-10-11 after the first live run: 51 candidates, the LLM
+   kept 4 of 40, and the original "beyond the cap keeps heuristic
+   treatment" rule filled 6 of 10 slots with unvetted items.)* Retention
+   also drops legacy telegram GROUP items that predate R1b's
+   `addressed_to_user`, and gmail items whose persisted `from_address` is
+   an assistant sender. Heuristic/fallback mode is unchanged.
 7. At most 3 `calendar:` items appear in the served top `MAX_FEED_ITEMS`
    (in both modes); the rest are not served. Implement at serve time in
    `get_feed` (a small pure `_select_served(visible)` helper), not by
