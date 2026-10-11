@@ -65,6 +65,7 @@ MAX_OPEN_LOOPS_PAYLOAD = 15
 MAX_AWAITING_REPLY_PAYLOAD = 10
 SIGNAL_MAX_AGE_SECONDS = 21 * 24 * 60 * 60
 MAX_LABEL_DEPREFIX_MESSAGES = 200
+MAX_CANDIDATE_RECIPIENTS = 8
 MIN_LABEL_CONFIDENCE = 0.6
 MAX_LABELING_LOG = 500
 NEW_SENDER_LABEL = "new sender"
@@ -111,6 +112,8 @@ _GMAIL_SYSTEM_LABELS = {
 }
 
 _LABEL_IDS_BY_ACCOUNT: dict[str, dict[str, str]] = {}
+# Token file behind each scanned account, for the S2 People API refresh.
+_TOKEN_PATHS_BY_ACCOUNT: dict[str, Path] = {}
 _LABEL_RESOURCES_BY_ACCOUNT: dict[str, list[dict[str, Any]]] = {}
 _NO_REPLY_RE = re.compile(
     r"(?:^|[._+-])(?:no[._-]?reply|do[._-]?not[._-]?reply|donotreply)(?:[._+-]|$)",
@@ -144,6 +147,26 @@ def _headers(raw_headers: Any) -> dict[str, list[str]]:
 def _first_header(headers: dict[str, list[str]], name: str) -> str:
     values = headers.get(name.lower()) or []
     return values[0] if values else ""
+
+
+def _recipient_entries(headers: dict[str, list[str]]) -> list[dict[str, str]]:
+    """To/Cc recipients with their display names, for the people context (S2)."""
+    entries: list[dict[str, str]] = []
+    seen: set[str] = set()
+    raw = [value for name in ("to", "cc") for value in headers.get(name) or []]
+    for name, address in email.utils.getaddresses(raw):
+        address = address.strip().strip("<>").casefold()
+        if "@" not in address or address in seen:
+            continue
+        seen.add(address)
+        entry = {"email": address}
+        display = _compact(name, 80)
+        if display and "@" not in display:
+            entry["name"] = display
+        entries.append(entry)
+        if len(entries) >= MAX_CANDIDATE_RECIPIENTS:
+            break
+    return entries
 
 
 def _decode_gmail_body(data: str) -> str:
@@ -401,6 +424,7 @@ def _gmail_candidate(
         # junk rules; scan_gmail strips them before candidates are emitted.
         "_recipients": operator_profile.addresses(recipient_headers or [recipient]),
         "_list_unsubscribe": operator_profile.list_unsubscribe_addresses(list_unsubscribe),
+        "recipients": _recipient_entries(headers),
         "snippet": snippet,
         "body": body_for_classification,
         "message_id": message_id,
@@ -489,6 +513,7 @@ def scan_gmail(
                 continue
             if gmail_services is not None:
                 gmail_services[account] = service
+            _TOKEN_PATHS_BY_ACCOUNT[account] = token_path
 
             previous_watermark = _watermark(watermarks.get(account))
             listed = service.users().messages().list(
@@ -1965,4 +1990,106 @@ def label_gmail_messages(
         open_loops,
         state,
         profile,
+    )
+
+
+# --- S2: people directory refresh --------------------------------------------
+
+_PEOPLE_MODULE_NAME = "hermes_town_people"
+
+
+def _load_people_module() -> ModuleType:
+    """The sibling people.py, loaded lazily so a broken copy never stops a scan."""
+    cached = sys.modules.get(_PEOPLE_MODULE_NAME)
+    if cached is not None:
+        return cached
+    path = Path(__file__).resolve().with_name("people.py")
+    spec = importlib.util.spec_from_file_location(_PEOPLE_MODULE_NAME, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[_PEOPLE_MODULE_NAME] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(_PEOPLE_MODULE_NAME, None)
+        raise
+    return module
+
+
+def _stored_scopes(token: dict[str, Any]) -> set[str]:
+    raw = token.get("scopes", token.get("scope", []))
+    if isinstance(raw, str):
+        values = raw.split()
+    elif isinstance(raw, list):
+        values = [value for value in raw if isinstance(value, str)]
+    else:
+        values = []
+    return {value.strip() for value in values if value.strip()}
+
+
+def _people_service(account: str, contacts_scopes: frozenset[str]) -> Any:
+    """A People API client for ``account``; None when its token lacks contacts scope.
+
+    Built from the token's own stored scopes (the Gmail client is downscoped
+    to Gmail). Credentials refresh in memory only, like every Town scanner.
+    """
+    token_path = _TOKEN_PATHS_BY_ACCOUNT.get(account)
+    if token_path is None:
+        return None
+    token = json.loads(token_path.read_text(encoding="utf-8"))
+    if not isinstance(token, dict):
+        raise RuntimeError("token file is not a JSON object")
+    scopes = _stored_scopes(token)
+    if not scopes & contacts_scopes:
+        return None
+    from google.auth.transport.requests import Request
+    from google.oauth2.credentials import Credentials
+    from googleapiclient.discovery import build
+
+    creds = Credentials.from_authorized_user_info(token, scopes=sorted(scopes))
+    if creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+    if not creds.valid:
+        raise RuntimeError("OAuth credentials are invalid or expired and could not be refreshed")
+    return build("people", "v1", credentials=creds, cache_discovery=False)
+
+
+def refresh_people(
+    hermes_home: Path,
+    now: float,
+    *,
+    gmail_services: MutableMapping[str, Any],
+    inbound: list[dict[str, Any]],
+    outbound: list[dict[str, Any]],
+    known_contacts: list[str],
+    log: Any,
+    profile: dict[str, Any] | None = None,
+    people_service: Any = None,
+) -> dict[str, int]:
+    """Refresh ``people-cache.json`` for the accounts this scan reached.
+
+    Read-only Google calls (People ``connections.list``; Gmail sent-mail
+    ``messages.list``/``get(format=metadata)``), each at most once per 24 h per
+    account. Returns counts only; raises only on an unusable people module.
+    """
+    people = _load_people_module()
+    accounts = sorted(str(account or "").strip().casefold() for account in gmail_services)
+    if profile is None:
+        profile = operator_profile.load_operator_profile(hermes_home, account_addresses=accounts)
+    if people_service is None:
+        def people_service(account: str) -> Any:
+            return _people_service(account, people.CONTACTS_SCOPES)
+
+    return people.refresh_people_cache(
+        hermes_home,
+        now,
+        accounts=accounts,
+        gmail_services=gmail_services,
+        people_service=people_service,
+        inbound=inbound,
+        outbound=outbound,
+        known_contacts=known_contacts,
+        profile=profile,
+        log=log,
     )

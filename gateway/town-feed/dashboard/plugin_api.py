@@ -377,6 +377,16 @@ def _normalize_event_attendees(value: Any) -> list[dict[str, Any]]:
             entry["response"] = response[:24]
         if raw.get("self") is True:
             entry["self"] = True
+        # S2: directory facts from the calendar scan's people enrichment.
+        org = str(raw.get("org") or "").strip()
+        if org:
+            entry["org"] = _compact(org, 80)
+        if raw.get("relationship") in _PEOPLE_RELATIONSHIPS:
+            entry["relationship"] = raw["relationship"]
+        last_contact = raw.get("last_contact_ts")
+        if isinstance(last_contact, (int, float)) and not isinstance(last_contact, bool):
+            if math.isfinite(last_contact) and last_contact > 0:
+                entry["last_contact_ts"] = float(last_contact)
         attendees.append(entry)
     return attendees
 
@@ -452,6 +462,7 @@ def _normalize_schedule_events(value: Any) -> list[dict[str, Any]]:
         ical_uid = str(raw_event.get("ical_uid") or "").strip()
         if ical_uid:
             event["ical_uid"] = ical_uid[:255]
+        event["event_key"] = _event_key(event)
         events.append(event)
         if len(events) >= MAX_SCHEDULE_EVENTS:
             break
@@ -498,6 +509,10 @@ def _normalize_day_brief(value: Any) -> Optional[dict[str, Any]]:
         text = str(value.get(field) or "").strip()
         if text:
             normalized[field] = text
+    # S2: meeting prep (absent from briefs written before S2).
+    prep = _normalize_day_brief_prep(value.get("prep"))
+    if prep:
+        normalized["prep"] = prep
     return normalized
 
 
@@ -1678,6 +1693,281 @@ def _day_brief_input_hash(
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+# --- S2: who people are (directory facts for both LLM lanes) --------------
+
+_PEOPLE_MODULE = "hermes_town_people"
+_PEOPLE_RELATIONSHIPS = {"colleague", "contact", "correspondent", "new"}
+_MEETING_EVENT_TYPES = {"", "default", "fromGmail"}
+MAX_ROW_PEOPLE_ATTENDEES = 5
+MAX_MEETING_PEOPLE_EVENTS = 4
+MAX_MEETING_PEOPLE = 6
+DAY_BRIEF_MAX_PREP = 2
+DAY_BRIEF_PREP_LINE_CHARS = 90
+DAY_BRIEF_TALKING_POINT_CHARS = 140
+
+
+def _people_module() -> Optional[Any]:
+    """The sibling people.py, loaded by path; ``None`` means no people facts."""
+    cached = sys.modules.get(_PEOPLE_MODULE)
+    if cached is not None:
+        return cached
+    path = Path(__file__).resolve().with_name("people.py")
+    try:
+        spec = importlib.util.spec_from_file_location(_PEOPLE_MODULE, path)
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[_PEOPLE_MODULE] = module
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(_PEOPLE_MODULE, None)
+        return None
+    return module
+
+
+def _people_index(
+    profile: dict[str, Any],
+    accounts: Iterable[Any],
+    known_contacts: Optional[set[str]],
+    now: float,
+) -> Optional[Any]:
+    """One curation pass's view of the people directory (None without it).
+
+    Connected accounts count as the operator's own addresses (their custom
+    domains make colleagues), exactly as when the directory was built.
+    """
+    module = _people_module()
+    if module is None:
+        return None
+    try:
+        own = list(profile.get("self_addresses") or [])
+        own.extend(str(account or "").strip().casefold() for account in accounts if account)
+        return module.PeopleIndex(
+            module.load_directory(get_hermes_home()),
+            dict(profile, self_addresses=own),
+            now=now,
+            known=known_contacts or (),
+        )
+    except Exception:
+        return None
+
+
+def _event_key(event: dict[str, Any]) -> str:
+    """A stable id for one occurrence, shared by /feed rows and day-brief prep."""
+    identity = str(event.get("ical_uid") or "").strip() or " ".join(
+        str(event.get("summary") or "").split()
+    ).casefold()
+    start = _parse_timestamp(event.get("start_iso"))
+    digest = hashlib.sha256(f"{identity}\n{start:.0f}".encode("utf-8")).hexdigest()
+    return f"ev_{digest[:12]}"
+
+
+def _schedule_event_for(
+    candidate: dict[str, Any], schedule_events: list[dict[str, Any]]
+) -> Optional[dict[str, Any]]:
+    """The schedule row behind a ``calendar:`` candidate (account + start, then title)."""
+    kind, _, rest = str(candidate.get("source") or "").partition(":")
+    if kind != "calendar" or not rest:
+        return None
+    account = rest.partition(":")[0].strip().casefold()
+    start = float(candidate.get("created_at_ts") or 0.0)
+    matches = [
+        event
+        for event in schedule_events
+        if str(event.get("account") or "").strip().casefold() == account
+        and abs(_parse_timestamp(event.get("start_iso")) - start) < 1.0
+    ]
+    if len(matches) <= 1:
+        return matches[0] if matches else None
+    headline = " ".join(str(candidate.get("headline") or "").split()).casefold()
+    for event in matches:
+        summary = " ".join(str(event.get("summary") or "").split()).casefold()
+        if summary and headline.startswith(summary):
+            return event
+    return None
+
+
+def _row_people(
+    item: dict[str, Any], people: Any, schedule_events: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Ranking-row people: a Gmail sender + up to 4 recipients, or up to 5 attendees."""
+    source = str(item.get("source") or "")
+    if source.startswith("gmail:"):
+        return people.message_people(item)
+    event = _schedule_event_for(item, schedule_events)
+    entries: list[dict[str, Any]] = []
+    for attendee in (event or {}).get("attendees") or []:
+        entry = people.attendee_entry(attendee) if isinstance(attendee, dict) else None
+        if entry:
+            entries.append(entry)
+        if len(entries) >= MAX_ROW_PEOPLE_ATTENDEES:
+            break
+    return entries
+
+
+_PEOPLE_RANKING_RULES = (
+    "A row's people entries describe its sender, recipients, or attendees: "
+    "name, org, relationship (colleague, contact, correspondent, or new), "
+    "last_contact, and title when known. Introduce people by name, with their "
+    "org or relationship when supplied. Never invent roles, titles, orgs, or "
+    "relationships beyond those fields. Say there is no prior email history "
+    "with someone only when their relationship is new — never for a "
+    "colleague, contact, or correspondent. "
+)
+
+
+def _meeting_people(
+    schedule_events: list[dict[str, Any]], people: Any, now: float, local_tz: Any
+) -> list[dict[str, Any]]:
+    """Day-brief input: up to 4 meetings in the next 24 h x up to 6 people each."""
+    meetings: list[dict[str, Any]] = []
+    for event in sorted(schedule_events, key=lambda row: _parse_timestamp(row.get("start_iso"))):
+        if event.get("all_day") is True:
+            continue
+        if str(event.get("event_type") or "") not in _MEETING_EVENT_TYPES:
+            continue
+        start_ts = _parse_timestamp(event.get("start_iso"))
+        if not start_ts or start_ts < now or start_ts > now + 24 * 3600:
+            continue
+        entries: list[dict[str, Any]] = []
+        for attendee in event.get("attendees") or []:
+            entry = people.attendee_entry(attendee, with_email=True) if isinstance(attendee, dict) else None
+            if entry and entry.get("email"):
+                entries.append(entry)
+            if len(entries) >= MAX_MEETING_PEOPLE:
+                break
+        if not entries:
+            continue
+        meeting: dict[str, Any] = {
+            "event_key": str(event.get("event_key") or "") or _event_key(event),
+            "summary": _compact(str(event.get("summary") or ""), 160),
+            "start_local": datetime.fromtimestamp(start_ts, tz=local_tz).strftime("%a %-I:%M %p"),
+            "people": entries,
+        }
+        count = event.get("attendee_count")
+        if isinstance(count, int) and count > len(entries) + 1:
+            meeting["attendee_count"] = count
+        details = str(event.get("description_excerpt") or "").strip()
+        if details:
+            meeting["details"] = _compact(details, 400)
+        meetings.append(meeting)
+        if len(meetings) >= MAX_MEETING_PEOPLE_EVENTS:
+            break
+    return meetings
+
+
+_DAY_BRIEF_PREP_SCHEMA = {
+    "type": "array",
+    "maxItems": DAY_BRIEF_MAX_PREP,
+    "items": {
+        "type": "object",
+        "properties": {
+            "event_key": {"type": "string"},
+            "people": {
+                "type": "array",
+                "maxItems": MAX_MEETING_PEOPLE,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "email": {"type": "string"},
+                        "line": {"type": "string", "maxLength": DAY_BRIEF_PREP_LINE_CHARS},
+                    },
+                    "required": ["email", "line"],
+                    "additionalProperties": False,
+                },
+            },
+            "talking_point": {"type": "string", "maxLength": DAY_BRIEF_TALKING_POINT_CHARS},
+        },
+        "required": ["event_key", "people"],
+        "additionalProperties": False,
+    },
+}
+
+_DAY_BRIEF_PEOPLE_RULES = (
+    " meeting_people lists the people in the next meetings with name, org, "
+    "relationship (colleague, contact, correspondent, or new), last_contact, "
+    "and title when known: introduce attendees by name with that org or "
+    "relationship, and never invent roles or relationships. The prep field "
+    "(separate from prep callouts): for at most the next two meetings in "
+    "meeting_people, return event_key copied unchanged, people as {email "
+    "copied unchanged, line} for attendees worth a word, and an optional "
+    "talking_point. Each line is at most 90 characters and grounded only in "
+    "that person's supplied facts and the meeting details; say there is no "
+    "prior email history only when relationship is new. talking_point is one "
+    "concrete opener grounded in the meeting details or the people facts; "
+    "omit it when nothing grounded fits. Skip declined attendees. With no "
+    "meeting_people, return an empty prep array."
+)
+
+
+def _normalize_day_brief_prep(value: Any) -> list[dict[str, Any]]:
+    """``[{event_key, people: [{email, line}], talking_point?}]``, at most 2."""
+    if not isinstance(value, list):
+        return []
+    prep: list[dict[str, Any]] = []
+    seen_keys: set[str] = set()
+    for raw in value:
+        if not isinstance(raw, dict):
+            continue
+        event_key = str(raw.get("event_key") or "").strip()[:64]
+        if not event_key or event_key in seen_keys:
+            continue
+        people: list[dict[str, str]] = []
+        emails: set[str] = set()
+        raw_people = raw.get("people")
+        for person in raw_people[:MAX_MEETING_PEOPLE] if isinstance(raw_people, list) else []:
+            if not isinstance(person, dict):
+                continue
+            email = str(person.get("email") or "").strip().casefold()[:254]
+            line = _bounded_compact(str(person.get("line") or ""), DAY_BRIEF_PREP_LINE_CHARS)
+            if "@" in email and line and email not in emails:
+                emails.add(email)
+                people.append({"email": email, "line": line})
+        entry: dict[str, Any] = {"event_key": event_key, "people": people}
+        talking_point = _bounded_compact(
+            str(raw.get("talking_point") or ""), DAY_BRIEF_TALKING_POINT_CHARS
+        )
+        if talking_point:
+            entry["talking_point"] = talking_point
+        if people or talking_point:
+            prep.append(entry)
+            seen_keys.add(event_key)
+        if len(prep) >= DAY_BRIEF_MAX_PREP:
+            break
+    return prep
+
+
+def _ground_prep(value: Any, meetings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Raw LLM prep kept only for the next two supplied meetings and their people.
+
+    Grounding runs before normalization caps the list, so an invented entry
+    can never crowd out a real one.
+    """
+    allowed = {
+        meeting["event_key"]: {
+            person["email"] for person in meeting["people"] if person.get("email")
+        }
+        for meeting in meetings[:DAY_BRIEF_MAX_PREP]
+    }
+    grounded: list[dict[str, Any]] = []
+    for raw in value if isinstance(value, list) else []:
+        if not isinstance(raw, dict):
+            continue
+        event_key = str(raw.get("event_key") or "").strip()
+        emails = allowed.get(event_key)
+        if emails is None:
+            continue
+        raw_people = raw.get("people") if isinstance(raw.get("people"), list) else []
+        people = [
+            person
+            for person in raw_people
+            if isinstance(person, dict)
+            and str(person.get("email") or "").strip().casefold() in emails
+        ]
+        grounded.append(dict(raw, event_key=event_key, people=people))
+    return _normalize_day_brief_prep(grounded)
+
+
 def _suggestion_signal_groups(
     candidates: list[dict[str, Any]],
     awaiting_reply: list[dict[str, Any]],
@@ -1688,6 +1978,7 @@ def _suggestion_signal_groups(
     now: float,
     known_contacts: Optional[set[str]] = None,
     schedule_context: Optional[dict[str, Any]] = None,
+    people: Optional[Any] = None,
 ) -> dict[str, Any]:
     action_mail: list[dict[str, Any]] = []
     orders: list[dict[str, Any]] = []
@@ -1840,15 +2131,17 @@ def _suggestion_signal_groups(
                 name = str(attendee.get("name") or "").strip()
                 if name or email:
                     display.append(name or email)
-                if known_contacts and email and email not in known_contacts:
+                # S2: first contact = relationship ``new`` in the people
+                # directory; colleagues, contacts, and correspondents never are.
+                if people is not None and email and people.is_first_contact(attendee):
                     first_contact.append(email)
             if display:
                 signal["attendees"] = display
             count = event.get("attendee_count")
             if isinstance(count, int) and count > len(display):
                 signal["attendee_count"] = count
-            # Grounded first-contact: claimable only against the sent-mail
-            # correspondent set — absent that set, no claim is possible.
+            # Grounded first-contact: claimable only against the people
+            # directory — absent it, no claim is possible.
             if first_contact:
                 signal["first_contact_attendees"] = first_contact
         description = str(event.get("description_excerpt") or "").strip()
@@ -1972,6 +2265,7 @@ def _llm_rank(
     known_contacts: Optional[set[str]] = None,
     schedule_context: Optional[dict[str, Any]] = None,
     has_enriched_contract: bool = False,
+    people: Optional[Any] = None,
 ) -> tuple[dict[str, dict[str, Any]], list[dict[str, str]], Optional[str]]:
     schema = {
         "type": "object",
@@ -2042,11 +2336,17 @@ def _llm_rank(
             for field in ("user_spoke_last", "addressed_to_user", "operator_replied_after_ask"):
                 if isinstance(item.get(field), bool):
                     row[field] = item[field]
+        # S2: who the people on this row are.
+        if people is not None:
+            row_people = _row_people(item, people, schedule_events or [])
+            if row_people:
+                row["people"] = row_people
         payload.append(row)
 
     legacy_instructions = (
         TOWN_VOICE
         + _RANKING_RULES
+        + _PEOPLE_RANKING_RULES
         + (
             "Also return 3-5 contextual suggestions fully grounded in the items you "
             "return and, whenever possible, derived from the top-ranked items. Write "
@@ -2073,6 +2373,7 @@ def _llm_rank(
             time.time() if now is None else now,
             known_contacts=known_contacts,
             schedule_context=schedule_context,
+            people=people,
         )
         llm_input = {
             "ranking_candidates": payload,
@@ -2089,6 +2390,7 @@ def _llm_rank(
                 "urgent reason, except an order of at least $100 is notable. "
             )
             + _RANKING_RULES
+            + _PEOPLE_RANKING_RULES
             + (
                 "Also return 3-5 suggestions by independently analyzing "
                 "suggestion_signals. Use the capped groups before "
@@ -2213,6 +2515,7 @@ def _generate_day_brief(
     top_headlines: list[str],
     known_contacts: Optional[set[str]],
     now: float,
+    people: Optional[Any] = None,
 ) -> tuple[Optional[dict[str, Any]], Optional[str]]:
     """One narrative sentence + grounded callouts for the dashboard header."""
     local_tz = _local_timezone()
@@ -2256,17 +2559,22 @@ def _generate_day_brief(
         "required": ["day_summary", "callouts"],
         "additionalProperties": False,
     }
+    # S2: meeting prep output; first contact = relationship ``new`` only.
+    schema["properties"]["prep"] = _DAY_BRIEF_PREP_SCHEMA
+    meeting_people = (
+        _meeting_people(schedule_events, people, now, local_tz) if people is not None else []
+    )
     first_contact: list[str] = []
-    if known_contacts:
+    if people is not None:
         for event in schedule_events:
             attendees = event.get("attendees")
             if not isinstance(attendees, list):
                 continue
             for attendee in attendees:
-                if not isinstance(attendee, dict) or attendee.get("self") is True:
+                if not isinstance(attendee, dict) or not people.is_first_contact(attendee):
                     continue
                 email = str(attendee.get("email") or "").strip().casefold()
-                if email and email not in known_contacts and email not in first_contact:
+                if email and email not in first_contact:
                     first_contact.append(email)
     llm_input = {
         "local_now": local_now.strftime("%A %b %-d, %-I:%M %p"),
@@ -2284,6 +2592,7 @@ def _generate_day_brief(
         ],
         "first_contact_attendees": first_contact[:8],
         "top_need_to_know": top_headlines[:5],
+        "meeting_people": meeting_people,
     }
     instructions = (
         TOWN_VOICE
@@ -2318,6 +2627,7 @@ def _generate_day_brief(
             "from the trip event or location text ('SF trip', 'SBC week'); copy "
             "day_n and total_days from the trip entry."
         )
+        + _DAY_BRIEF_PEOPLE_RULES
     )
     try:
         result = llm.complete_structured(
@@ -2326,13 +2636,18 @@ def _generate_day_brief(
             json_schema=schema,
             schema_name="town_day_brief",
             temperature=0.2,
-            max_tokens=700,
+            # S2: room for prep lines (2 meetings x up to 6 people) after the callouts.
+            max_tokens=1200,
             purpose="town-day-brief",
         )
         parsed = getattr(result, "parsed", None)
         brief = _normalize_day_brief(parsed if isinstance(parsed, dict) else None)
         if brief is None:
             return None, "day brief response had no usable day_summary"
+        brief.pop("prep", None)
+        prep = _ground_prep(parsed.get("prep"), meeting_people)
+        if prep:
+            brief["prep"] = prep
         return brief, None
     except Exception as exc:
         return None, str(exc)
@@ -2476,6 +2791,18 @@ def run_curator(llm: Any = None) -> dict[str, Any]:
     memory_items, memory_hashes, memory_errors = _scan_memory(now, previous_hashes)
     errors = session_errors + cron_errors + memory_errors
     schedule_context = _schedule_context(schedule_events, now)
+    # S2: one people-directory view for both LLM lanes.
+    people_index = _people_index(
+        profile,
+        [event.get("account") for event in schedule_events]
+        + [
+            item.get("account")
+            for item in cron_items
+            if str(item.get("source") or "").startswith("gmail:")
+        ],
+        known_contacts,
+        now,
+    )
 
     by_hash: dict[str, dict[str, Any]] = {}
     for candidate in session_items + cron_items + memory_items:
@@ -2528,6 +2855,9 @@ def run_curator(llm: Any = None) -> dict[str, Any]:
             "addressed_to_user",
             "operator_replied_after_ask",
             "action_hint",
+            "from",
+            "from_address",
+            "recipients",
         ):
             if field in prior:
                 candidate[field] = prior.get(field)
@@ -2581,6 +2911,7 @@ def run_curator(llm: Any = None) -> dict[str, Any]:
             known_contacts=known_contacts,
             schedule_context=schedule_context,
             has_enriched_contract=has_enriched_contract,
+            people=people_index,
         )
         if llm_rows:
             ranking_mode = "llm"
@@ -2634,6 +2965,7 @@ def run_curator(llm: Any = None) -> dict[str, Any]:
                     top_headlines=_top_headlines(candidates, dismissed_keys | declined_keys),
                     known_contacts=known_contacts,
                     now=now,
+                    people=people_index,
                 )
                 if generated is not None:
                     generated["generated_at"] = _iso_timestamp(now)
@@ -2693,6 +3025,11 @@ def run_curator(llm: Any = None) -> dict[str, Any]:
                     merged_item[field] = candidate[field]
             if candidate.get("user_spoke_last") is True:
                 merged_item["user_spoke_last"] = True
+            # S2: Gmail addressing survives retention so re-ranked mail keeps its people.
+            if str(candidate.get("source") or "").startswith("gmail:"):
+                for field in ("from", "from_address", "recipients"):
+                    if candidate.get(field):
+                        merged_item[field] = candidate[field]
             # R1b attribution signals must survive retention so re-ranked chat
             # items keep their addressing context.
             for field in ("addressed_to_user", "operator_replied_after_ask"):
@@ -2817,6 +3154,9 @@ def get_feed() -> dict[str, Any]:
                 "trip": day_brief.get("trip"),
                 "generated_at": day_brief.get("generated_at"),
             }
+            # S2: per-meeting prep lines, keyed by the schedule rows' event_key.
+            if day_brief.get("prep"):
+                day_brief_payload["prep"] = day_brief["prep"]
     return {
         "items": _select_served(visible),
         "curated_at": _iso_timestamp(curated_timestamp) if curated_timestamp else None,

@@ -4,7 +4,7 @@ Deploy these four files together to `~/.hermes/scripts/`. Hermes cron resolves t
 
 | Script | stdout JSON contract | Exit codes | Persistent state |
 |---|---|---|---|
-| `town-gmail-scan.py` | Always prints `{"candidates": [...], "labeling": {"applied": n, "skipped": [...], "errors": [...]}, "watermarks_advanced": bool}`. | `0` success, `2` config/state, `3` plugin/Hermes import, `4` auxiliary classifier, `5` Gmail API or labeling. | Owns `~/.hermes/town-feed/gmail-state.json` and `.gmail-state.lock`; on first load it copies Gmail-owned legacy fields from the plugin's `feed-state.json` without modifying that file. |
+| `town-gmail-scan.py` | Always prints `{"candidates": [...], "labeling": {"applied": n, "skipped": [...], "errors": [...]}, "watermarks_advanced": bool}`. Candidates carry `recipients` (To/Cc `{email, name?}`, at most 8) for the curator's people context. | `0` success, `2` config/state, `3` plugin/Hermes import, `4` auxiliary classifier, `5` Gmail API or labeling. | Owns `~/.hermes/town-feed/gmail-state.json` and `.gmail-state.lock`; on first load it copies Gmail-owned legacy fields from the plugin's `feed-state.json` without modifying that file. |
 | `town-telegram-scan.py` | Prints `{"candidates": [...]}` only when changed threads exist; successful quiet scans have empty stdout. | `0` success, `2` config/state, `3` runtime import, `5` local Telegram daemon API. | Owns `~/.hermes/town-feed/telegram-state.json` and `.telegram-state.lock` with per-chat watermarks. |
 | `town-calendar-scan.py` | Prints `{"candidates": [...], "next_event": {...} | null, "events": [...]}` when events exist (see [Calendar time and event types](#calendar-time-and-event-types)); no scoped tokens or no events produce empty stdout. | `0` success/quiet, `2` token/config, `3` Google API imports, `5` Calendar auth/API. | No state file. Reads `~/.hermes/google_token.json` and `~/.hermes/google-accounts/*/google_token.json`; refreshes credentials in memory only. |
 | `town-curate.py` | Always prints the installed plugin's curator result object, including `{"ok": false, "error": ...}` on setup/state failures. | `0` success, `2` curator state/result, `3` plugin/Hermes import, `4` heuristic fallback after auxiliary LLM failure. | The installed plugin owns `~/.hermes/plugins/town-feed/feed-state.json` and its lock. |
@@ -87,3 +87,28 @@ events starting within 24 h that have another attendee, a conference link,
 or a location; `next_event` is the earliest future timed `default`/`fromGmail`
 event. Working-location, birthday, focus-time, and out-of-office rows are
 schedule-only.
+
+## People directory
+
+`town-gmail-scan.py` also maintains `~/.hermes/town-feed/people-cache.json`
+(mode `0600`, written atomically, at most 5000 people) through the installed
+plugin's `people.py`: who each address is (name, org, title), its
+relationship to the operator (`colleague` > `contact` > `correspondent` >
+`new`), and when email was last exchanged. Per connected account it reads,
+read-only and at most once per 24 h (a failed source retries after an hour):
+
+- Google Contacts via the People API `people/me` connections
+  (`names,emailAddresses,organizations`), only when the account's token
+  carries `contacts.readonly` (otherwise skipped; one stderr line a day);
+- To/Cc recipients of up to 500 SENT messages from the last 180 days
+  (`messages.list` + `messages.get(format=metadata)`).
+
+Inbound real-person senders and the operator's own sends seen by every scan
+merge in incrementally. A colleague is anyone on a `work_domains` domain from
+`operator.json` or on a non-consumer domain of the operator's own addresses.
+The refresh runs before the scan's own errors are printed and never changes
+the exit code or stdout; failures log one `town-gmail-scan: people refresh:`
+line with addresses redacted. `town-calendar-scan.py` reads the cache to add
+`name`, `org`, `relationship`, and `last_contact_ts` to each non-self
+attendee (no cache, no enrichment) and flags the operator's own addresses
+`self`, which also survive the 8-entry attendee cap.
