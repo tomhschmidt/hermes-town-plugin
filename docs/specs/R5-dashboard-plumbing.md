@@ -28,7 +28,7 @@ imperative handlers, ≥ few-second polling, bridge-only cross-plugin data).*
 5. **Open in Gmail** ignores the account (`/mail/#inbox/<id>`), opening
    the wrong mailbox for the second account.
 6. **Fake initials** on suggestion chips: `suggestionInitials` turns
-   labels into "NP" (Nudge Patrick-style), "FM", "PT".
+   labels into "NB" (Nudge Bob-style), "FM", "PT".
 7. **Briefing card goes stale**: its effect depends on
    `[briefing?.id, cronRuns]`, so a new day's run is not fetched until
    remount.
