@@ -38,6 +38,8 @@ The required installed layout is:
 `-- dashboard/
     |-- manifest.json
     |-- dist/index.js
+    |-- google_scan.py
+    |-- operator_profile.py
     `-- plugin_api.py
 ```
 
@@ -76,6 +78,23 @@ decisions, suggestions, next_event) plus script-local
 `~/.hermes/town-feed/{gmail,telegram}-state.json` (watermarks,
 known-correspondent cache, labeling audit log). Google tokens are owned
 by the google-workspace skill; scripts refresh in memory only.
+
+## Operator profile (`~/.hermes/town-feed/operator.json`)
+
+Optional, user-owned, never in this repo. `dashboard/operator_profile.py`
+(deployed beside `plugin_api.py` and `google_scan.py`) reads it, falling back
+to the `**Name:**` / `**What to call them:**` / `**Timezone:**` /
+`**Telegram:**` lines of `~/.hermes/memories/USER.md`, then the system
+timezone. Connected Gmail accounts always count as the operator's own
+addresses; list any other aliases and the assistant address that mails you
+(e.g. your morning briefing) so that mail is never labeled or surfaced:
+
+```json
+{
+  "self_addresses": ["alias@example.com"],
+  "assistant_senders": ["assistant@example.com"]
+}
+```
 
 ## Verify locally on the gateway machine
 

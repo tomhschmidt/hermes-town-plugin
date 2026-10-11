@@ -8,17 +8,19 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import importlib.util
 import json
 import math
 import os
 import re
+import sys
 import tempfile
 import threading
 import time
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import Any, Iterable, Iterator, Optional
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -125,6 +127,39 @@ def _lock_path() -> Path:
     return _plugin_root() / ".feed-state.lock"
 
 
+_OPERATOR_PROFILE_MODULE = "hermes_town_operator_profile"
+
+
+def _operator_profile_module() -> Optional[Any]:
+    """The sibling operator_profile.py, loaded by path like this module.
+
+    ``None`` when it cannot load: curation then runs without the profile's
+    self/assistant rules instead of failing.
+    """
+    cached = sys.modules.get(_OPERATOR_PROFILE_MODULE)
+    if cached is not None:
+        return cached
+    path = Path(__file__).resolve().with_name("operator_profile.py")
+    try:
+        spec = importlib.util.spec_from_file_location(_OPERATOR_PROFILE_MODULE, path)
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[_OPERATOR_PROFILE_MODULE] = module
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(_OPERATOR_PROFILE_MODULE, None)
+        return None
+    return module
+
+
+def _load_profile(accounts: Iterable[str] = ()) -> dict[str, Any]:
+    module = _operator_profile_module()
+    if module is None:
+        return {"self_addresses": [], "assistant_senders": []}
+    return module.load_operator_profile(get_hermes_home(), account_addresses=accounts)
+
+
 def _empty_state() -> dict[str, Any]:
     return {
         "version": STATE_VERSION,
@@ -224,6 +259,11 @@ def _read_state_unlocked() -> dict[str, Any]:
             state["source_state"]["memory_hashes"] = {}
         state["source_state"].pop("gmail", None)
         state["source_state"].pop("gmail_sent", None)
+        cron_consumed = _merge_cron_consumed(state["source_state"].get("cron_consumed"), {})
+        if cron_consumed:
+            state["source_state"]["cron_consumed"] = cron_consumed
+        else:
+            state["source_state"].pop("cron_consumed", None)
     if not isinstance(state.get("last_curate_errors"), list):
         state["last_curate_errors"] = []
     else:
@@ -570,6 +610,15 @@ def _candidate(
     }
 
 
+# Interrupt/error placeholders the agent appends as a closing assistant row;
+# the session's real outcome is the substantive message before them.
+_SESSION_STUB_RE = re.compile(
+    r"\A\s*(?:operation interrupted\b|interrupted\b|error\s*:|request timed out\b|"
+    r"api call failed\b)",
+    re.IGNORECASE,
+)
+
+
 def _scan_sessions(now: float) -> tuple[list[dict[str, Any]], list[str]]:
     candidates: list[dict[str, Any]] = []
     errors: list[str] = []
@@ -619,7 +668,7 @@ def _scan_sessions(now: float) -> tuple[list[dict[str, Any]], list[str]]:
                         for message in reversed(messages):
                             if str(message.get("role") or "").lower() == "assistant":
                                 candidate_text = _plain_text(message.get("content"))
-                                if candidate_text:
+                                if candidate_text and not _SESSION_STUB_RE.match(candidate_text):
                                     summary = candidate_text
                                     break
                     except Exception as exc:
@@ -679,19 +728,73 @@ def _latest_cron_output_time(output_root: Path, job_id: str) -> Optional[float]:
     return float(latest) if latest else None
 
 
-def _latest_cron_output(output_root: Path, job_id: str) -> str:
-    job_dir = output_root / job_id
+# Scanners run every 10 min, the curator every 30: every output doc a job
+# wrote since the last WRITTEN curation is read (oldest first), bounded to the
+# newest docs, and to recent ones when a job has no consumption watermark.
+MAX_CRON_DOCS_PER_JOB = 12
+CRON_BACKFILL_SECONDS = 6 * 60 * 60
+
+
+def _cron_output_docs(output_root: Path, job_id: str) -> list[tuple[int, Path]]:
+    """A job's output docs as ``(mtime_ns, path)``, oldest first."""
+    docs: list[tuple[int, Path]] = []
     try:
-        latest = max(
-            (path for path in job_dir.glob("*.md") if path.is_file()),
-            key=lambda path: path.stat().st_mtime_ns,
-        )
-    except (ValueError, OSError):
-        return ""
+        paths = list((output_root / job_id).glob("*.md"))
+    except OSError:
+        return docs
+    for path in paths:
+        try:
+            if path.is_file():
+                docs.append((path.stat().st_mtime_ns, path))
+        except OSError:
+            continue
+    docs.sort(key=lambda doc: (doc[0], doc[1].name))
+    return docs
+
+
+def _read_cron_doc(path: Path) -> str:
     try:
-        return latest.read_text(encoding="utf-8", errors="replace")
+        return path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return ""
+
+
+def _unconsumed_cron_docs(
+    docs: list[tuple[int, Path]], watermark: Optional[int], now: float
+) -> list[tuple[int, Path]]:
+    if watermark is None:
+        cutoff_ns = int((now - CRON_BACKFILL_SECONDS) * 1_000_000_000)
+        unread = [doc for doc in docs if doc[0] >= cutoff_ns]
+    else:
+        unread = [doc for doc in docs if doc[0] > watermark]
+    return unread[-MAX_CRON_DOCS_PER_JOB:]
+
+
+def _merge_cron_consumed(current: Any, update: dict[str, int]) -> dict[str, int]:
+    """Per-job consumption watermarks (newest consumed doc mtime_ns); never regress."""
+    merged: dict[str, int] = {}
+    for source in (current, update):
+        if not isinstance(source, dict):
+            continue
+        for raw_job_id, raw_mtime in source.items():
+            job_id = str(raw_job_id or "").strip()
+            if not job_id or isinstance(raw_mtime, bool):
+                continue
+            try:
+                mtime_ns = int(raw_mtime)
+            except (TypeError, ValueError):
+                continue
+            if mtime_ns > 0:
+                merged[job_id] = max(merged.get(job_id, 0), mtime_ns)
+    return merged
+
+
+def _newest_doc_with(docs: list[tuple[str, Optional[dict[str, Any]]]], key: str) -> str:
+    """The newest doc text whose town-scan payload carries ``key`` ("" if none)."""
+    for text, payload in docs:
+        if payload is not None and key in payload:
+            return text
+    return ""
 
 
 def _town_scan_payload(output: str) -> Optional[dict[str, Any]]:
@@ -808,7 +911,7 @@ def _town_scan_awaiting_reply(output: str) -> Optional[list[dict[str, Any]]]:
                 "last_sent_ts": last_sent_ts,
             }
         )
-    entries.sort(key=lambda entry: float(entry["last_sent_ts"]))
+    entries.sort(key=lambda entry: float(entry["last_sent_ts"]), reverse=True)
     return entries[:MAX_AWAITING_REPLY_SIGNALS]
 
 
@@ -842,19 +945,26 @@ def _town_scan_open_loops(output: str) -> Optional[list[dict[str, Any]]]:
             or not last_seen_ts
         ):
             continue
-        entries.append(
-            {
-                "account": account,
-                "thread_id": thread_id,
-                "person": _compact(person, 120),
-                "subject": _compact(subject, 180),
-                "ask": _bounded_compact(ask, 140),
-                "deadline_iso": _iso_timestamp(deadline_ts) if deadline_ts else None,
-                "first_seen_ts": first_seen_ts,
-                "last_seen_ts": last_seen_ts,
-            }
-        )
-    entries.sort(key=lambda entry: float(entry["first_seen_ts"]))
+        entry = {
+            "account": account,
+            "thread_id": thread_id,
+            "person": _compact(person, 120),
+            "subject": _compact(subject, 180),
+            "ask": _bounded_compact(ask, 140),
+            "deadline_iso": _iso_timestamp(deadline_ts) if deadline_ts else None,
+            "first_seen_ts": first_seen_ts,
+            "last_seen_ts": last_seen_ts,
+        }
+        if raw.get("bulk_sender") is True:
+            entry["bulk_sender"] = True
+        from_address = str(raw.get("from_address") or "").strip().casefold()
+        if from_address:
+            entry["from_address"] = from_address
+        entries.append(entry)
+    entries.sort(
+        key=lambda entry: (float(entry["last_seen_ts"]), float(entry["first_seen_ts"])),
+        reverse=True,
+    )
     return entries[:MAX_OPEN_LOOP_SIGNALS]
 
 
@@ -963,6 +1073,8 @@ def _cron_failure_detail(error: Any, status: str) -> str:
 
 def _scan_cron(
     now: float,
+    consumed: Optional[dict[str, int]] = None,
+    profile: Optional[dict[str, Any]] = None,
 ) -> tuple[
     list[dict[str, Any]],
     list[str],
@@ -972,7 +1084,18 @@ def _scan_cron(
     list[dict[str, Any]],
     set[str],
     bool,
+    dict[str, int],
 ]:
+    """Collect cron candidates and the current snapshot signals.
+
+    Candidates come from every output doc newer than the job's ``consumed``
+    watermark (oldest first); the last element is the watermark update to
+    persist once the curation is written. Snapshot fields (awaiting reply,
+    open loops, known contacts, next event, schedule) come from the newest doc
+    that carries each.
+    """
+    consumed = _merge_cron_consumed(consumed, {})
+    consumed_out: dict[str, int] = {}
     candidates: list[dict[str, Any]] = []
     errors: list[str] = []
     next_events: list[dict[str, str]] = []
@@ -1041,26 +1164,47 @@ def _scan_cron(
                     if health_item:
                         candidates.append(health_item)
 
-            output = _latest_cron_output(output_root, job_id)
-            scan_candidates = _town_scan_candidates(output)
-            if scan_candidates is not None:
-                candidates.extend(scan_candidates)
-            has_enriched_contract = (
-                has_enriched_contract or _town_scan_has_enriched_contract(output)
+            docs = _cron_output_docs(output_root, job_id)
+            watermark = consumed.get(job_id)
+            unconsumed = _unconsumed_cron_docs(docs, watermark, now)
+            texts = {path: _read_cron_doc(path) for _, path in unconsumed}
+            for _, path in unconsumed:
+                scan_candidates = _town_scan_candidates(texts[path])
+                if scan_candidates is not None:
+                    candidates.extend(scan_candidates)
+            if unconsumed:
+                consumed_out[job_id] = max(watermark or 0, unconsumed[-1][0])
+            elif watermark is None and docs:
+                consumed_out[job_id] = docs[-1][0]
+            if docs and docs[-1][1] not in texts:
+                texts[docs[-1][1]] = _read_cron_doc(docs[-1][1])
+            snapshot_docs = [
+                (texts[path], _town_scan_payload(texts[path]))
+                for _, path in reversed(docs)
+                if path in texts
+            ]
+            has_enriched_contract = has_enriched_contract or any(
+                _town_scan_has_enriched_contract(text) for text, _ in snapshot_docs
             )
-            scan_awaiting_reply = _town_scan_awaiting_reply(output)
+            scan_awaiting_reply = _town_scan_awaiting_reply(
+                _newest_doc_with(snapshot_docs, "awaiting_reply")
+            )
             if scan_awaiting_reply is not None:
                 awaiting_reply.extend(scan_awaiting_reply)
-            scan_open_loops = _town_scan_open_loops(output)
+            scan_open_loops = _town_scan_open_loops(_newest_doc_with(snapshot_docs, "open_loops"))
             if scan_open_loops is not None:
                 open_loops.extend(scan_open_loops)
-            scan_known_contacts = _town_scan_known_contacts(output)
+            scan_known_contacts = _town_scan_known_contacts(
+                _newest_doc_with(snapshot_docs, "known_contacts")
+            )
             if scan_known_contacts is not None:
                 known_contacts.update(scan_known_contacts)
-            next_event = _town_scan_next_event(output)
+            next_event = _town_scan_next_event(_newest_doc_with(snapshot_docs, "next_event"))
             if next_event:
                 next_events.append(next_event)
-            scan_schedule_events = _town_scan_schedule_events(output)
+            scan_schedule_events = _town_scan_schedule_events(
+                _newest_doc_with(snapshot_docs, "events")
+            )
             if scan_schedule_events is not None:
                 schedule_events.extend(scan_schedule_events)
             if is_town_failure:
@@ -1079,18 +1223,14 @@ def _scan_cron(
         existing = awaiting_by_thread.get(key)
         if existing is None or float(entry["last_sent_ts"]) < float(existing["last_sent_ts"]):
             awaiting_by_thread[key] = entry
-    awaiting_reply = sorted(
-        awaiting_by_thread.values(), key=lambda entry: float(entry["last_sent_ts"])
-    )
+    awaiting_reply = _filter_awaiting_signals(list(awaiting_by_thread.values()), now, profile)
     open_loops_by_thread: dict[tuple[str, str], dict[str, Any]] = {}
     for entry in open_loops:
         key = (str(entry["account"]), str(entry["thread_id"]))
         existing = open_loops_by_thread.get(key)
         if existing is None or float(entry["last_seen_ts"]) > float(existing["last_seen_ts"]):
             open_loops_by_thread[key] = entry
-    open_loops = sorted(
-        open_loops_by_thread.values(), key=lambda entry: float(entry["first_seen_ts"])
-    )
+    open_loops = _filter_open_loop_signals(list(open_loops_by_thread.values()), now, profile)
     return (
         candidates,
         errors,
@@ -1100,7 +1240,69 @@ def _scan_cron(
         open_loops[:MAX_OPEN_LOOP_SIGNALS],
         known_contacts,
         has_enriched_contract,
+        consumed_out,
     )
+
+
+SIGNAL_MAX_AGE_SECONDS = 21 * 24 * 60 * 60
+
+
+def _filter_awaiting_signals(
+    entries: list[dict[str, Any]], now: float, profile: Optional[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Recent, real awaiting-reply threads, newest send first.
+
+    Junk tracked before the R4 scanner rules (self-only mail, unsubscribe
+    requests, FYI forwards) is left out here at read time; Gmail is untouched.
+    """
+    rules = _operator_profile_module()
+    self_addresses = (
+        rules.self_address_set(profile, [entry["account"] for entry in entries])
+        if rules
+        else set()
+    )
+    kept: list[dict[str, Any]] = []
+    for entry in entries:
+        if now - float(entry["last_sent_ts"]) > SIGNAL_MAX_AGE_SECONDS:
+            continue
+        if rules and rules.awaiting_reply_junk_reason(
+            rules.addresses(str(entry.get("to") or "")), entry.get("subject"), self_addresses
+        ):
+            continue
+        kept.append(entry)
+    kept.sort(key=lambda entry: float(entry["last_sent_ts"]), reverse=True)
+    return kept
+
+
+def _filter_open_loop_signals(
+    entries: list[dict[str, Any]], now: float, profile: Optional[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Recent open loops from real senders, newest activity first."""
+    rules = _operator_profile_module()
+    self_addresses = (
+        rules.self_address_set(profile, [entry["account"] for entry in entries])
+        if rules
+        else set()
+    )
+    assistant_senders = rules.assistant_sender_set(profile) if rules else set()
+    kept: list[dict[str, Any]] = []
+    for entry in entries:
+        if now - float(entry["last_seen_ts"]) > SIGNAL_MAX_AGE_SECONDS:
+            continue
+        if entry.get("bulk_sender") is True:
+            continue
+        sender = str(entry.get("from_address") or "").strip().casefold()
+        if not sender:
+            person = str(entry.get("person") or "").strip().casefold()
+            sender = person if "@" in person and " " not in person else ""
+        if sender and (sender in self_addresses or sender in assistant_senders):
+            continue
+        kept.append(entry)
+    kept.sort(
+        key=lambda entry: (float(entry["last_seen_ts"]), float(entry["first_seen_ts"])),
+        reverse=True,
+    )
+    return kept
 
 
 def _memory_files() -> list[Path]:
@@ -2155,6 +2357,91 @@ def _prune_decisions(decisions: dict[str, Any], now: Optional[float] = None) -> 
     return dict(ordered[:MAX_DECISIONS])
 
 
+def _identity_key(candidate: dict[str, Any]) -> str:
+    """The source thing an item is about: one live item per identity.
+
+    ``telegram:<chat_id>``, ``session:<session_id>``,
+    ``gmail:<account>:<thread_id>`` (message id when threadless),
+    ``calendar:<account>:<event_id>``; anything else is its own identity.
+    """
+    source = str(candidate.get("source") or "").strip()
+    kind, _, rest = source.partition(":")
+    rest = rest.strip()
+    if kind == "telegram" and rest:
+        return f"telegram:{rest.split(':', 1)[0]}"
+    if kind == "session" and rest and rest != "unknown":
+        return f"session:{rest}"
+    if kind == "gmail" and rest:
+        account_part, _, message_id = rest.partition(":")
+        account = (str(candidate.get("account") or "").strip() or account_part).casefold()
+        thread = str(candidate.get("thread_id") or "").strip() or message_id.strip()
+        if account and thread:
+            return f"gmail:{account}:{thread}"
+    if kind == "calendar" and rest:
+        return f"calendar:{rest}"
+    return f"content:{candidate.get('content_hash') or source}"
+
+
+def _newest_per_identity(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep the newest candidate (by source activity) per identity.
+
+    Ties go to the later entry, so callers list retained items before fresh
+    ones and older scan docs before newer ones.
+    """
+    newest: dict[str, tuple[float, int, dict[str, Any]]] = {}
+    for index, candidate in enumerate(candidates):
+        identity = _identity_key(candidate)
+        activity = float(candidate.get("created_at_ts") or 0.0)
+        current = newest.get(identity)
+        if current is None or (activity, index) > current[:2]:
+            newest[identity] = (activity, index, candidate)
+    return [entry[2] for entry in sorted(newest.values(), key=lambda entry: entry[1])]
+
+
+def _is_dismissed(decisions: dict[str, Any], candidate: dict[str, Any]) -> bool:
+    decision = decisions.get(f"ntk_{candidate['content_hash'][:16]}")
+    return isinstance(decision, dict) and bool(decision.get("dismissed"))
+
+
+def _is_assistant_mail(candidate: dict[str, Any], assistant_senders: set[str]) -> bool:
+    """Mail the operator's assistant sent (e.g. their own briefing) is exhaust."""
+    return (
+        bool(assistant_senders)
+        and str(candidate.get("source") or "").startswith("gmail:")
+        and str(candidate.get("from_address") or "").strip().casefold() in assistant_senders
+    )
+
+
+def _top_headlines(candidates: list[dict[str, Any]], hidden_keys: set[str]) -> list[str]:
+    shown = sorted(
+        (candidate for candidate in candidates if candidate["key"] not in hidden_keys),
+        key=lambda item: (float(item["score"]), float(item["created_at_ts"])),
+        reverse=True,
+    )
+    return [str(candidate.get("headline") or "") for candidate in shown[:5]]
+
+
+MAX_CALENDAR_SERVED = 3
+
+
+def _select_served(visible: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The served top items: at most ``MAX_CALENDAR_SERVED`` calendar items.
+
+    Serve-time only — state keeps every item, so the cap never deletes.
+    """
+    served: list[dict[str, Any]] = []
+    calendar_items = 0
+    for item in visible:
+        if str(item.get("source") or "").startswith("calendar:"):
+            if calendar_items >= MAX_CALENDAR_SERVED:
+                continue
+            calendar_items += 1
+        served.append(item)
+        if len(served) >= MAX_FEED_ITEMS:
+            break
+    return served
+
+
 def run_curator(llm: Any = None) -> dict[str, Any]:
     """Scan sources, rank candidates, merge durable decisions, and persist.
 
@@ -2171,6 +2458,8 @@ def run_curator(llm: Any = None) -> dict[str, Any]:
 
     source_state = snapshot.get("source_state") or {}
     previous_hashes = source_state.get("memory_hashes") or {}
+    profile = _load_profile()
+    assistant_senders = set(profile.get("assistant_senders") or [])
 
     session_items, session_errors = _scan_sessions(now)
     (
@@ -2182,19 +2471,21 @@ def run_curator(llm: Any = None) -> dict[str, Any]:
         open_loops,
         known_contacts,
         has_enriched_contract,
-    ) = _scan_cron(now)
+        cron_consumed,
+    ) = _scan_cron(now, source_state.get("cron_consumed"), profile)
     memory_items, memory_hashes, memory_errors = _scan_memory(now, previous_hashes)
     errors = session_errors + cron_errors + memory_errors
     schedule_context = _schedule_context(schedule_events, now)
 
     by_hash: dict[str, dict[str, Any]] = {}
     for candidate in session_items + cron_items + memory_items:
-        if not _is_ntk_candidate(candidate):
+        if not _is_ntk_candidate(candidate) or _is_assistant_mail(candidate, assistant_senders):
             continue
         candidate["score"] = _heuristic_score(candidate, now)
         existing = by_hash.get(candidate["content_hash"])
         if existing is None or candidate["created_at_ts"] > existing["created_at_ts"]:
             by_hash[candidate["content_hash"]] = candidate
+    fresh_hashes = set(by_hash)
 
     # A memory change is an event, not a continuously changing source. Keep
     # recent prior items until they age out or are dismissed; otherwise a
@@ -2242,10 +2533,15 @@ def run_curator(llm: Any = None) -> dict[str, Any]:
         candidate["score"] = _heuristic_score(candidate, now)
         by_hash[digest] = candidate
 
+    # One live item per source: a newer message in the same chat, thread,
+    # session, or event supersedes the older item instead of stacking beside it.
     candidates = sorted(
         (
             candidate
-            for candidate in by_hash.values()
+            for candidate in _newest_per_identity(
+                [by_hash[digest] for digest in by_hash if digest not in fresh_hashes]
+                + [by_hash[digest] for digest in by_hash if digest in fresh_hashes]
+            )
             if now - float(candidate["created_at_ts"]) <= RECENT_SECONDS
         ),
         key=lambda item: (float(item["score"]), float(item["created_at_ts"])),
@@ -2254,20 +2550,25 @@ def run_curator(llm: Any = None) -> dict[str, Any]:
 
     ranking_mode = "heuristic"
     llm_suggestions: Optional[list[dict[str, str]]] = None
-    if llm is not None and candidates:
-        snapshot_decisions = snapshot.get("decisions") or {}
-        suggestion_candidates = [
-            candidate
-            for candidate in candidates
-            if not (
-                isinstance(snapshot_decisions.get(f"ntk_{candidate['content_hash'][:16]}"), dict)
-                and snapshot_decisions[f"ntk_{candidate['content_hash'][:16]}"].get("dismissed")
-            )
-        ]
+    snapshot_decisions = snapshot.get("decisions") or {}
+    dismissed_keys = {
+        candidate["key"] for candidate in candidates if _is_dismissed(snapshot_decisions, candidate)
+    }
+    # Sent to the LLM but not returned: judged not worth showing (LLM mode only).
+    declined_keys: set[str] = set()
+    # Dismissed candidates are never shown, so they inform neither the ranking
+    # nor the suggestions (whose fallback reads the ranking payload).
+    ranking_candidates = [
+        candidate for candidate in candidates if candidate["key"] not in dismissed_keys
+    ]
+    if llm is not None and ranking_candidates:
+        sent_keys = {
+            candidate["key"] for candidate in ranking_candidates[:MAX_CANDIDATES_FOR_LLM]
+        }
         llm_rows, suggestions, llm_error = _llm_rank(
-            candidates,
+            ranking_candidates,
             llm,
-            suggestion_candidates=suggestion_candidates,
+            suggestion_candidates=ranking_candidates,
             awaiting_reply=awaiting_reply,
             open_loops=open_loops,
             open_loop_suppressed=snapshot.get("open_loop_suppressed") or [],
@@ -2298,6 +2599,8 @@ def run_curator(llm: Any = None) -> dict[str, Any]:
                         candidate["score"] = round(max(0.0, min(100.0, float(row["score"]))), 2)
                     except (KeyError, TypeError, ValueError):
                         pass
+                elif candidate["key"] in sent_keys:
+                    declined_keys.add(candidate["key"])
                 else:
                     candidate["score"] = max(0.0, float(candidate["score"]) - 20.0)
         elif llm_error:
@@ -2325,9 +2628,7 @@ def run_curator(llm: Any = None) -> dict[str, Any]:
                     schedule_context=schedule_context,
                     next_event=next_event,
                     awaiting_reply=awaiting_reply,
-                    top_headlines=[
-                        str(candidate.get("headline") or "") for candidate in candidates[:5]
-                    ],
+                    top_headlines=_top_headlines(candidates, dismissed_keys | declined_keys),
                     known_contacts=known_contacts,
                     now=now,
                 )
@@ -2356,6 +2657,8 @@ def run_curator(llm: Any = None) -> dict[str, Any]:
         open_loop_keys.discard("")
         merged: list[dict[str, Any]] = []
         for candidate in candidates:
+            if candidate["key"] in declined_keys:
+                continue
             item_id = f"ntk_{candidate['content_hash'][:16]}"
             decision = decisions.get(item_id) if isinstance(decisions.get(item_id), dict) else {}
             source_activity_at = _iso_timestamp(float(candidate["created_at_ts"]))
@@ -2400,6 +2703,10 @@ def run_curator(llm: Any = None) -> dict[str, Any]:
         state["decisions"] = _prune_decisions(decisions, now)
         merged_source_state = dict(state.get("source_state") or {})
         merged_source_state["memory_hashes"] = memory_hashes
+        # Persisted only with the curation result: a failed run re-reads the docs.
+        merged_source_state["cron_consumed"] = _merge_cron_consumed(
+            merged_source_state.get("cron_consumed"), cron_consumed
+        )
         state["source_state"] = merged_source_state
         completed_at = _iso_timestamp(time.time())
         state["last_curated_at"] = completed_at
@@ -2501,7 +2808,7 @@ def get_feed() -> dict[str, Any]:
                 "generated_at": day_brief.get("generated_at"),
             }
     return {
-        "items": visible[:MAX_FEED_ITEMS],
+        "items": _select_served(visible),
         "curated_at": _iso_timestamp(curated_timestamp) if curated_timestamp else None,
         "suggestions": state["suggestions"],
         "suggestions_generated_at": state["suggestions_generated_at"],

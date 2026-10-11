@@ -471,7 +471,12 @@ class GmailWatermarkHoldTest(unittest.TestCase):
             "googleapiclient.discovery": SimpleNamespace(build=lambda *a, **k: self.gmail),
         }
         stderr = io.StringIO()
-        with mock.patch.dict(sys.modules, google_modules), contextlib.redirect_stderr(stderr):
+        # HERMES_HOME keeps the scanner's operator-profile read in the sandbox.
+        with (
+            mock.patch.dict(sys.modules, google_modules),
+            mock.patch.dict(os.environ, {"HERMES_HOME": str(self.home)}),
+            contextlib.redirect_stderr(stderr),
+        ):
             code, payload = self.script._run(lambda: call_llm)
         # main() prints exactly this object as the job's stdout.
         stdout = json.loads(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
