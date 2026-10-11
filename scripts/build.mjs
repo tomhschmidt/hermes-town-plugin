@@ -1,8 +1,10 @@
-import { stat, mkdir, readdir } from 'node:fs/promises'
+import { stat, mkdir, readdir, readFile, writeFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 
 import { build } from 'esbuild'
+
+import { hoistImports, importsAreLeading } from './hoist-imports.mjs'
 
 const root = fileURLToPath(new URL('..', import.meta.url))
 const sourceRoot = path.join(root, 'src')
@@ -69,12 +71,16 @@ async function main() {
       outfile,
       platform: 'neutral'
     })
+    await writeFile(outfile, hoistImports(await readFile(outfile, 'utf8')))
 
     outputs.push({ id, outfile })
   }
 
   const violations = []
   for (const { id, outfile } of outputs) {
+    if (!importsAreLeading(await readFile(outfile, 'utf8'))) {
+      violations.push(`${id}: import declaration after code (older Hermes Desktop loaders cannot rewrite it)`)
+    }
     const specifiers = await readImportSpecifiers(outfile)
     for (const specifier of specifiers) {
       if (!allowedImports.has(specifier)) {
