@@ -54,6 +54,7 @@ MAX_KNOWN_CONTACTS = 2000
 DAY_BRIEF_MAX_CALLOUTS = 4
 DAY_BRIEF_STALE_SECONDS = 3 * 60 * 60
 DAY_BRIEF_REFRESH_SECONDS = 60 * 60
+DAY_BRIEF_OPENER_CHARS = 140
 SUGGESTION_KINDS = {"followup", "digest", "maintenance"}
 DAY_BRIEF_CALLOUT_KINDS = {"conflict", "travel", "timezone", "prep", "deadline", "trip"}
 BOARD_COLUMNS = (
@@ -160,6 +161,32 @@ def _load_profile(accounts: Iterable[str] = ()) -> dict[str, Any]:
     return module.load_operator_profile(get_hermes_home(), account_addresses=accounts)
 
 
+_WHERE_MODULE = "hermes_town_where"
+
+
+def _where_module() -> Optional[Any]:
+    """The sibling where.py (S1 location + meaningful-event rules), by path.
+
+    ``None`` when it cannot load: the feed then omits ``where`` and treats
+    every timed event as meaningful instead of failing.
+    """
+    cached = sys.modules.get(_WHERE_MODULE)
+    if cached is not None:
+        return cached
+    path = Path(__file__).resolve().with_name("where.py")
+    try:
+        spec = importlib.util.spec_from_file_location(_WHERE_MODULE, path)
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[_WHERE_MODULE] = module
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(_WHERE_MODULE, None)
+        return None
+    return module
+
+
 def _empty_state() -> dict[str, Any]:
     return {
         "version": STATE_VERSION,
@@ -174,7 +201,7 @@ def _empty_state() -> dict[str, Any]:
         "label_stats": {},
         "last_labeling_summary": None,
         "next_event": None,
-        "schedule": {"events": [], "generated_at": None, "context": None},
+        "schedule": {"events": [], "generated_at": None, "context": None, "recent_travel": []},
         "day_brief": None,
         "open_loop_suppressed": [],
     }
@@ -292,6 +319,7 @@ def _read_state_unlocked() -> dict[str, Any]:
             _iso_timestamp(schedule_generated_at) if schedule_generated_at else None
         ),
         "context": dict(raw_context) if isinstance(raw_context, dict) else None,
+        "recent_travel": _normalize_schedule_events(raw_schedule.get("recent_travel")),
     }
     state["day_brief"] = _normalize_day_brief(state.get("day_brief"))
     return state
@@ -432,6 +460,9 @@ def _normalize_schedule_events(value: Any) -> list[dict[str, Any]]:
         event_tz = str(raw_event.get("event_tz") or "").strip()
         if event_tz:
             event["event_tz"] = event_tz[:64]
+        end_tz = str(raw_event.get("end_tz") or "").strip()
+        if end_tz:
+            event["end_tz"] = end_tz[:64]
         if raw_event.get("multi_day") is True:
             event["multi_day"] = True
         if raw_event.get("lodging_hint") is True:
@@ -494,6 +525,10 @@ def _normalize_day_brief(value: Any) -> Optional[dict[str, Any]]:
         "trip": trip,
         "generated_at": _iso_timestamp(generated_at) if generated_at else None,
     }
+    # S1: the where-grounded first line; briefs from before S1 have none.
+    opener = _bounded_compact(str(value.get("opener") or ""), DAY_BRIEF_OPENER_CHARS)
+    if opener:
+        normalized["opener"] = opener
     for field in ("input_hash", "local_date"):
         text = str(value.get(field) or "").strip()
         if text:
@@ -1013,6 +1048,13 @@ def _town_scan_schedule_events(output: str) -> Optional[list[dict[str, Any]]]:
     return _normalize_schedule_events(payload.get("events"))
 
 
+def _town_scan_recent_travel(output: str) -> Optional[list[dict[str, Any]]]:
+    payload = _town_scan_payload(output)
+    if payload is None or "recent_travel" not in payload:
+        return None
+    return _normalize_schedule_events(payload.get("recent_travel"))
+
+
 _CRON_ERROR_NOISE = (
     re.compile(r"^Plugin \S.*?: unknown kind\b"),
     re.compile(r"^providers\.\S+?: unknown config keys\b"),
@@ -1075,6 +1117,7 @@ def _scan_cron(
     now: float,
     consumed: Optional[dict[str, int]] = None,
     profile: Optional[dict[str, Any]] = None,
+    snapshot: Optional[dict[str, Any]] = None,
 ) -> tuple[
     list[dict[str, Any]],
     list[str],
@@ -1092,7 +1135,8 @@ def _scan_cron(
     watermark (oldest first); the last element is the watermark update to
     persist once the curation is written. Snapshot fields (awaiting reply,
     open loops, known contacts, next event, schedule) come from the newest doc
-    that carries each.
+    that carries each. When ``snapshot`` is a dict it also receives
+    ``recent_travel`` (S1), so the tuple shape stays stable for callers.
     """
     consumed = _merge_cron_consumed(consumed, {})
     consumed_out: dict[str, int] = {}
@@ -1103,6 +1147,7 @@ def _scan_cron(
     awaiting_reply: list[dict[str, Any]] = []
     open_loops: list[dict[str, Any]] = []
     known_contacts: set[str] = set()
+    recent_travel: list[dict[str, Any]] = []
     has_enriched_contract = False
     try:
         from cron.jobs import get_cron_output_dir, list_jobs
@@ -1207,6 +1252,11 @@ def _scan_cron(
             )
             if scan_schedule_events is not None:
                 schedule_events.extend(scan_schedule_events)
+            scan_recent_travel = _town_scan_recent_travel(
+                _newest_doc_with(snapshot_docs, "recent_travel")
+            )
+            if scan_recent_travel is not None:
+                recent_travel.extend(scan_recent_travel)
             if is_town_failure:
                 continue
     except Exception as exc:
@@ -1217,6 +1267,9 @@ def _scan_cron(
         default=None,
     )
     schedule_events.sort(key=lambda event: _parse_timestamp(event["start_iso"]))
+    if snapshot is not None:
+        recent_travel.sort(key=lambda event: _parse_timestamp(event["start_iso"]))
+        snapshot["recent_travel"] = recent_travel[-MAX_SCHEDULE_EVENTS:]
     awaiting_by_thread: dict[tuple[str, str], dict[str, Any]] = {}
     for entry in awaiting_reply:
         key = (str(entry["account"]), str(entry["thread_id"]))
@@ -1451,8 +1504,182 @@ def _relative_future(timestamp: float, now: float) -> str:
     return f"in {days} days"
 
 
-def _local_timezone() -> Any:
-    return datetime.now(timezone.utc).astimezone().tzinfo
+def _zone_or_none(name: Any) -> Any:
+    text = str(name or "").strip()
+    if not text:
+        return None
+    try:
+        from zoneinfo import ZoneInfo
+
+        return ZoneInfo(text)
+    except Exception:
+        return None
+
+
+def _local_timezone(profile: Optional[dict[str, Any]] = None) -> Any:
+    """The operator's home zone (zoneinfo, DST-aware) from their profile.
+
+    The host's current offset is only the last resort, when no profile source
+    (operator.json, USER.md, config.yaml, system zone) names a valid zone.
+    """
+    if profile is None:
+        profile = _load_profile()
+    zone = _zone_or_none((profile or {}).get("home_timezone"))
+    return zone or datetime.now(timezone.utc).astimezone().tzinfo
+
+
+# --- S1: where the operator is, and their local "now" -----------------------
+
+# Instants in LLM inputs and the local-time string written beside each (S1:
+# the models never convert UTC themselves). Date-only values stay as they are.
+_LOCAL_TIME_FIELDS = {
+    "created_at": "created_local",
+    "start_at": "start_local",
+    "start_iso": "start_local",
+    "end_iso": "end_local",
+    "received_at": "received_local",
+    "first_seen_at": "first_seen_local",
+    "last_seen_at": "last_seen_local",
+    "last_sent_at": "last_sent_local",
+    "sent_at": "sent_local",
+    "deadline": "deadline_local",
+    "a_start_iso": "a_start_local",
+    "b_start_iso": "b_start_local",
+    "starts_iso": "starts_local",
+    "first_start_iso": "first_start_local",
+    "last_end_iso": "last_end_local",
+    "since": "since_local",
+    "until": "until_local",
+}
+
+_OPERATOR_RULES = (
+    "Operator context: operator says who the operator is and where they are "
+    "right now (operator.where: status home, away, traveling_today, or "
+    "just_returned, with its evidence). They live in operator.home_city: never "
+    "describe home_city as a destination, a visit, a trip, or somewhere they "
+    "are 'in town' — going back there is coming home. Every instant in the "
+    "input has a *_local string in the operator's current zone "
+    "(operator.local_now_label is now): use those for every time you write and "
+    "never convert UTC yourself. When operator.where.status is not home, "
+    "mention home time (the *_home strings) only where it matters, such as a "
+    "call with people back home. "
+)
+
+
+def _infer_where(
+    profile: Optional[dict[str, Any]],
+    schedule_events: list[dict[str, Any]],
+    recent_travel: list[dict[str, Any]],
+    now: float,
+) -> Optional[dict[str, Any]]:
+    module = _where_module()
+    if module is None:
+        return None
+    try:
+        return module.infer_where(schedule_events, recent_travel, profile or {}, now)
+    except Exception:
+        return None
+
+
+def _display_timezone(profile: Optional[dict[str, Any]], where: Optional[dict[str, Any]]) -> Any:
+    """Where "local" is: the away zone while the operator is away, else home."""
+    if isinstance(where, dict) and where.get("status") == "away":
+        zone = _zone_or_none(where.get("timezone"))
+        if zone is not None:
+            return zone
+    return _local_timezone(profile)
+
+
+def _operator_block(
+    profile: Optional[dict[str, Any]], now: float, where: Optional[dict[str, Any]]
+) -> dict[str, Any]:
+    module = _operator_profile_module()
+    if module is None or not hasattr(module, "operator_context"):
+        return {}
+    try:
+        return module.operator_context(profile or {}, now, where)
+    except Exception:
+        return {}
+
+
+def _localize_times(value: Any, zone_name: str, home_zone_name: str = "") -> Any:
+    """A copy of an LLM input with ``*_local`` (and, away, ``*_home``) strings.
+
+    Every instant in ``_LOCAL_TIME_FIELDS`` gains a label such as "Mon Oct 12,
+    9:00 AM ET" in ``zone_name``; existing labels are never overwritten.
+    """
+    module = _operator_profile_module()
+    if module is None or not hasattr(module, "local_time_label") or not zone_name:
+        return value
+    with_home = bool(home_zone_name) and home_zone_name != zone_name
+
+    def labels(raw: Any) -> tuple[str, str]:
+        text = str(raw or "").strip()
+        timestamp = _parse_timestamp(text) if "T" in text else 0.0
+        if not timestamp:
+            return "", ""
+        home = module.local_time_label(timestamp, home_zone_name) if with_home else ""
+        return module.local_time_label(timestamp, zone_name), home
+
+    def walk(node: Any) -> Any:
+        if isinstance(node, list):
+            return [walk(item) for item in node]
+        if not isinstance(node, dict):
+            return node
+        localized = {key: walk(item) for key, item in node.items()}
+        for field, target in _LOCAL_TIME_FIELDS.items():
+            if field not in node or target in node:
+                continue
+            raw = node[field]
+            if isinstance(raw, list):
+                local_values = [labels(item)[0] for item in raw]
+                if any(local_values):
+                    localized[target] = local_values
+                continue
+            local, home = labels(raw)
+            if local:
+                localized[target] = local
+            if home:
+                localized[target[: -len("_local")] + "_home"] = home
+        return localized
+
+    return walk(value)
+
+
+def _is_meaningful(event: dict[str, Any]) -> bool:
+    module = _where_module()
+    if module is None:
+        return not event.get("all_day")
+    try:
+        return bool(module.is_meaningful(event))
+    except Exception:
+        return not event.get("all_day")
+
+
+def _meaningful_counts(
+    schedule_events: list[dict[str, Any]], now: float, local_tz: Any
+) -> Optional[dict[str, int]]:
+    module = _where_module()
+    if module is None:
+        return None
+    try:
+        return module.meaningful_counts(schedule_events, now, local_tz)
+    except Exception:
+        return None
+
+
+def _next_meaningful_event(
+    schedule_events: list[dict[str, Any]], now: float
+) -> Optional[dict[str, str]]:
+    """The scanner's slim ``next_event`` shape, for the next meaningful event."""
+    module = _where_module()
+    if module is None:
+        return None
+    try:
+        event = module.next_meaningful_event(schedule_events, now)
+    except Exception:
+        return None
+    return _normalize_next_event(event) if isinstance(event, dict) else None
 
 
 # Context rows, not commitments: never conflicts, clusters, load, or trips.
@@ -1474,16 +1701,17 @@ def _schedule_identity_keys(
 
 
 def _schedule_context(
-    schedule_events: list[dict[str, Any]], now: float
+    schedule_events: list[dict[str, Any]], now: float, local_tz: Any = None
 ) -> Optional[dict[str, Any]]:
     """Deterministic day-shape facts computed from the normalized schedule.
 
     Pure interval math — the day-brief LLM narrates these facts but cannot
     invent them (the G6R sensing/judgment split, applied to synthesis).
+    ``local_tz`` is the operator's display zone (home, or away zone).
     """
     if not schedule_events:
         return None
-    local_tz = _local_timezone()
+    local_tz = local_tz or _local_timezone()
     local_now = datetime.fromtimestamp(now, tz=local_tz)
     today = local_now.date()
 
@@ -1660,7 +1888,10 @@ def _schedule_context(
 
 
 def _day_brief_input_hash(
-    schedule_events: list[dict[str, Any]], schedule_context: Optional[dict[str, Any]]
+    schedule_events: list[dict[str, Any]],
+    schedule_context: Optional[dict[str, Any]],
+    where: Optional[dict[str, Any]] = None,
+    local_date: str = "",
 ) -> str:
     identity = {
         "events": [
@@ -1674,6 +1905,11 @@ def _day_brief_input_hash(
         ],
         "context": schedule_context or {},
     }
+    # S1: a move (home -> away, landing) or a new local day re-briefs.
+    if isinstance(where, dict):
+        identity["where"] = [str(where.get("status") or ""), str(where.get("city") or "")]
+    if local_date:
+        identity["local_date"] = local_date
     canonical = json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
@@ -1972,6 +2208,7 @@ def _llm_rank(
     known_contacts: Optional[set[str]] = None,
     schedule_context: Optional[dict[str, Any]] = None,
     has_enriched_contract: bool = False,
+    operator: Optional[dict[str, Any]] = None,
 ) -> tuple[dict[str, dict[str, Any]], list[dict[str, str]], Optional[str]]:
     schema = {
         "type": "object",
@@ -2129,6 +2366,19 @@ def _llm_rank(
             )
             + _CLOSING_RULES
         )
+    # S1: who and where the operator is, and local strings for every instant.
+    if operator is None:
+        operator = _operator_block(_load_profile(), time.time() if now is None else now, None)
+    if operator:
+        zones = (str(operator.get("timezone") or ""), str(operator.get("home_timezone") or ""))
+        operator = _localize_times(operator, *zones)
+        llm_input = _localize_times(llm_input, *zones)
+        if isinstance(llm_input, dict):
+            llm_input = {"operator": operator, **llm_input}
+        else:
+            # The legacy contract's input is the bare candidate list.
+            instructions += " Operator (JSON): " + json.dumps(operator, ensure_ascii=False) + ". "
+        instructions += " " + _OPERATOR_RULES
     try:
         result = llm.complete_structured(
             instructions=instructions,
@@ -2155,6 +2405,26 @@ def _llm_rank(
         return ranked, suggestions, None
     except Exception as exc:
         return {}, [], str(exc)
+
+
+# S1: the brief opens from where the operator is, and counts only real events.
+_DAY_BRIEF_S1_RULES = (
+    "opener: ONE sentence of at most 140 characters that orients the operator "
+    "from operator.where and the shape of the schedule, grounded ONLY in "
+    "operator.where (status, city, label, evidence) and the events: "
+    "just_returned names the return and where from; away says where they are "
+    "(and the time offset when it matters); traveling_today names the flight; "
+    "a working location says where they are working; otherwise lead with the "
+    "first meaningful commitment. Never invent travel, weather, places, or "
+    "events, and never restate the date. Meaningful events are timed "
+    "commitments with another person, a place or call link, or at least 30 "
+    "minutes; events marked minor are personal reminders — never count, lead "
+    "with, or call them meetings. day_summary counts ONLY meaningful events: "
+    "use meaningful_today and meaningful_tomorrow, never "
+    "schedule_context.load.events_today. When meaningful_today is below 3 and "
+    "meaningful_tomorrow is 5 or more, day_summary says tomorrow is the "
+    "heavier day ('Light day — 2 meetings; tomorrow has 8'). "
+)
 
 
 def _day_brief_event_projection(
@@ -2199,6 +2469,8 @@ def _day_brief_event_projection(
         details = str(event.get("description_excerpt") or "").strip()
         if details:
             row["details"] = _compact(details, 240)
+        if not event.get("all_day") and not _is_meaningful(event):
+            row["minor"] = True
         rows.append(row)
     return rows
 
@@ -2213,13 +2485,17 @@ def _generate_day_brief(
     top_headlines: list[str],
     known_contacts: Optional[set[str]],
     now: float,
+    operator: Optional[dict[str, Any]] = None,
+    local_tz: Any = None,
+    meaningful: Optional[dict[str, int]] = None,
 ) -> tuple[Optional[dict[str, Any]], Optional[str]]:
     """One narrative sentence + grounded callouts for the dashboard header."""
-    local_tz = _local_timezone()
+    local_tz = local_tz or _local_timezone()
     local_now = datetime.fromtimestamp(now, tz=local_tz)
     schema = {
         "type": "object",
         "properties": {
+            "opener": {"type": "string", "maxLength": DAY_BRIEF_OPENER_CHARS},
             "day_summary": {"type": "string", "maxLength": 220},
             "callouts": {
                 "type": "array",
@@ -2253,7 +2529,7 @@ def _generate_day_brief(
                 ]
             },
         },
-        "required": ["day_summary", "callouts"],
+        "required": ["opener", "day_summary", "callouts"],
         "additionalProperties": False,
     }
     first_contact: list[str] = []
@@ -2285,6 +2561,14 @@ def _generate_day_brief(
         "first_contact_attendees": first_contact[:8],
         "top_need_to_know": top_headlines[:5],
     }
+    # S1: where the operator is, meaningful-event counts, local strings.
+    if operator:
+        zones = (str(operator.get("timezone") or ""), str(operator.get("home_timezone") or ""))
+        llm_input = {"operator": operator, **llm_input}
+        llm_input = _localize_times(llm_input, *zones)
+    if meaningful is not None:
+        llm_input["meaningful_today"] = int(meaningful.get("today") or 0)
+        llm_input["meaningful_tomorrow"] = int(meaningful.get("tomorrow") or 0)
     instructions = (
         TOWN_VOICE
         + (
@@ -2318,6 +2602,9 @@ def _generate_day_brief(
             "from the trip event or location text ('SF trip', 'SBC week'); copy "
             "day_n and total_days from the trip entry."
         )
+        + " "
+        + _OPERATOR_RULES
+        + _DAY_BRIEF_S1_RULES
     )
     try:
         result = llm.complete_structured(
@@ -2462,6 +2749,7 @@ def run_curator(llm: Any = None) -> dict[str, Any]:
     assistant_senders = set(profile.get("assistant_senders") or [])
 
     session_items, session_errors = _scan_sessions(now)
+    scan_snapshot: dict[str, Any] = {}
     (
         cron_items,
         cron_errors,
@@ -2472,10 +2760,15 @@ def run_curator(llm: Any = None) -> dict[str, Any]:
         known_contacts,
         has_enriched_contract,
         cron_consumed,
-    ) = _scan_cron(now, source_state.get("cron_consumed"), profile)
+    ) = _scan_cron(now, source_state.get("cron_consumed"), profile, scan_snapshot)
     memory_items, memory_hashes, memory_errors = _scan_memory(now, previous_hashes)
     errors = session_errors + cron_errors + memory_errors
-    schedule_context = _schedule_context(schedule_events, now)
+    # S1: where the operator is decides what "local" means for this cycle.
+    recent_travel = list(scan_snapshot.get("recent_travel") or [])
+    where = _infer_where(profile, schedule_events, recent_travel, now)
+    local_tz = _display_timezone(profile, where)
+    operator = _operator_block(profile, now, where)
+    schedule_context = _schedule_context(schedule_events, now, local_tz)
 
     by_hash: dict[str, dict[str, Any]] = {}
     for candidate in session_items + cron_items + memory_items:
@@ -2581,6 +2874,7 @@ def run_curator(llm: Any = None) -> dict[str, Any]:
             known_contacts=known_contacts,
             schedule_context=schedule_context,
             has_enriched_contract=has_enriched_contract,
+            operator=operator,
         )
         if llm_rows:
             ranking_mode = "llm"
@@ -2615,8 +2909,10 @@ def run_curator(llm: Any = None) -> dict[str, Any]:
     day_brief = _normalize_day_brief(snapshot.get("day_brief"))
     if llm is not None:
         if schedule_events:
-            local_date = datetime.fromtimestamp(now, tz=_local_timezone()).date().isoformat()
-            input_hash = _day_brief_input_hash(schedule_events, schedule_context)
+            local_date = datetime.fromtimestamp(now, tz=local_tz).date().isoformat()
+            input_hash = _day_brief_input_hash(
+                schedule_events, schedule_context, where=where, local_date=local_date
+            )
             current = day_brief if isinstance(day_brief, dict) else {}
             fresh_enough = (
                 current.get("input_hash") == input_hash
@@ -2629,11 +2925,18 @@ def run_curator(llm: Any = None) -> dict[str, Any]:
                     llm,
                     schedule_events=schedule_events,
                     schedule_context=schedule_context,
-                    next_event=next_event,
+                    next_event=(
+                        _next_meaningful_event(schedule_events, now)
+                        if _where_module() is not None
+                        else next_event
+                    ),
                     awaiting_reply=awaiting_reply,
                     top_headlines=_top_headlines(candidates, dismissed_keys | declined_keys),
                     known_contacts=known_contacts,
                     now=now,
+                    operator=operator,
+                    local_tz=local_tz,
+                    meaningful=_meaningful_counts(schedule_events, now, local_tz),
                 )
                 if generated is not None:
                     generated["generated_at"] = _iso_timestamp(now)
@@ -2726,6 +3029,7 @@ def run_curator(llm: Any = None) -> dict[str, Any]:
             "events": schedule_events,
             "generated_at": completed_at,
             "context": schedule_context,
+            "recent_travel": recent_travel,
         }
         state["day_brief"] = _normalize_day_brief(day_brief)
         # Scanner failures surface via the town-cron-health candidates, not by
@@ -2801,11 +3105,21 @@ def get_feed() -> dict[str, Any]:
         key=lambda item: (float(item["score"]), _parse_timestamp(item["created_at"])),
         reverse=True,
     )
+    # S1: who/where, recomputed per request from stored rows (cheap, pure).
+    profile = _load_profile()
+    stored_events = schedule.get("events", []) if isinstance(schedule, dict) else []
+    recent_travel = schedule.get("recent_travel", []) if isinstance(schedule, dict) else []
+    where = _infer_where(profile, stored_events or [], recent_travel or [], now)
+    local_tz = _display_timezone(profile, where)
+    operator = {
+        field: str(profile.get(field) or "")
+        for field in ("name", "preferred_name", "home_city", "home_timezone")
+    }
     day_brief = state.get("day_brief")
     day_brief_payload = None
     if isinstance(day_brief, dict):
         brief_generated_at = _parse_timestamp(day_brief.get("generated_at"))
-        local_today = datetime.fromtimestamp(now, tz=_local_timezone()).date().isoformat()
+        local_today = datetime.fromtimestamp(now, tz=local_tz).date().isoformat()
         if (
             brief_generated_at
             and now - brief_generated_at <= DAY_BRIEF_STALE_SECONDS
@@ -2817,6 +3131,8 @@ def get_feed() -> dict[str, Any]:
                 "trip": day_brief.get("trip"),
                 "generated_at": day_brief.get("generated_at"),
             }
+            if day_brief.get("opener"):
+                day_brief_payload["opener"] = day_brief["opener"]
     return {
         "items": _select_served(visible),
         "curated_at": _iso_timestamp(curated_timestamp) if curated_timestamp else None,
@@ -2825,6 +3141,10 @@ def get_feed() -> dict[str, Any]:
         "next_event": state["next_event"],
         "schedule": schedule_events,
         "day_brief": day_brief_payload,
+        # S1 (additive): older desktops ignore these.
+        "schedule_context": _schedule_context(schedule_events, now, local_tz),
+        "operator": operator,
+        "where": where,
     }
 
 

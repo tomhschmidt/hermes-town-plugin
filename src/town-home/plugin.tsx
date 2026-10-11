@@ -42,9 +42,21 @@ import type * as React from 'react'
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 
 import { refetchEventTypes, shouldRefetchForEvent, type RefetchTopic } from '../shared/refetch-events.ts'
+import {
+  normalizeOperator,
+  normalizeScheduleContext,
+  normalizeWhere,
+  type TownOperator,
+  type TownScheduleContext,
+  type TownWhere
+} from '../shared/situation.ts'
 import { gmailUrl, telegramChipLabel } from '../shared/sources.ts'
+import { contextLineSource, greetingBase, greetingName, locationChipLabel } from './lib/header.ts'
 import { isInternalTownJob } from './lib/jobs.ts'
 import { humanRunStatus, runOutputPreview, runStatusTone, stripMarkdownToText } from './lib/run-output.ts'
+import { pickUpNext } from './lib/upnext.ts'
+import { displayTimeZone, safeTimeZone } from './lib/when.ts'
+import { UpNext } from './upnext.tsx'
 
 const MIN_POLL_INTERVAL_MS = 15_000
 const EVENT_REFRESH_DEBOUNCE_MS = 2_000
@@ -75,6 +87,7 @@ interface TownHomePreferences {
   cardOrder: CardId[]
   cardVisibility: Record<CardId, boolean>
   doneTaskWindowHours: DoneTaskWindowHours
+  upNextVisible: boolean
   userName: string
 }
 
@@ -95,6 +108,7 @@ const DEFAULT_TOWN_HOME_PREFERENCES: TownHomePreferences = {
     briefing: true
   },
   doneTaskWindowHours: 48,
+  upNextVisible: true,
   userName: ''
 }
 
@@ -172,6 +186,7 @@ function defaultTownHomePreferences(): TownHomePreferences {
     cardOrder: [...DEFAULT_TOWN_HOME_PREFERENCES.cardOrder],
     cardVisibility: { ...DEFAULT_TOWN_HOME_PREFERENCES.cardVisibility },
     doneTaskWindowHours: DEFAULT_TOWN_HOME_PREFERENCES.doneTaskWindowHours,
+    upNextVisible: DEFAULT_TOWN_HOME_PREFERENCES.upNextVisible,
     userName: DEFAULT_TOWN_HOME_PREFERENCES.userName
   }
 }
@@ -232,6 +247,7 @@ function normalizeTownHomePreferences(value: unknown): TownHomePreferences {
     doneTaskWindowHours: isDoneTaskWindowHours(record.doneTaskWindowHours)
       ? record.doneTaskWindowHours
       : defaults.doneTaskWindowHours,
+    upNextVisible: typeof record.upNextVisible === 'boolean' ? record.upNextVisible : defaults.upNextVisible,
     userName: normalizeUserName(record.userName)
   }
 }
@@ -393,7 +409,10 @@ interface TownScheduleEvent {
   location: string | null
   conference: string | null
   attendees: string[]
+  attendeeCount: number | null
   multiDay: boolean
+  eventType: string | null
+  eventTz: string | null
 }
 
 interface TownDayBriefCallout {
@@ -411,6 +430,7 @@ interface TownDayBrief {
   daySummary: string
   callouts: TownDayBriefCallout[]
   trip: TownDayBriefTrip | null
+  opener: string | null
 }
 
 type TownSuggestionKind = 'followup' | 'digest' | 'maintenance'
@@ -431,10 +451,13 @@ interface TownFeedState {
   items: TownFeedItem[]
   loading: boolean
   nextEvent: TownNextEvent | null
+  operator: TownOperator | null
   schedule: TownScheduleEvent[]
+  scheduleContext: TownScheduleContext | null
   suggestions: TownSuggestion[]
   suggestionsGeneratedAt: number | null
   unavailable: boolean
+  where: TownWhere | null
 }
 
 interface KanbanTask {
@@ -727,6 +750,7 @@ function normalizeTownSchedule(value: unknown): TownScheduleEvent[] {
         const display = stringValue(attendee.name).trim() || stringValue(attendee.email).trim()
         return display ? [display] : []
       }).slice(0, 8)
+      const rawCount = event.attendeeCount ?? event.attendee_count
       schedule.push({
         account,
         allDay,
@@ -736,7 +760,10 @@ function normalizeTownSchedule(value: unknown): TownScheduleEvent[] {
         location: stringValue(event.location).trim() || null,
         conference: stringValue(event.conference).trim() || null,
         attendees,
-        multiDay: event.multiDay === true || event.multi_day === true
+        attendeeCount: typeof rawCount === 'number' && Number.isFinite(rawCount) ? rawCount : null,
+        multiDay: event.multiDay === true || event.multi_day === true,
+        eventType: stringValue(event.eventType ?? event.event_type).trim() || null,
+        eventTz: stringValue(event.eventTz ?? event.event_tz).trim() || null
       })
     }
   }
@@ -770,7 +797,8 @@ function normalizeTownDayBrief(value: unknown): TownDayBrief | null {
       }
     : null
 
-  return { daySummary, callouts, trip }
+  const opener = stringValue(brief.opener).trim().slice(0, 140) || null
+  return { daySummary, callouts, trip, opener }
 }
 
 function normalizeTownFeedState(value: unknown): TownFeedState {
@@ -826,10 +854,13 @@ function normalizeTownFeedState(value: unknown): TownFeedState {
     items,
     loading: state?.loading === true,
     nextEvent,
+    operator: normalizeOperator(state?.operator),
     schedule: normalizeTownSchedule(state?.schedule),
+    scheduleContext: normalizeScheduleContext(state?.scheduleContext ?? state?.schedule_context),
     suggestions,
     suggestionsGeneratedAt: timestampValue(state?.suggestionsGeneratedAt ?? state?.suggestions_generated_at),
-    unavailable: state?.unavailable === true
+    unavailable: state?.unavailable === true,
+    where: normalizeWhere(state?.where)
   }
 }
 
@@ -3325,9 +3356,14 @@ function closeCustomizeDialog(): void {
   setCustomizeDialogOpen(false)
 }
 
+function toggleUpNextVisibility(): void {
+  updateTownHomePreferences(current => ({ ...current, upNextVisible: !current.upNextVisible }))
+}
+
 function CustomizeDialog() {
   const open = useValue($customizeDialogOpen)
   const preferences = useValue($townHomePreferences)
+  const model = useValue(host.state.model)
 
   return (
     <Dialog open={open} onOpenChange={setCustomizeDialogOpen}>
@@ -3349,6 +3385,16 @@ function CustomizeDialog() {
         </div>
 
         <div className="space-y-1">
+          <div className="flex items-center gap-3 py-2.5">
+            <Switch
+              aria-label={`${preferences.upNextVisible ? 'Hide' : 'Show'} Up next`}
+              checked={preferences.upNextVisible}
+              onClick={toggleUpNextVisibility}
+              size="xs"
+            />
+            <span className="min-w-0 flex-1 text-sm font-medium">Up next</span>
+            <span className="shrink-0 text-xs text-(--ui-text-tertiary)">Under the header</span>
+          </div>
           {preferences.cardOrder.map((cardId, index) => (
             <div
               className="flex items-center gap-3 border-t border-(--ui-stroke-secondary) py-2.5 first:border-t-0"
@@ -3407,6 +3453,11 @@ function CustomizeDialog() {
           </Select>
         </div>
 
+        <div className="flex min-w-0 items-center justify-between gap-3 border-t border-(--ui-stroke-secondary) pt-4 text-sm">
+          <span className="shrink-0 font-medium">Model</span>
+          <span className="min-w-0 truncate text-(--ui-text-secondary)" title={model || 'No model selected'}>{model || 'Not selected'}</span>
+        </div>
+
         <DialogFooter>
           <Button type="button" onClick={closeCustomizeDialog}>Done</Button>
         </DialogFooter>
@@ -3456,7 +3507,6 @@ function TownHomeCard({
 function TownHome() {
   const nowTimestamp = useNow()
   const gateway = useValue(host.state.gateway)
-  const model = useValue(host.state.model)
   const profile = useValue(host.state.profile)
   const activeSessionId = useValue(host.state.activeSessionId)
   const preferences = useValue($townHomePreferences)
@@ -3469,12 +3519,18 @@ function TownHome() {
   const activeRows = normalizeActiveSessions(activeSessions.data)
   const waitingItems = attentionItems(activeRows, sessionRows, markers, activeSessionId)
   const now = new Date(nowTimestamp)
-  const hour = now.getHours()
-  const greetingBase = hour < 12
-    ? now.getDay() === 1 ? 'Happy Monday' : 'Good morning'
-    : hour < 18 ? 'Good afternoon' : 'Good evening'
-  const greeting = preferences.userName ? `${greetingBase}, ${preferences.userName}.` : `${greetingBase}.`
-  const today = new Intl.DateTimeFormat(undefined, { day: 'numeric', month: 'long', weekday: 'long' }).format(now)
+  // S1: the header speaks in the operator's zone (away zone while away), never
+  // the renderer's implicit one; the renderer zone is only the fallback for a
+  // gateway that predates the operator profile.
+  const operator = feed?.operator ?? null
+  const where = feed?.where ?? null
+  const rendererZone = safeTimeZone(new Intl.DateTimeFormat().resolvedOptions().timeZone)
+  const homeTz = safeTimeZone(operator?.homeTimezone, rendererZone)
+  const displayTz = displayTimeZone(operator, where, rendererZone)
+  const greetingWord = greetingBase(nowTimestamp, displayTz)
+  const name = greetingName(preferences.userName, operator?.preferredName)
+  const greeting = name ? `${greetingWord}, ${name}.` : `${greetingWord}.`
+  const today = new Intl.DateTimeFormat(undefined, { day: 'numeric', month: 'long', weekday: 'long', timeZone: displayTz }).format(now)
   const cronAvailable = !cron.error && !payloadError(cron.data)
   const nextRoutine = cronAvailable
     ? normalizeCronRows(cron.data)
@@ -3482,18 +3538,25 @@ function TownHome() {
         .sort((a, b) => (a.nextRunAt ?? Number.POSITIVE_INFINITY) - (b.nextRunAt ?? Number.POSITIVE_INFINITY))[0]
     : undefined
   const dayBrief = feed?.dayBrief ?? null
-  const contextLine = dayBrief?.daySummary
-    ? dayBrief.daySummary
-    : feed?.nextEvent
-      ? `Next: ${feed.nextEvent.summary} · ${relativeTime(feed.nextEvent.startAt, nowTimestamp)}`
-      : waitingItems.length > 0
-        ? `${waitingItems.length} ${waitingItems.length === 1 ? 'item' : 'items'} waiting on you`
-        : nextRoutine?.nextRunAt !== null && nextRoutine?.nextRunAt !== undefined
-          ? `Next routine: ${nextRoutine.name} · ${relativeTime(nextRoutine.nextRunAt, nowTimestamp)}`
-          : null
+  const upNext = feedBridge && feed && feed.schedule.length > 0
+    ? pickUpNext(feed.schedule, feed.scheduleContext, nowTimestamp, { displayTz, homeTz })
+    : null
+  const nextMeaningful = upNext?.rows.find(row => row.event.startAt > nowTimestamp)?.event ?? null
+  const contextLine = contextLineSource({
+    opener: dayBrief?.opener,
+    daySummary: dayBrief?.daySummary,
+    nextMeaningful,
+    legacyNextEvent: feed?.nextEvent ?? null,
+    scheduleLoaded: (feed?.schedule.length ?? 0) > 0,
+    waitingCount: waitingItems.length,
+    nextRoutine: nextRoutine && nextRoutine.nextRunAt !== null ? { name: nextRoutine.name, nextRunAt: nextRoutine.nextRunAt } : null,
+    relative: at => relativeTime(at, nowTimestamp)
+  })?.text ?? null
+  const locationChip = locationChipLabel(where, dayBrief?.trip)
   const accentColor = profileColor(profile)
-  const gatewayTone = gateway === 'open' ? 'good' : gateway === 'connecting' ? 'warn' : 'muted'
-  const gatewayLabel = gateway === 'open' ? 'Gateway online' : `Gateway ${gateway || 'idle'}`
+  const gatewayOffline = gateway !== 'open'
+  const gatewayTone = gateway === 'connecting' ? 'warn' : 'muted'
+  const gatewayLabel = gateway === 'connecting' ? 'Reconnecting' : 'Offline'
   const schedule = feedBridge && feed ? feed.schedule.filter(event => event.endAt >= now.getTime()) : []
   const [boardWide, attachBoard] = useBoardWide()
 
@@ -3517,14 +3580,15 @@ function TownHome() {
                   className="mb-3 block h-1 w-12 rounded-full bg-(--ui-stroke-secondary)"
                   style={accentColor ? { backgroundColor: accentColor } : undefined}
                 />
-                <div className="mb-2 flex items-center gap-2 text-sm text-(--ui-text-secondary)">
+                <div className="mb-2 flex min-w-0 flex-wrap items-center gap-2 text-sm text-(--ui-text-secondary)">
                   <p>{today}</p>
-                  {dayBrief?.trip ? (
-                    <Badge size="xs" variant="muted">
-                      {dayBrief.trip.label}
-                      {dayBrief.trip.dayN !== null
-                        ? ` · day ${dayBrief.trip.dayN}${dayBrief.trip.totalDays !== null ? ` of ${dayBrief.trip.totalDays}` : ''}`
-                        : ''}
+                  {locationChip ? (
+                    <Badge
+                      size="xs"
+                      title={where && where.evidence.length > 0 ? where.evidence.join(' · ') : undefined}
+                      variant="muted"
+                    >
+                      {locationChip}
                     </Badge>
                   ) : null}
                   {schedule.length > 0 ? (
@@ -3566,17 +3630,12 @@ function TownHome() {
                 ) : null}
               </div>
               <div className="flex min-w-0 flex-wrap items-center gap-2">
-                <div className="inline-flex items-center gap-2 rounded-md border border-(--ui-stroke-secondary) px-2.5 py-1.5 text-xs text-(--ui-text-secondary)">
-                  <StatusDot tone={gatewayTone} />
-                  <span>{gatewayLabel}</span>
-                </div>
-                <div
-                  className="inline-flex min-w-0 items-center gap-2 rounded-md border border-(--ui-stroke-secondary) px-2.5 py-1.5 text-xs text-(--ui-text-secondary)"
-                  title={model || 'No model selected'}
-                >
-                  <span className="text-(--ui-text-tertiary)">Model</span>
-                  <span className="max-w-52 truncate font-medium text-(--ui-text-primary)">{model || 'Not selected'}</span>
-                </div>
+                {gatewayOffline ? (
+                  <span className="inline-flex items-center gap-1.5 text-xs text-(--ui-text-tertiary)" title={`Gateway ${gateway || 'idle'}`}>
+                    <StatusDot tone={gatewayTone} />
+                    <span>{gatewayLabel}</span>
+                  </span>
+                ) : null}
                 <Tip label="Customize Town">
                   <Button
                     aria-label="Customize Town"
@@ -3593,6 +3652,10 @@ function TownHome() {
             </header>
 
             <TaskComposer />
+
+            {preferences.upNextVisible && upNext ? (
+              <UpNext result={upNext} onOpenSchedule={openScheduleDialog} />
+            ) : null}
 
             {preferences.cardOrder
               .filter(cardId => preferences.cardVisibility[cardId] && MAIN_CARD_IDS.has(cardId))

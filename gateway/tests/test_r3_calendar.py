@@ -431,7 +431,8 @@ class ContractTest(ScannerTestCase):
             conferenceData={"conferenceSolution": {"name": "Zoom"}},
         )
         payload = self.build(meeting)
-        self.assertEqual(set(payload), {"candidates", "next_event", "events"})
+        # S1 adds recent_travel; the pre-S1 keys must all remain.
+        self.assertLessEqual({"candidates", "next_event", "events"}, set(payload))
         candidate = payload["candidates"][0]
         self.assertEqual(
             set(candidate),

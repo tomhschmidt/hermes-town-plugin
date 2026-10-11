@@ -3,13 +3,15 @@
 Source of truth is ``$HERMES_HOME/town-feed/operator.json`` (user-owned,
 never in the repo). Missing fields fall back to the structured lines of
 ``$HERMES_HOME/memories/USER.md`` (``**Name:**``, ``**What to call them:**``,
-``**Timezone:**``, ``**Telegram:**``), then (timezone only) to Hermes
-``config.yaml`` ``timezone``, then to the system timezone. Only
-those structured fields are read: free-text memory never enters the profile.
+``**Timezone:**``, ``**Home city:**``, ``**Telegram:**``), then (timezone
+only) to Hermes ``config.yaml`` ``timezone``, then to the system timezone.
+Only those structured fields are read: free-text memory never enters the
+profile.
 
 Loading is plain file reading: it never raises and never touches the
 network. The mail predicates below apply the profile to Gmail addressing
-(self-exhaust and awaiting-reply junk) for both the scanner and the curator.
+(self-exhaust and awaiting-reply junk) for both the scanner and the curator;
+``operator_context`` is the who/where/when block both LLM lanes receive (S1).
 """
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ import json
 import os
 import re
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -26,18 +29,22 @@ OPERATOR_FILE = Path("town-feed") / "operator.json"
 USER_MEMORY_FILE = Path("memories") / "USER.md"
 MAX_USER_MEMORY_BYTES = 256 * 1024
 MAX_FIELD_CHARS = 120
+MAX_WORK_DOMAINS = 20
 
 _USER_MD_LINE = re.compile(r"^\s*(?:[-*+]\s+)?\*\*([^*:]+):\*\*\s*(.*?)\s*$")
 _USER_MD_FIELDS = {
     "name": "name",
     "what to call them": "preferred_name",
     "timezone": "home_timezone",
+    "home city": "home_city",
+    "city": "home_city",
     "telegram": "telegram",
 }
 _TELEGRAM_HANDLE = re.compile(r"^@?([A-Za-z][A-Za-z0-9_]{3,31})$")
 _FORWARD_SUBJECT = re.compile(r"^\s*fwd?\s*:", re.IGNORECASE)
 _UNSUBSCRIBE_SUBJECT = re.compile(r"^\s*unsubscribe\b", re.IGNORECASE)
 _MAILTO = re.compile(r"<\s*mailto:([^>?\s]+)", re.IGNORECASE)
+_DOMAIN = re.compile(r"^(?=.{3,120}$)[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$")
 
 
 def _default_profile() -> dict[str, Any]:
@@ -45,6 +52,8 @@ def _default_profile() -> dict[str, Any]:
         "name": "",
         "preferred_name": "",
         "home_timezone": "",
+        "home_city": "",
+        "work_domains": {},
         "self_addresses": [],
         "assistant_senders": [],
         "telegram_user_id": None,
@@ -170,6 +179,36 @@ def _read_user_memory(path: Path) -> dict[str, Any]:
     return fields
 
 
+def _domain(value: Any) -> str:
+    domain = _text(value).casefold().lstrip("@").rstrip(".")
+    return domain if _DOMAIN.match(domain) else ""
+
+
+def _domain_org(domain: str) -> str:
+    """"example-capital.com" -> "Example Capital" (list-form work_domains)."""
+    label = domain.split(".", 1)[0]
+    return " ".join(part.capitalize() for part in re.split(r"[-_]+", label) if part)
+
+
+def _work_domains(value: Any) -> dict[str, str]:
+    """``{domain: org name}``; a plain list of domains derives the org name."""
+    if isinstance(value, dict):
+        pairs = list(value.items())
+    elif isinstance(value, (list, tuple)):
+        pairs = [(item, "") for item in value]
+    else:
+        return {}
+    domains: dict[str, str] = {}
+    for raw_domain, raw_org in pairs:
+        domain = _domain(raw_domain)
+        if not domain or domain in domains:
+            continue
+        domains[domain] = _text(raw_org) or _domain_org(domain)
+        if len(domains) >= MAX_WORK_DOMAINS:
+            break
+    return domains
+
+
 def load_operator_profile(
     hermes_home: Optional[Path] = None,
     *,
@@ -196,6 +235,8 @@ def load_operator_profile(
             or _config_timezone(home)
             or _system_timezone()
         )
+        profile["home_city"] = _text(configured.get("home_city")) or _text(memory.get("home_city"))
+        profile["work_domains"] = _work_domains(configured.get("work_domains"))
 
         self_addresses = addresses(configured.get("self_addresses"))
         for address in addresses(list(account_addresses or ())):
@@ -292,3 +333,150 @@ def awaiting_reply_junk_reason(
     if _FORWARD_SUBJECT.match(subject_text):
         return "forward"
     return None
+
+
+# --- Who, where, and when for the LLM lanes (S1) ----------------------------
+
+# Spoken abbreviations, kept in sync with src/town-home/lib/when.ts. US zones
+# use the DST-neutral form ("ET"); others carry (standard, daylight) names;
+# anything unlisted renders as a UTC offset ("UTC+8") rather than zoneinfo's
+# bare "+08".
+_GENERIC_ZONE_NAMES = {
+    "America/New_York": "ET",
+    "America/Detroit": "ET",
+    "America/Toronto": "ET",
+    "America/Indiana/Indianapolis": "ET",
+    "America/Chicago": "CT",
+    "America/Winnipeg": "CT",
+    "America/Denver": "MT",
+    "America/Edmonton": "MT",
+    "America/Boise": "MT",
+    "America/Phoenix": "MT",
+    "America/Los_Angeles": "PT",
+    "America/Vancouver": "PT",
+    "America/Anchorage": "AKT",
+    "Pacific/Honolulu": "HT",
+    "Asia/Singapore": "SGT",
+    "Asia/Hong_Kong": "HKT",
+    "Asia/Tokyo": "JST",
+    "Asia/Seoul": "KST",
+    "Asia/Shanghai": "CST",
+    "Asia/Kolkata": "IST",
+    "Asia/Dubai": "GST",
+    "Asia/Bangkok": "ICT",
+    "Asia/Ho_Chi_Minh": "ICT",
+    "Asia/Jakarta": "WIB",
+    "Asia/Manila": "PHT",
+    "Asia/Kuala_Lumpur": "MYT",
+    "Atlantic/Reykjavik": "GMT",
+}
+_SEASONAL_ZONE_NAMES = {
+    "Europe/London": ("GMT", "BST"),
+    "Europe/Dublin": ("GMT", "IST"),
+    "Europe/Lisbon": ("WET", "WEST"),
+    "Europe/Athens": ("EET", "EEST"),
+    "Europe/Helsinki": ("EET", "EEST"),
+    "Australia/Sydney": ("AEST", "AEDT"),
+    "Australia/Melbourne": ("AEST", "AEDT"),
+    "Pacific/Auckland": ("NZST", "NZDT"),
+    **{
+        zone: ("CET", "CEST")
+        for zone in (
+            "Europe/Paris", "Europe/Berlin", "Europe/Madrid", "Europe/Rome",
+            "Europe/Amsterdam", "Europe/Brussels", "Europe/Zurich", "Europe/Vienna",
+            "Europe/Stockholm", "Europe/Copenhagen", "Europe/Oslo", "Europe/Prague",
+            "Europe/Warsaw",
+        )
+    },
+}
+
+
+def _zone_info(name: Any) -> Any:
+    valid = _valid_timezone(name)
+    if not valid:
+        return None
+    from zoneinfo import ZoneInfo
+
+    return ZoneInfo(valid)
+
+
+def _moment(now: Any) -> datetime:
+    if isinstance(now, datetime):
+        return now if now.tzinfo else now.replace(tzinfo=timezone.utc)
+    try:
+        return datetime.fromtimestamp(float(now), tz=timezone.utc)
+    except (TypeError, ValueError, OverflowError, OSError):
+        return datetime.now(timezone.utc)
+
+
+def zone_abbreviation(zone_name: Any, now: Any) -> str:
+    """"ET", "SGT", "BST", else "UTC+8" — the zone as people say it at ``now``."""
+    zone = _zone_info(zone_name)
+    if zone is None:
+        return "UTC"
+    name = _valid_timezone(zone_name)
+    local = _moment(now).astimezone(zone)
+    if name in _GENERIC_ZONE_NAMES:
+        return _GENERIC_ZONE_NAMES[name]
+    if name in _SEASONAL_ZONE_NAMES:
+        standard, daylight = _SEASONAL_ZONE_NAMES[name]
+        return daylight if local.dst() else standard
+    offset = local.utcoffset()
+    minutes = int(offset.total_seconds() // 60) if offset is not None else 0
+    if minutes == 0:
+        return "UTC"
+    sign = "+" if minutes > 0 else "-"
+    hours, remainder = divmod(abs(minutes), 60)
+    return f"UTC{sign}{hours}{f':{remainder:02d}' if remainder else ''}"
+
+
+def local_time_label(when: Any, zone_name: Any) -> str:
+    """"Sun Oct 11, 10:42 AM ET" in ``zone_name`` (UTC when it is invalid)."""
+    zone = _zone_info(zone_name) or timezone.utc
+    local = _moment(when).astimezone(zone)
+    return f"{local.strftime('%a %b %-d, %-I:%M %p')} {zone_abbreviation(zone_name, local)}"
+
+
+def display_timezone(profile: Optional[dict[str, Any]], where: Optional[dict[str, Any]] = None) -> str:
+    """The zone "local" means: where the operator is when away, else home."""
+    if isinstance(where, dict) and where.get("status") == "away":
+        away = _valid_timezone(where.get("timezone"))
+        if away:
+            return away
+    return _valid_timezone((profile or {}).get("home_timezone")) or "UTC"
+
+
+def operator_context(
+    profile: Optional[dict[str, Any]], now: Any, where: Optional[dict[str, Any]] = None
+) -> dict[str, Any]:
+    """Who the operator is, where they are, and their local now — for the LLMs.
+
+    Only structured profile fields: never addresses, ids, or memory text.
+    """
+    profile = profile or {}
+    home_timezone = _valid_timezone(profile.get("home_timezone"))
+    home_city = _text(profile.get("home_city"))
+    if not isinstance(where, dict):
+        where = {
+            "status": "home",
+            "city": home_city,
+            "timezone": home_timezone,
+            "label": f"Home in {home_city}" if home_city else "Home",
+            "evidence": [],
+        }
+    zone_name = display_timezone(profile, where)
+    zone = _zone_info(zone_name) or timezone.utc
+    local_now = _moment(now).astimezone(zone)
+    context: dict[str, Any] = {
+        "name": _text(profile.get("name")),
+        "preferred_name": _text(profile.get("preferred_name")),
+        "home_city": home_city,
+        "home_timezone": home_timezone,
+        "timezone": zone_name,
+        "local_now": local_now.isoformat(timespec="seconds"),
+        "local_now_label": local_time_label(local_now, zone_name),
+        "where": dict(where),
+    }
+    if home_timezone and home_timezone != zone_name:
+        context["home_now_label"] = local_time_label(local_now, home_timezone)
+    return context

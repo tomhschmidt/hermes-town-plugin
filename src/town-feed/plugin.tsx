@@ -16,6 +16,14 @@ import {
 import { useEffect } from 'react'
 
 import { refetchEventTypes, shouldRefetchForEvent } from '../shared/refetch-events.ts'
+import {
+  normalizeOperator,
+  normalizeScheduleContext,
+  normalizeWhere,
+  type TownOperator,
+  type TownScheduleContext,
+  type TownWhere
+} from '../shared/situation.ts'
 import { gmailUrl, telegramChipLabel } from '../shared/sources.ts'
 import { waitForCuration } from './lib/refresh.ts'
 
@@ -61,6 +69,8 @@ interface ScheduleEvent {
   attendees: string[]
   attendeeCount: number | null
   multiDay: boolean
+  eventType: string | null
+  eventTz: string | null
 }
 
 interface DayBriefCallout {
@@ -79,6 +89,7 @@ interface DayBrief {
   callouts: DayBriefCallout[]
   trip: DayBriefTrip | null
   generatedAt: number | null
+  opener: string | null
 }
 
 type SuggestionKind = 'followup' | 'digest' | 'maintenance'
@@ -98,10 +109,13 @@ interface FeedState {
   items: FeedItem[]
   loading: boolean
   nextEvent: NextEvent | null
+  operator: TownOperator | null
   schedule: ScheduleEvent[]
+  scheduleContext: TownScheduleContext | null
   suggestions: Suggestion[]
   suggestionsGeneratedAt: number | null
   unavailable: boolean
+  where: TownWhere | null
 }
 
 interface FeedAtom {
@@ -216,10 +230,13 @@ const $feed = atom({
   items: [],
   loading: true,
   nextEvent: null,
+  operator: null,
   schedule: [],
+  scheduleContext: null,
   suggestions: [],
   suggestionsGeneratedAt: null,
-  unavailable: false
+  unavailable: false,
+  where: null
 }) as FeedAtom
 const $kanban = atom({ columns: [], error: null, loading: true, unavailable: false }) as KanbanAtom
 const $recentlyDismissed = atom([]) as RecentlyDismissedAtom
@@ -366,7 +383,9 @@ function normalizeSchedule(value: unknown): ScheduleEvent[] {
         conference: stringValue(event.conference).trim() || null,
         attendees,
         attendeeCount: typeof rawCount === 'number' && Number.isFinite(rawCount) ? rawCount : null,
-        multiDay: event.multi_day === true
+        multiDay: event.multi_day === true,
+        eventType: stringValue(event.event_type).trim() || null,
+        eventTz: stringValue(event.event_tz).trim() || null
       })
     }
   }
@@ -404,7 +423,8 @@ function normalizeDayBrief(value: unknown): DayBrief | null {
     daySummary,
     callouts,
     trip,
-    generatedAt: timestampValue(brief.generated_at ?? brief.generatedAt)
+    generatedAt: timestampValue(brief.generated_at ?? brief.generatedAt),
+    opener: stringValue(brief.opener).trim().slice(0, 140) || null
   }
 }
 
@@ -413,9 +433,12 @@ function normalizeFeed(value: unknown): {
   dayBrief: DayBrief | null
   items: FeedItem[]
   nextEvent: NextEvent | null
+  operator: TownOperator | null
   schedule: ScheduleEvent[]
+  scheduleContext: TownScheduleContext | null
   suggestions: Suggestion[]
   suggestionsGeneratedAt: number | null
+  where: TownWhere | null
 } {
   const response = asRecord(value)
   const rows = response?.items
@@ -482,9 +505,12 @@ function normalizeFeed(value: unknown): {
     dayBrief: normalizeDayBrief(response?.day_brief),
     items,
     nextEvent,
+    operator: normalizeOperator(response?.operator),
     schedule: normalizeSchedule(response?.schedule),
+    scheduleContext: normalizeScheduleContext(response?.schedule_context),
     suggestions,
-    suggestionsGeneratedAt: timestampValue(response?.suggestions_generated_at)
+    suggestionsGeneratedAt: timestampValue(response?.suggestions_generated_at),
+    where: normalizeWhere(response?.where)
   }
 }
 
@@ -617,10 +643,13 @@ async function refreshFeed(): Promise<number | null | undefined> {
         items: visibleItems(),
         loading: false,
         nextEvent: normalized.nextEvent,
+        operator: normalized.operator,
         schedule: normalized.schedule,
+        scheduleContext: normalized.scheduleContext,
         suggestions: normalized.suggestions,
         suggestionsGeneratedAt: normalized.suggestionsGeneratedAt,
-        unavailable: false
+        unavailable: false,
+        where: normalized.where
       })
     }
     return normalized.curatedAt
