@@ -41,6 +41,11 @@ import {
 import type * as React from 'react'
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 
+import { refetchEventTypes, shouldRefetchForEvent, type RefetchTopic } from '../shared/refetch-events.ts'
+import { gmailUrl, telegramChipLabel } from '../shared/sources.ts'
+import { isInternalTownJob } from './lib/jobs.ts'
+import { humanRunStatus, runOutputPreview, runStatusTone, stripMarkdownToText } from './lib/run-output.ts'
+
 const MIN_POLL_INTERVAL_MS = 15_000
 const EVENT_REFRESH_DEBOUNCE_MS = 2_000
 const SESSION_LIST_PARAMS = { limit: 12 }
@@ -59,12 +64,9 @@ const CARD_IDS = ['tasks', 'recents', 'need-to-know', 'suggestions', 'routines',
 const MAIN_CARD_IDS = new Set<CardId>(['tasks', 'recents', 'briefing'])
 const SIDE_CARD_IDS = new Set<CardId>(['need-to-know', 'suggestions', 'routines'])
 const DONE_TASK_WINDOW_HOURS = [12, 24, 48, 168] as const
-const TOWN_SCANNER_JOB_NAMES = new Set([
-  'town-gmail-scan',
-  'town-telegram-scan',
-  'town-calendar-scan',
-  'town-feed-curate'
-])
+// How long after registration a missing town-feed bridge reads as "connecting"
+// (it may simply register after us) before the "not connected" copy shows.
+const BRIDGE_READY_TIMEOUT_MS = 3_000
 
 type CardId = (typeof CARD_IDS)[number]
 type DoneTaskWindowHours = (typeof DONE_TASK_WINDOW_HOURS)[number]
@@ -105,6 +107,7 @@ const $now = atom(Date.now())
 let nowSubscriberCount = 0
 let nowInterval: ReturnType<typeof setInterval> | null = null
 let pluginContext: PluginContext | null = null
+let bridgeWaitDeadline = 0
 
 type UnknownRecord = Record<string, unknown>
 
@@ -294,6 +297,7 @@ interface CronRow {
   prompt: string
   promptPreview: string
   schedule: string
+  script: string
   state: string
 }
 
@@ -315,6 +319,7 @@ interface RecentRoutineActivity {
 type RecentActivity = RecentSessionActivity | RecentRoutineActivity
 
 interface CronRun {
+  delivered?: boolean | null
   error: string
   output: string
   startedAt: number
@@ -354,6 +359,8 @@ interface TownFeedItem {
   source: string
   createdAt: number | null
   actionHint: string | null
+  chatName: string | null
+  account: string | null
 }
 
 interface RecentlyDismissedEntry {
@@ -412,6 +419,7 @@ interface TownSuggestion {
   id: string
   kind: TownSuggestionKind
   label: string
+  person: string | null
   prompt: string
 }
 
@@ -613,13 +621,16 @@ function townScanPayload(output: string): UnknownRecord | null {
 
 function presentRunOutput(output: string): string {
   const lines = output.replace(/\r\n?/g, '\n').split('\n')
-  if (lines[0]?.trim().startsWith('# Cron Job:')) {
+  // Current gateways send only the reply; legacy whole-doc output keeps its header cleanup
+  // (a reply's own "**Weather:** …" lines must survive).
+  const wholeDoc = lines[0]?.trim().startsWith('# Cron Job:') ?? false
+  if (wholeDoc) {
     const blankLineIndex = lines.findIndex(line => line.trim() === '')
     lines.splice(0, blankLineIndex >= 0 ? blankLineIndex + 1 : lines.length)
   }
 
   const cleaned = lines
-    .filter(line => !/^\s*\*\*[^*]+:\*\*\s*.*$/.test(line))
+    .filter(line => !wholeDoc || !/^\s*\*\*[^*]+:\*\*\s*.*$/.test(line))
     .join('\n')
     .trim()
   const payload = townScanPayload(cleaned)
@@ -779,7 +790,9 @@ function normalizeTownFeedState(value: unknown): TownFeedState {
       summary: stringValue(item.summary),
       source: stringValue(item.source) || 'Hermes',
       createdAt: timestampValue(item.createdAt),
-      actionHint: stringValue(item.actionHint ?? item.action_hint).trim() || null
+      actionHint: stringValue(item.actionHint ?? item.action_hint).trim() || null,
+      chatName: stringValue(item.chatName ?? item.chat_name).trim() || null,
+      account: stringValue(item.account).trim() || null
     }]
   })
   const suggestionRows = Array.isArray(state?.suggestions) ? state.suggestions : []
@@ -793,7 +806,9 @@ function normalizeTownFeedState(value: unknown): TownFeedState {
       return []
     }
 
-    return [{ id, kind, label, prompt }]
+    // Initials only ever come from a real person field, never from the label.
+    const person = stringValue(suggestion.person).trim().slice(0, 80) || null
+    return [{ id, kind, label, person, prompt }]
   })
   const nextEventRecord = asRecord(state?.nextEvent ?? state?.next_event)
   const nextEventSummary = stringValue(nextEventRecord?.summary).trim()
@@ -872,13 +887,25 @@ function normalizeKanbanState(value: unknown): KanbanState {
   }
 }
 
-function useTownFeedBridge(): { bridge: TownFeedBridge | null; feed: TownFeedState | null } {
-  const [bridge, setBridge] = useState<TownFeedBridge | null>(null)
-  const [feed, setFeed] = useState<TownFeedState | null>(null)
+// A missing bridge reads as "connecting" until the ready event or the
+// post-registration grace period ends; only then do cards say "not connected".
+function bridgeWaitRemainingMs(): number {
+  return Math.max(0, bridgeWaitDeadline - Date.now())
+}
+
+function useTownFeedBridge(): { bridge: TownFeedBridge | null; connecting: boolean; feed: TownFeedState | null } {
+  // Read the already-published bridge on first render so connected cards paint immediately.
+  const [bridge, setBridge] = useState<TownFeedBridge | null>(() => windowTownFeedBridge())
+  const [feed, setFeed] = useState<TownFeedState | null>(() => {
+    const candidate = windowTownFeedBridge()
+    return candidate ? normalizeTownFeedState(candidate.$feed?.get?.()) : null
+  })
+  const [connecting, setConnecting] = useState(() => !windowTownFeedBridge() && bridgeWaitRemainingMs() > 0)
 
   useEffect(() => {
     let activeBridge: TownFeedBridge | null = null
     let unsubscribe: (() => void) | null = null
+    let readyTimer: ReturnType<typeof setTimeout> | null = null
 
     const attach = () => {
       if (activeBridge) {
@@ -907,15 +934,20 @@ function useTownFeedBridge(): { bridge: TownFeedBridge | null; feed: TownFeedSta
         setBridge(null)
         setFeed(null)
       }
+      setConnecting(false)
     }
 
     attach()
     if (!activeBridge) {
       window.addEventListener('hermes-town-feed-ready', attach, { once: true })
+      readyTimer = setTimeout(() => setConnecting(false), bridgeWaitRemainingMs())
     }
 
     return () => {
       window.removeEventListener('hermes-town-feed-ready', attach)
+      if (readyTimer !== null) {
+        clearTimeout(readyTimer)
+      }
       try {
         unsubscribe?.()
       } catch {
@@ -929,16 +961,21 @@ function useTownFeedBridge(): { bridge: TownFeedBridge | null; feed: TownFeedSta
     }
   }, [])
 
-  return { bridge, feed }
+  return { bridge, connecting, feed }
 }
 
-function useTownKanbanBridge(): { bridge: TownFeedBridge | null; kanban: KanbanState | null } {
-  const [bridge, setBridge] = useState<TownFeedBridge | null>(null)
-  const [kanban, setKanban] = useState<KanbanState | null>(null)
+function useTownKanbanBridge(): { bridge: TownFeedBridge | null; connecting: boolean; kanban: KanbanState | null } {
+  const [bridge, setBridge] = useState<TownFeedBridge | null>(() => windowTownKanbanBridge())
+  const [kanban, setKanban] = useState<KanbanState | null>(() => {
+    const candidate = windowTownKanbanBridge()
+    return candidate ? normalizeKanbanState(candidate.$kanban?.get?.()) : null
+  })
+  const [connecting, setConnecting] = useState(() => !windowTownKanbanBridge() && bridgeWaitRemainingMs() > 0)
 
   useEffect(() => {
     let activeBridge: TownFeedBridge | null = null
     let unsubscribe: (() => void) | null = null
+    let readyTimer: ReturnType<typeof setTimeout> | null = null
 
     const attach = () => {
       if (activeBridge) {
@@ -967,15 +1004,20 @@ function useTownKanbanBridge(): { bridge: TownFeedBridge | null; kanban: KanbanS
         setBridge(null)
         setKanban(null)
       }
+      setConnecting(false)
     }
 
     attach()
     if (!activeBridge) {
       window.addEventListener('hermes-town-feed-ready', attach, { once: true })
+      readyTimer = setTimeout(() => setConnecting(false), bridgeWaitRemainingMs())
     }
 
     return () => {
       window.removeEventListener('hermes-town-feed-ready', attach)
+      if (readyTimer !== null) {
+        clearTimeout(readyTimer)
+      }
       try {
         unsubscribe?.()
       } catch {
@@ -989,13 +1031,13 @@ function useTownKanbanBridge(): { bridge: TownFeedBridge | null; kanban: KanbanS
     }
   }, [])
 
-  return { bridge, kanban }
+  return { bridge, connecting, kanban }
 }
 
 function useRpc<T>(
   method: string,
   params: Record<string, unknown>,
-  { intervalMs = MIN_POLL_INTERVAL_MS }: { intervalMs?: number } = {}
+  { intervalMs = MIN_POLL_INTERVAL_MS, topic }: { intervalMs?: number; topic?: RefetchTopic } = {}
 ): RpcState<T> {
   const requestRef = useRef({ method, params })
   const [state, setState] = useState<RpcState<T>>({ data: null, error: null, loading: true })
@@ -1021,8 +1063,13 @@ function useRpc<T>(
       }
     }
 
-    const scheduleEventRefresh = () => {
-      if (host.state.gateway.get() !== 'open' || refreshTimer !== null) {
+    const scheduleEventRefresh = (event: unknown) => {
+      if (
+        !topic
+        || !shouldRefetchForEvent(event, topic)
+        || host.state.gateway.get() !== 'open'
+        || refreshTimer !== null
+      ) {
         return
       }
 
@@ -1034,17 +1081,20 @@ function useRpc<T>(
 
     void refresh()
     const interval = setInterval(() => void refresh(), pollIntervalMs)
-    const offEvent = host.onEvent('*', scheduleEventRefresh)
+    // Only events that can change this data; streaming deltas never refetch.
+    const offEvents: Array<() => void> = topic
+      ? refetchEventTypes(topic).map(type => host.onEvent(type, scheduleEventRefresh))
+      : []
 
     return () => {
       live = false
       clearInterval(interval)
-      offEvent()
+      offEvents.forEach(off => off())
       if (refreshTimer !== null) {
         clearTimeout(refreshTimer)
       }
     }
-  }, [intervalMs])
+  }, [intervalMs, topic])
 
   return state
 }
@@ -1190,6 +1240,7 @@ function normalizeCronRows(value: unknown): CronRow[] {
         prompt: promptPreview.endsWith('...') ? '' : promptPreview,
         promptPreview,
         schedule: schedule || 'Schedule unavailable',
+        script: stringValue(item.script),
         state: stringValue(item.state)
       }
     ]
@@ -1267,12 +1318,6 @@ function isCalendarSource(source: string): boolean {
   return /^calendar:[^:]+:.+$/i.test(source.trim())
 }
 
-function telegramSourceLabel(item: TownFeedItem, chatId: string): string {
-  const summaryName = item.summary.match(/^(?:telegram(?: chat)?|chat)\s*[:\u00b7\u2014-]\s*([^:\n\u00b7\u2014]{1,60})/i)?.[1]?.trim()
-  const headlineName = item.headline.match(/^([^:\n]{1,60}):\s/)?.[1]?.trim()
-  return summaryName || headlineName || chatId
-}
-
 function townFeedSourceReference(item: TownFeedItem, cronRows: CronRow[]): { icon: string; label: string } {
   if (sessionIdFromSource(item.source)) {
     return { icon: 'comment-discussion', label: 'Session' }
@@ -1283,9 +1328,8 @@ function townFeedSourceReference(item: TownFeedItem, cronRows: CronRow[]): { ico
     return { icon: 'mail', label: gmail.account.split('@', 1)[0] || 'Gmail' }
   }
 
-  const telegramChatId = telegramChatIdFromSource(item.source)
-  if (telegramChatId) {
-    return { icon: 'send', label: telegramSourceLabel(item, telegramChatId) }
+  if (telegramChatIdFromSource(item.source)) {
+    return { icon: 'send', label: telegramChipLabel(item) }
   }
 
   const cronJobId = cronJobIdFromSource(item.source)
@@ -1463,16 +1507,6 @@ function CardSkeleton({ rows = 3 }: { rows?: number }) {
   )
 }
 
-function runTone(status: string): 'bad' | 'good' | 'muted' {
-  if (status === 'ok') {
-    return 'good'
-  }
-  if (status === 'error' || status === 'failed') {
-    return 'bad'
-  }
-  return 'muted'
-}
-
 function openRunHistory(event: { currentTarget: { dataset: { jobId?: string; jobName?: string } } }): void {
   const id = event.currentTarget.dataset.jobId?.trim()
   if (!id) {
@@ -1642,16 +1676,14 @@ function RunHistoryDialog() {
             {runs.map(run => (
               <div className="space-y-2" key={`${run.startedAt}-${run.status}`}>
                 <div className="flex items-center gap-2 text-xs text-(--ui-text-secondary)">
-                  <StatusDot tone={runTone(run.status)} />
+                  <StatusDot tone={runStatusTone(run.status, run.delivered)} />
                   <span>{relativeTime(run.startedAt, now)}</span>
-                  <span className="text-(--ui-text-tertiary)">
-                    {run.status && run.status.trim().toLowerCase() !== 'unknown' ? run.status : '—'}
-                  </span>
+                  <span className="text-(--ui-text-tertiary)">{humanRunStatus(run.status, run.delivered)}</span>
                 </div>
                 <ScrollArea className="max-h-40 rounded border border-(--ui-stroke-secondary)">
-                  <pre className="whitespace-pre-wrap break-words p-3 font-mono text-xs text-(--ui-text-secondary)">
-                    {presentRunOutput(run.output || run.error) || 'No output was saved.'}
-                  </pre>
+                  <div className="whitespace-pre-wrap break-words p-3 text-xs leading-5 text-(--ui-text-secondary)">
+                    {stripMarkdownToText(presentRunOutput(run.output || run.error)) || 'No output was saved.'}
+                  </div>
                 </ScrollArea>
               </div>
             ))}
@@ -2098,7 +2130,7 @@ function TasksCard({
   sessions: RpcState<unknown>
   waitingItems: AttentionItem[]
 }) {
-  const { bridge, kanban } = useTownKanbanBridge()
+  const { bridge, connecting: kanbanConnecting, kanban } = useTownKanbanBridge()
   const now = useNow()
   const [optimisticTaskIds, setOptimisticTaskIds] = useState<Set<string>>(new Set())
   const bridgeRef = useRef(bridge)
@@ -2195,7 +2227,9 @@ function TasksCard({
         </div>
       ) : (
         <>
-          {showSessionsFallback ? (
+          {showSessionsFallback && kanbanConnecting ? (
+            <CardSkeleton rows={4} />
+          ) : showSessionsFallback ? (
             <div>
               <p className="mb-3 text-xs leading-5 text-(--ui-text-tertiary)">
                 Showing recent sessions (kanban bridge offline)
@@ -2304,7 +2338,7 @@ function RecentsCard({ cron, sessions }: { cron: RpcState<unknown>; sessions: Rp
   const [expanded, setExpanded] = useState(false)
   const sessionRows = normalizeRecentSessions(sessions.data)
   const routineRows = normalizeCronRows(cron.data).flatMap(row => {
-    if (!row.enabled || row.lastRunAt === null || TOWN_SCANNER_JOB_NAMES.has(row.name)) {
+    if (!row.enabled || row.lastRunAt === null || isInternalTownJob(row)) {
       return []
     }
 
@@ -2427,7 +2461,7 @@ function RecentlyDismissedStrip({
 }
 
 function NeedToKnowCard({ cron }: { cron: RpcState<unknown> }) {
-  const { bridge, feed } = useTownFeedBridge()
+  const { bridge, connecting, feed } = useTownFeedBridge()
   const now = useNow()
   const recentlyDismissed = useValue($recentlyDismissed)
   const bridgeRef = useRef(bridge)
@@ -2447,11 +2481,11 @@ function NeedToKnowCard({ cron }: { cron: RpcState<unknown> }) {
   if (!bridge || !feed) {
     return (
       <SectionCard sideRail title="Need to Know">
-        <CardEmptyState
+        {connecting ? <CardSkeleton rows={3} /> : <CardEmptyState
           action={<Button size="inline" type="button" variant="text" onClick={explainTownFeedPane}>How to open it</Button>}
           description="Load the Need to Know pane once to connect its live feed here."
           title="Feed not connected"
-        />
+        />}
       </SectionCard>
     )
   }
@@ -2533,7 +2567,7 @@ function NeedToKnowCard({ cron }: { cron: RpcState<unknown> }) {
     }
     const gmail = gmailSourceFromSource(source)
     if (gmail) {
-      window.open(`https://mail.google.com/mail/#inbox/${encodeURIComponent(gmail.messageId)}`, '_blank', 'noopener,noreferrer')
+      window.open(gmailUrl(item?.account || gmail.account, gmail.messageId), '_blank', 'noopener,noreferrer')
     }
   }
 
@@ -2555,7 +2589,9 @@ function NeedToKnowCard({ cron }: { cron: RpcState<unknown> }) {
     <SectionCard
       action={(
         <div className="flex items-center gap-1 text-xs text-(--ui-text-tertiary)">
-          {feed.curatedAt === null ? null : <span>{relativeTime(feed.curatedAt, now)}</span>}
+          {feed.curating
+            ? <span>Refreshing…</span>
+            : feed.curatedAt === null ? null : <span>{relativeTime(feed.curatedAt, now)}</span>}
           <Tip label={feed.curating ? 'Refreshing Need to Know' : 'Refresh Need to Know'}>
             <Button
               aria-label="Refresh Need to Know"
@@ -2742,9 +2778,15 @@ function dayBriefCalloutIcon(kind: string): string {
   }
 }
 
-function suggestionInitials(label: string): string | null {
-  const match = label.trim().match(/^(\p{Lu}\p{L}*)\s+(\p{Lu}\p{L}*)\b/u)
-  return match ? `${match[1][0]}${match[2][0]}`.toUpperCase() : null
+function personInitials(person: string | null): string | null {
+  const initials = (person ?? '')
+    .trim()
+    .split(/\s+/)
+    .slice(0, 2)
+    .map(word => Array.from(word)[0] ?? '')
+    .join('')
+    .toUpperCase()
+  return initials || null
 }
 
 function suggestionIcon(kind: TownSuggestionKind): string {
@@ -2758,7 +2800,7 @@ function suggestionIcon(kind: TownSuggestionKind): string {
 }
 
 function SuggestionsCard() {
-  const { bridge, feed } = useTownFeedBridge()
+  const { bridge, connecting, feed } = useTownFeedBridge()
   const now = useNow()
   const bridgeRef = useRef(bridge)
   const feedRef = useRef(feed)
@@ -2796,7 +2838,9 @@ function SuggestionsCard() {
     <SectionCard
       action={(
         <div className="flex items-center gap-1 text-xs text-(--ui-text-tertiary)">
-          {suggestionsGeneratedAt === null ? null : <span>{relativeTime(suggestionsGeneratedAt, now)}</span>}
+          {feed?.curating
+            ? <span>Refreshing…</span>
+            : suggestionsGeneratedAt === null ? null : <span>{relativeTime(suggestionsGeneratedAt, now)}</span>}
           <Tip label={feed?.curating ? 'Refreshing suggestions' : 'Refresh suggestions'}>
             <Button
               aria-label="Refresh suggestions"
@@ -2815,7 +2859,9 @@ function SuggestionsCard() {
       sideRail
       title="Suggestions"
     >
-      {!bridge || !feed ? (
+      {(!bridge || !feed) && connecting ? (
+        <CardSkeleton rows={2} />
+      ) : !bridge || !feed ? (
         <CardEmptyState
           action={<Button size="inline" type="button" variant="text" onClick={openTownFeed}>Open Need to Know</Button>}
           description="Load the Need to Know pane to connect curated next-step suggestions."
@@ -2849,7 +2895,7 @@ function SuggestionsCard() {
       ) : (
         <div>
           {suggestions.map(suggestion => {
-            const initials = suggestionInitials(suggestion.label)
+            const initials = personInitials(suggestion.person)
 
             return (
               <button
@@ -2921,7 +2967,7 @@ function SuggestionsCard() {
           onClick={refresh}
         >
           <Codicon name="refresh" size="0.75rem" />
-          <span>Refresh feed</span>
+          <span>{feed?.curating ? 'Refreshing…' : 'Refresh feed'}</span>
         </Button>
       </div>
     </SectionCard>
@@ -2929,7 +2975,7 @@ function SuggestionsCard() {
 }
 
 function RoutinesCard({ cron }: { cron: RpcState<unknown> }) {
-  const rows = normalizeCronRows(cron.data)
+  const rows = normalizeCronRows(cron.data).filter(row => !isInternalTownJob(row))
   const cronError = cron.error || payloadError(cron.data)
   const cronBridge = useCronBridgeCapabilities()
   const now = useNow()
@@ -3008,6 +3054,8 @@ function RoutinesCard({ cron }: { cron: RpcState<unknown> }) {
         <div>
           {rows.map(row => {
             const outcome = routineOutcome(row, now)
+            // Failures and paused routines stay visible; healthy outcomes reveal on hover.
+            const outcomeAlwaysVisible = outcome.tone === 'bad' || outcome.tone === 'warn'
             const nextRun = row.nextRunAt === null ? (row.enabled ? 'Next run unavailable' : 'Paused') : relativeTime(row.nextRunAt, now)
             const description = routineDescription(row.promptPreview.replace(/\.\.\.$/, ''))
 
@@ -3052,7 +3100,7 @@ function RoutinesCard({ cron }: { cron: RpcState<unknown> }) {
                   </div>
                 ) : null}
                 <Button
-                  className="mt-1.5 h-auto min-w-0 justify-start gap-1.5 p-0 text-xs text-(--ui-text-secondary) opacity-0 transition-opacity duration-150 group-hover:opacity-100 focus-visible:opacity-100"
+                  className={`mt-1.5 h-auto min-w-0 justify-start gap-1.5 p-0 text-xs text-(--ui-text-secondary) ${outcomeAlwaysVisible ? '' : 'opacity-0 transition-opacity duration-150 group-hover:opacity-100 focus-visible:opacity-100'}`}
                   data-job-id={row.id}
                   data-job-name={row.name}
                   size="inline"
@@ -3127,13 +3175,14 @@ function BriefingCard({ cron }: { cron: RpcState<unknown> }) {
         setLoadingRun(false)
       }
     })
-  }, [briefing?.id, cronBridge.cronRuns])
+    // lastRunAt: a new day's run refetches without a remount.
+  }, [briefing?.id, briefing?.lastRunAt, cronBridge.cronRuns])
 
   const fallbackOutcome = briefing ? routineOutcome(briefing, now) : null
   const status = latestRun?.status || briefing?.lastStatus || 'unknown'
+  const delivered = latestRun?.delivered ?? null
   const timestamp = latestRun?.startedAt ?? briefing?.lastRunAt ?? null
-  const output = (latestRun?.output || latestRun?.error || '').replace(/\s+/g, ' ').trim()
-  const outputPreview = output.length > 200 ? `${output.slice(0, 199).trimEnd()}…` : output
+  const outputPreview = runOutputPreview(latestRun?.output || latestRun?.error || '')
   const clipboardAvailable = clipboardWriteAvailable()
 
   return (
@@ -3143,7 +3192,7 @@ function BriefingCard({ cron }: { cron: RpcState<unknown> }) {
       ) : cronError ? (
         <ErrorState className="py-6" description={cronError} title="Could not check briefing routines" />
       ) : briefing ? (
-        loadingRun ? (
+        loadingRun && !latestRun ? (
           <CardSkeleton rows={2} />
         ) : (
           <Button
@@ -3155,11 +3204,16 @@ function BriefingCard({ cron }: { cron: RpcState<unknown> }) {
             onClick={openRunHistory}
           >
             <span className="flex items-center gap-2 text-xs text-(--ui-text-secondary)">
-              <StatusDot tone={latestRun ? runTone(latestRun.status) : fallbackOutcome?.tone || 'muted'} />
+              <StatusDot tone={latestRun ? runStatusTone(latestRun.status, delivered) : fallbackOutcome?.tone || 'muted'} />
               <span>{timestamp === null ? 'Not run yet' : relativeTime(timestamp, now)}</span>
-              <span className="text-(--ui-text-tertiary)">{status}</span>
+              {timestamp === null ? null : (
+                <span className="text-(--ui-text-tertiary)">{humanRunStatus(status, delivered)}</span>
+              )}
             </span>
-            <span className="line-clamp-3 text-xs leading-5 text-(--ui-text-secondary)">
+            <span
+              className="text-xs leading-5 text-(--ui-text-secondary)"
+              style={{ display: '-webkit-box', WebkitLineClamp: 4, WebkitBoxOrient: 'vertical', overflow: 'hidden', whiteSpace: 'pre-line' }}
+            >
               {outputPreview || runError || 'No output was saved for the latest run.'}
             </span>
           </Button>
@@ -3406,9 +3460,9 @@ function TownHome() {
   const profile = useValue(host.state.profile)
   const activeSessionId = useValue(host.state.activeSessionId)
   const preferences = useValue($townHomePreferences)
-  const sessions = useRpc<unknown>('session.list', SESSION_LIST_PARAMS)
-  const activeSessions = useRpc<unknown>('session.active_list', ACTIVE_SESSION_PARAMS)
-  const cron = useRpc<unknown>('cron.manage', CRON_LIST_PARAMS)
+  const sessions = useRpc<unknown>('session.list', SESSION_LIST_PARAMS, { topic: 'sessions' })
+  const activeSessions = useRpc<unknown>('session.active_list', ACTIVE_SESSION_PARAMS, { topic: 'activeSessions' })
+  const cron = useRpc<unknown>('cron.manage', CRON_LIST_PARAMS, { topic: 'cron' })
   const { bridge: feedBridge, feed } = useTownFeedBridge()
   const markers = useAttentionMarkers(activeSessionId)
   const sessionRows = normalizeSessions(sessions.data)
@@ -3424,7 +3478,7 @@ function TownHome() {
   const cronAvailable = !cron.error && !payloadError(cron.data)
   const nextRoutine = cronAvailable
     ? normalizeCronRows(cron.data)
-        .filter(row => row.enabled && row.state !== 'paused' && row.nextRunAt !== null && row.nextRunAt >= now.getTime())
+        .filter(row => row.enabled && row.state !== 'paused' && row.nextRunAt !== null && row.nextRunAt >= now.getTime() && !isInternalTownJob(row))
         .sort((a, b) => (a.nextRunAt ?? Number.POSITIVE_INFINITY) - (b.nextRunAt ?? Number.POSITIVE_INFINITY))[0]
     : undefined
   const dayBrief = feed?.dayBrief ?? null
@@ -3585,6 +3639,7 @@ export default {
   name: 'Town Home',
   register(ctx: PluginContext) {
     pluginContext = ctx
+    bridgeWaitDeadline = Date.now() + BRIDGE_READY_TIMEOUT_MS
     try {
       $townHomePreferences.set(normalizeTownHomePreferences(ctx.storage.get(TOWN_HOME_PREFERENCES_KEY, defaultTownHomePreferences())))
     } catch {

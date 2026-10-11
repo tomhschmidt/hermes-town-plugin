@@ -2387,6 +2387,9 @@ def run_curator(llm: Any = None) -> dict[str, Any]:
     }
 
 
+_PUBLIC_SOURCE_FIELDS = ("chat_name", "last_sender", "chat_type", "account", "thread_id")
+
+
 def _public_item(item: dict[str, Any]) -> dict[str, Any]:
     public = {
         "id": item["id"],
@@ -2400,6 +2403,16 @@ def _public_item(item: dict[str, Any]) -> dict[str, Any]:
     action_hint = str(item.get("action_hint") or "").strip()
     if action_hint:
         public["action_hint"] = action_hint
+    # Source context the desktop needs for chips and deep links (R5): chat
+    # titles instead of raw Telegram ids, the Gmail account for /mail/u/<acct>.
+    for field in _PUBLIC_SOURCE_FIELDS:
+        value = item.get(field)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            value = str(value)
+        if isinstance(value, str) and value.strip():
+            public[field] = value.strip()
+    if isinstance(item.get("user_spoke_last"), bool):
+        public["user_spoke_last"] = item["user_spoke_last"]
     return public
 
 
@@ -2469,6 +2482,63 @@ def get_cron_prompt(job_id: str) -> dict[str, Any]:
     return {"ok": True, "job_id": job_id, "prompt": str(job.get("prompt") or "")}
 
 
+CRON_RUN_OUTPUT_LIMIT = 2000
+_RUN_DOC_TAIL_BYTES = 16 * 1024
+_RESPONSE_HEADING_RE = re.compile(r"(?m)^## Response[ \t]*\r?$")
+
+
+def _cap_run_output(text: str, limit: int = CRON_RUN_OUTPUT_LIMIT) -> str:
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
+
+
+def _run_doc_response(path: Path, limit: int = CRON_RUN_OUTPUT_LIMIT) -> str:
+    """The text after the LAST ``## Response`` heading of a cron run document.
+
+    Run docs open with the job's full prompt (often tens of KB, and it can quote
+    the heading itself), so read backwards from the end in growing windows; the
+    response normally sits inside the first one. Docs without a Response section
+    (script-mode runs, blocked runs) yield ``""``.
+    """
+    try:
+        with path.open("rb") as handle:
+            size = handle.seek(0, os.SEEK_END)
+            window = _RUN_DOC_TAIL_BYTES
+            while True:
+                start = max(0, size - window)
+                handle.seek(start)
+                text = handle.read(size - start).decode("utf-8", errors="replace")
+                if start:
+                    # A window can open mid-line; only whole lines may match.
+                    text = text.partition("\n")[2]
+                match = None
+                for match in _RESPONSE_HEADING_RE.finditer(text):
+                    pass
+                if match is not None:
+                    return _cap_run_output(text[match.end():], limit)
+                if not start:
+                    return ""
+                window *= 4
+    except OSError:
+        return ""
+
+
+def _run_delivered(job: dict[str, Any]) -> Optional[bool]:
+    """Whether the job's latest run reached its delivery target, when the record says so."""
+    status = str(job.get("last_status") or "").strip().casefold()
+    if status == "delivery_failed" or str(job.get("last_delivery_error") or "").strip():
+        return False
+    deliver = str(job.get("deliver") or "").strip().casefold()
+    if status != "ok" or not deliver or deliver == "local":
+        return None
+    if deliver == "origin" and not job.get("origin"):
+        # Origin-less "origin" jobs are skipped like local ones (nothing is sent).
+        return None
+    return True
+
+
 @router.get("/cron-runs/{job_id}")
 def get_cron_runs(job_id: str) -> dict[str, Any]:
     from cron.jobs import get_cron_output_dir, list_jobs
@@ -2496,19 +2566,16 @@ def get_cron_runs(job_id: str) -> dict[str, Any]:
             started = datetime.strptime(path.stem, "%Y-%m-%d_%H-%M-%S").astimezone().timestamp()
         except ValueError:
             continue
-        try:
-            with path.open("r", encoding="utf-8", errors="replace") as handle:
-                output = handle.read(2000)
-        except OSError:
-            output = ""
-        runs.append(
-            {
-                "started_at": _iso_timestamp(started),
-                "status": str(job.get("last_status") or "unknown") if not runs else "unknown",
-                "error": str(job.get("last_error") or "") if not runs else "",
-                "output": output,
-            }
-        )
+        run: dict[str, Any] = {
+            "started_at": _iso_timestamp(started),
+            "status": str(job.get("last_status") or "unknown") if not runs else "unknown",
+            "error": str(job.get("last_error") or "") if not runs else "",
+            "output": _run_doc_response(path),
+        }
+        delivered = _run_delivered(job) if not runs else None
+        if delivered is not None:
+            run["delivered"] = delivered
+        runs.append(run)
 
     return {
         "ok": True,
@@ -2799,9 +2866,79 @@ def get_kanban_summary() -> dict[str, Any]:
         }
 
 
+CURATE_JOB_NAME = "town-feed-curate"
+CURATE_JOB_SCRIPT = "town-curate.py"
+_CURATE_TRIGGER_LOCK = threading.Lock()
+_curate_trigger_thread: Optional[threading.Thread] = None
+
+
+def _find_curate_job(jobs: Any) -> Optional[dict[str, Any]]:
+    matches = [
+        job
+        for job in jobs or []
+        if isinstance(job, dict)
+        and (
+            str(job.get("name") or "").strip().casefold() == CURATE_JOB_NAME
+            or Path(str(job.get("script") or "")).name == CURATE_JOB_SCRIPT
+        )
+    ]
+    # Prefer a live job when a paused duplicate lingers.
+    matches.sort(key=lambda job: job.get("enabled") is False)
+    return matches[0] if matches else None
+
+
+def _run_curate_job(job: dict[str, Any], execute: Any) -> None:
+    try:
+        outcome = execute(job)
+        if isinstance(outcome, dict) and outcome.get("error"):
+            import logging
+
+            logging.getLogger(__name__).warning("town-feed curate run: %s", outcome["error"])
+    except Exception:
+        import logging
+
+        logging.getLogger(__name__).exception("town-feed curate run failed")
+
+
 @router.post("/curate")
 def curate_feed() -> dict[str, Any]:
-    # Dashboard API modules are mounted without PluginContext, so this direct
-    # route intentionally uses the documented heuristic fallback. The scheduled
-    # town_feed_curate tool passes ctx.llm into the same run_curator function.
-    return run_curator(llm=None)
+    # Never curate inline: dashboard routes have no LLM, so run_curator(llm=None)
+    # would overwrite LLM headlines with heuristic ones, and an LLM pass outlives
+    # the renderer's ~15 s IPC timeout. Fire the curate cron job (same
+    # _execute_job_now path as /cron-trigger) on a thread; the desktop polls /feed
+    # until curated_at moves past `since`.
+    global _curate_trigger_thread
+    try:
+        from cron.jobs import list_jobs
+        from tools.cronjob_tools import _execute_job_now
+
+        job = _find_curate_job(list_jobs(include_disabled=True))
+    except Exception as exc:
+        return {"ok": False, "error": f"Could not read routines: {exc}"}
+    if job is None:
+        return {
+            "ok": False,
+            "error": f"No {CURATE_JOB_NAME} routine is scheduled; reinstall the town-feed plugin.",
+        }
+    if job.get("enabled") is False:
+        # A paused job would lose the manual-run claim; say so instead of a silent timeout.
+        return {"ok": False, "error": f"The {CURATE_JOB_NAME} routine is paused; resume it to refresh."}
+
+    with _process_lock():
+        state = _read_state_unlocked()
+    curated_timestamp = _parse_timestamp(state.get("last_curated_at"))
+    since = _iso_timestamp(curated_timestamp) if curated_timestamp else None
+
+    with _CURATE_TRIGGER_LOCK:
+        running = _curate_trigger_thread
+        if running is not None and running.is_alive():
+            return {"ok": True, "triggered": False, "since": since}
+        thread = threading.Thread(
+            target=_run_curate_job,
+            args=(job, _execute_job_now),
+            name="town-feed-curate-trigger",
+            daemon=True,
+        )
+        thread.start()
+        _curate_trigger_thread = thread
+    return {"ok": True, "triggered": True, "since": since}
