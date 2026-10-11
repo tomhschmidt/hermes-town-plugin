@@ -1685,12 +1685,21 @@ _RANKING_RULES = (
     "deadlines, and names—and never echo a vague snippet. For an orders message "
     "with an amount of at least $100, lead the headline with the amount and "
     "merchant. For chat threads (telegram sources), never echo raw message "
-    "lines: use the supplied body to say what happened and what the user must "
-    "do, attributing every statement to its sender by name. When "
-    "user_spoke_last is true the newest message is the user's own — phrase the "
-    "item as an open loop ('You told Hunter you're free tomorrow and offered to "
-    "bring dinner; waiting on his confirm'), never as news from the other "
-    "person. Summaries are the takeaway plus its implication or next step, "
+    "lines: use the supplied body to say what happened and what, if anything, "
+    "the user must do, attributing every statement to its sender by name. In "
+    "a telegram body, [YOU] marks the user's own messages, '↩ <name>' a reply "
+    "to <name> ('↩ you' is a reply to the user), and '@you' a message that "
+    "mentions or names the user. When user_spoke_last is true the newest "
+    "message is the user's own — phrase the item as an open loop ('You told "
+    "Bob you're free tomorrow and offered to bring dinner; waiting on his "
+    "confirm'), never as news from the other person. When a telegram row has "
+    "chat_type group and addressed_to_user false, nobody in it addressed the "
+    "user: never phrase it as the user's task — score it below 20 or omit "
+    "it; only the user's own unanswered promise there may appear, as an open "
+    "loop. When operator_replied_after_ask is true the user already answered "
+    "the latest ask: do not present that ask as open — at most an open loop "
+    "if the user's reply promised something. Summaries are the takeaway plus "
+    "its implication or next step, "
     "never a restatement of the source; when a source states a deadline and a "
     "consequence, carry both ('trial ends Jul 29 — routines lock'). Summaries "
     "must be concrete and at most two sentences. For an item with an obvious "
@@ -1783,11 +1792,12 @@ def _llm_rank(
         ):
             row["body"] = _bounded_compact(str(item["body"]), 1500)
         if source.startswith("telegram:"):
-            for field in ("chat_name", "last_sender"):
+            for field in ("chat_name", "last_sender", "chat_type"):
                 if str(item.get(field) or "").strip():
                     row[field] = _compact(str(item[field]), 80)
-            if isinstance(item.get("user_spoke_last"), bool):
-                row["user_spoke_last"] = item["user_spoke_last"]
+            for field in ("user_spoke_last", "addressed_to_user", "operator_replied_after_ask"):
+                if isinstance(item.get(field), bool):
+                    row[field] = item[field]
         payload.append(row)
 
     legacy_instructions = (
