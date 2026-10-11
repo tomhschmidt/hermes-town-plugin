@@ -45,3 +45,29 @@ export function gmailUrl(account: string | null | undefined, messageId: string):
     ? `https://mail.google.com/mail/u/${encodeURIComponent(email)}/#all/${id}`
     : `https://mail.google.com/mail/#inbox/${id}`
 }
+
+export interface SourceAction {
+  kind: 'gmail' | 'session' | 'run'
+  /** Accessible name and tooltip of the icon-only button. */
+  label: string
+  icon: string
+}
+
+/**
+ * The one source action a Need-to-Know card offers, as an icon-only button
+ * (U13): open the Gmail message or the session, or (where the surface has a
+ * run-history dialog) view the routine's run. Null when nothing opens.
+ */
+export function sourceAction(source: string, options: { runs?: boolean } = {}): SourceAction | null {
+  const value = source.trim()
+  if (/^session:\s*\S/i.test(value)) {
+    return { kind: 'session', label: 'Open session', icon: 'comment-discussion' }
+  }
+  if (/^gmail:[^:]*\S[^:]*:\s*\S/i.test(value)) {
+    return { kind: 'gmail', label: 'Open in Gmail', icon: 'mail' }
+  }
+  if (options.runs && /^cron:\s*\S/i.test(value)) {
+    return { kind: 'run', label: 'View run', icon: 'clock' }
+  }
+  return null
+}

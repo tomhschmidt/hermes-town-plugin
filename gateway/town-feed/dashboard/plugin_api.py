@@ -2435,6 +2435,60 @@ def _normalize_suggestions(value: Any) -> list[dict[str, str]]:
     return suggestions
 
 
+# U13: deterministic post-filter so a suggestion never repeats what Up next
+# or a conflict callout already says. No backfill: fewer chips beat padding.
+SUGGESTION_PREP_WINDOW_SECONDS = 18 * 60 * 60
+_SUGGESTION_PREP_RE = re.compile(r"(?:prep|prepare|get\s+ready|join)\b", re.IGNORECASE)
+_SUGGESTION_NAME_SPLIT_RE = re.compile(r"[\W_]+", re.UNICODE)
+
+
+def _suggestion_text(value: Any) -> str:
+    return " ".join(_SUGGESTION_NAME_SPLIT_RE.sub(" ", str(value or "")).casefold().split())
+
+
+def _names_event(label: str, summary: Any) -> bool:
+    """The label contains the event summary, when the summary is distinctive."""
+    name = _suggestion_text(summary)
+    if not name or (len(str(summary).split()) < 2 and len(name) < 6):
+        return False
+    return name in label
+
+
+def _filter_suggestions(
+    suggestions: list[dict[str, str]],
+    schedule_events: list[dict[str, Any]],
+    schedule_context: Optional[dict[str, Any]],
+    now: float,
+) -> list[dict[str, str]]:
+    """Drop prep chips for an Up-next event and chips restating a conflict."""
+    # Up next shows meaningful events under way or starting soon.
+    upcoming: list[Any] = []
+    for event in schedule_events:
+        if not isinstance(event, dict) or not _is_meaningful(event):
+            continue
+        start_ts = _parse_timestamp(event.get("start_iso"))
+        end_ts = _parse_timestamp(event.get("end_iso"))
+        if start_ts and end_ts > now and start_ts <= now + SUGGESTION_PREP_WINDOW_SECONDS:
+            upcoming.append(event.get("summary"))
+    conflicts = [
+        (conflict.get("a"), conflict.get("b"))
+        for conflict in (schedule_context or {}).get("conflicts") or []
+        if isinstance(conflict, dict)
+    ]
+    kept: list[dict[str, str]] = []
+    for suggestion in suggestions:
+        raw_label = str(suggestion.get("label") or "").strip()
+        label = _suggestion_text(raw_label)
+        if _SUGGESTION_PREP_RE.match(raw_label) and any(
+            _names_event(label, summary) for summary in upcoming
+        ):
+            continue
+        if any(_names_event(label, a) and _names_event(label, b) for a, b in conflicts):
+            continue
+        kept.append(suggestion)
+    return kept
+
+
 # C7: the one voice, injected into every Town LLM lane (ranking + day brief).
 TOWN_VOICE = (
     "Voice: you write for one operator, in second person, as a sharp chief of "
@@ -2728,6 +2782,33 @@ _DAY_BRIEF_S1_RULES = (
     "heavier day ('Light day — 2 meetings; tomorrow has 8'). "
 )
 
+# U13: at home (or just back) the operator lives in their home zone, so an
+# invite's foreign organizer zone is not worth converting.
+_HOME_WHERE_STATUSES = {"home", "just_returned"}
+_DAY_BRIEF_U13_RULES = (
+    "When operator.where.status is home or just_returned, produce NO timezone "
+    "callout: the operator is in their home zone, and an invite's organizer "
+    "zone is not worth converting. "
+)
+
+
+def _drop_home_timezone_callouts(
+    brief: Optional[dict[str, Any]], where: Optional[dict[str, Any]]
+) -> Optional[dict[str, Any]]:
+    """Drop ``timezone`` callouts while the operator is home or just back."""
+    if not isinstance(brief, dict) or not isinstance(where, dict):
+        return brief
+    if str(where.get("status") or "") not in _HOME_WHERE_STATUSES:
+        return brief
+    callouts = brief.get("callouts")
+    if isinstance(callouts, list):
+        brief["callouts"] = [
+            callout
+            for callout in callouts
+            if not (isinstance(callout, dict) and callout.get("kind") == "timezone")
+        ]
+    return brief
+
 
 def _day_brief_event_projection(
     schedule_events: list[dict[str, Any]], local_tz: Any
@@ -2915,6 +2996,7 @@ def _generate_day_brief(
         + " "
         + _OPERATOR_RULES
         + _DAY_BRIEF_S1_RULES
+        + _DAY_BRIEF_U13_RULES
     )
     try:
         result = llm.complete_structured(
@@ -2931,6 +3013,7 @@ def _generate_day_brief(
         brief = _normalize_day_brief(parsed if isinstance(parsed, dict) else None)
         if brief is None:
             return None, "day brief response had no usable day_summary"
+        _drop_home_timezone_callouts(brief, (operator or {}).get("where"))
         brief.pop("prep", None)
         prep = _ground_prep(parsed.get("prep"), meeting_people)
         if prep:
@@ -3210,7 +3293,10 @@ def run_curator(llm: Any = None) -> dict[str, Any]:
         )
         if llm_rows:
             ranking_mode = "llm"
-            llm_suggestions = suggestions
+            if suggestions:
+                llm_suggestions = _filter_suggestions(
+                    suggestions, schedule_events, schedule_context, now
+                )
             for candidate in candidates:
                 row = llm_rows.get(candidate["key"])
                 if row:
@@ -3373,7 +3459,8 @@ def run_curator(llm: Any = None) -> dict[str, Any]:
         # Scanner failures surface via the town-cron-health candidates, not by
         # carrying stale gmail: errors forward (which would never clear).
         state["last_curate_errors"] = errors[:20]
-        if ranking_mode == "llm" and llm_suggestions:
+        # A filtered-empty list still replaces the last set (U13: no backfill).
+        if ranking_mode == "llm" and llm_suggestions is not None:
             state["suggestions"] = llm_suggestions
             state["suggestions_generated_at"] = completed_at
         _write_state_unlocked(state)
@@ -3679,10 +3766,29 @@ def undismiss_item(payload: ItemRequest) -> dict[str, Any]:
     }
 
 
+def _kanban_connect() -> Any:
+    """A closing kanban DB connection, wherever this Hermes keeps the helper.
+
+    Hermes moved ``connect_closing`` to ``hermes_cli.kanban_db_connect`` and
+    dropped the ``kanban_db`` alias in v0.21.x; older installs only have the
+    original. Every kanban route opens its connection here (U13).
+    """
+    try:
+        from hermes_cli import kanban_db_connect
+    except ImportError:
+        kanban_db_connect = None
+    connect_closing = getattr(kanban_db_connect, "connect_closing", None)
+    if connect_closing is None:
+        from hermes_cli import kanban_db
+
+        connect_closing = kanban_db.connect_closing
+    return connect_closing()
+
+
 def _create_kanban_task(item: dict[str, Any]) -> dict[str, Any]:
     from hermes_cli import kanban_db
 
-    with kanban_db.connect_closing() as conn:
+    with _kanban_connect() as conn:
         task_id = kanban_db.create_task(
             conn,
             title=str(item["headline"]),
@@ -3713,7 +3819,7 @@ def create_composer_task(payload: TaskRequest) -> dict[str, Any]:
         body += f"\nSession: session:{payload.session_id}"
 
     try:
-        with kanban_db.connect_closing() as conn:
+        with _kanban_connect() as conn:
             task_id = kanban_db.create_task(
                 conn,
                 title=payload.title,
@@ -3781,7 +3887,7 @@ def promote_to_task(payload: ItemRequest) -> dict[str, Any]:
 def complete_kanban_task(payload: ItemRequest) -> dict[str, Any]:
     from hermes_cli import kanban_db
 
-    with kanban_db.connect_closing() as conn:
+    with _kanban_connect() as conn:
         task = kanban_db.get_task(conn, payload.id)
         if task is None:
             raise HTTPException(status_code=404, detail=f"kanban task {payload.id!r} not found")
@@ -3838,7 +3944,7 @@ def complete_kanban_task(payload: ItemRequest) -> dict[str, Any]:
 def get_kanban_summary() -> dict[str, Any]:
     from hermes_cli import kanban_db
 
-    with kanban_db.connect_closing() as conn:
+    with _kanban_connect() as conn:
         tasks = kanban_db.list_tasks(conn, include_archived=False)
         task_ids = [task.id for task in tasks]
         updated_at_by_task: dict[str, int] = {}

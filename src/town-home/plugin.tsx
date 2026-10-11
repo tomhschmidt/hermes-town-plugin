@@ -41,6 +41,7 @@ import {
 import type * as React from 'react'
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 
+import { compactAge, isStale } from '../shared/age.ts'
 import {
   normalizeAttendeeDetails,
   normalizeMeetingPrep,
@@ -56,11 +57,19 @@ import {
   type TownScheduleContext,
   type TownWhere
 } from '../shared/situation.ts'
-import { gmailUrl, telegramChipLabel } from '../shared/sources.ts'
-import { contextLineSource, greetingBase, greetingName, locationChipLabel } from './lib/header.ts'
+import { gmailUrl, sourceAction } from '../shared/sources.ts'
+import {
+  contextLineSource,
+  greetingBase,
+  greetingName,
+  locationChipLabel,
+  shouldShowLocationChip,
+  visibleCallouts
+} from './lib/header.ts'
 import { isInternalTownJob } from './lib/jobs.ts'
 import { scheduleAttendeeSummary } from './lib/people.ts'
 import { humanRunStatus, runOutputPreview, runStatusTone, stripMarkdownToText } from './lib/run-output.ts'
+import { sessionSource, tasksFallbackSessions } from './lib/tasks.ts'
 import { pickUpNext } from './lib/upnext.ts'
 import { displayTimeZone, safeTimeZone } from './lib/when.ts'
 import { MeetingPeople } from './people.tsx'
@@ -451,7 +460,6 @@ interface TownSuggestion {
   id: string
   kind: TownSuggestionKind
   label: string
-  person: string | null
   prompt: string
 }
 
@@ -848,9 +856,7 @@ function normalizeTownFeedState(value: unknown): TownFeedState {
       return []
     }
 
-    // Initials only ever come from a real person field, never from the label.
-    const person = stringValue(suggestion.person).trim().slice(0, 80) || null
-    return [{ id, kind, label, person, prompt }]
+    return [{ id, kind, label, prompt }]
   })
   const nextEventRecord = asRecord(state?.nextEvent ?? state?.next_event)
   const nextEventSummary = stringValue(nextEventRecord?.summary).trim()
@@ -1333,10 +1339,6 @@ function recentRoutineOutcome(row: CronRow): 'completed' | 'failed' | null {
   return null
 }
 
-function formatSessionAge(timestamp: number | null, now = Date.now()): string {
-  return timestamp === null ? 'Time unavailable' : relativeTime(timestamp, now)
-}
-
 function sessionIdFromSource(source: string): string | null {
   const match = source.trim().match(/^session:(.+)$/i)
   return match?.[1]?.trim() || null
@@ -1349,63 +1351,9 @@ function gmailSourceFromSource(source: string): { account: string; messageId: st
   return account && messageId ? { account, messageId } : null
 }
 
-function telegramChatIdFromSource(source: string): string | null {
-  const match = source.trim().match(/^telegram:(.+)$/i)
-  return match?.[1]?.trim() || null
-}
-
 function cronJobIdFromSource(source: string): string | null {
   const match = source.trim().match(/^cron:(.+)$/i)
   return match?.[1]?.trim() || null
-}
-
-function isCalendarSource(source: string): boolean {
-  return /^calendar:[^:]+:.+$/i.test(source.trim())
-}
-
-function townFeedSourceReference(item: TownFeedItem, cronRows: CronRow[]): { icon: string; label: string } {
-  if (sessionIdFromSource(item.source)) {
-    return { icon: 'comment-discussion', label: 'Session' }
-  }
-
-  const gmail = gmailSourceFromSource(item.source)
-  if (gmail) {
-    return { icon: 'mail', label: gmail.account.split('@', 1)[0] || 'Gmail' }
-  }
-
-  if (telegramChatIdFromSource(item.source)) {
-    return { icon: 'send', label: telegramChipLabel(item) }
-  }
-
-  const cronJobId = cronJobIdFromSource(item.source)
-  if (cronJobId) {
-    return { icon: 'clock', label: cronRows.find(row => row.id === cronJobId)?.name || 'Routine' }
-  }
-
-  if (isCalendarSource(item.source)) {
-    return { icon: 'calendar', label: 'Calendar' }
-  }
-
-  return { icon: 'symbol-misc', label: item.source || 'Hermes' }
-}
-
-function referencesTownFeedCurator(value: string): boolean {
-  const folded = value.toLowerCase()
-  return folded.includes('town feed curator') || folded.includes('town_feed_curate')
-}
-
-function stripImportantPreviewBlock(value: string): string {
-  return value.replace(/^\s*\[IMPORTANT:[\s\S]*?\]\s*/i, '')
-}
-
-function sessionFallbackRows(rows: SessionRow[]): SessionRow[] {
-  return rows.flatMap(row => {
-    if (referencesTownFeedCurator(row.title) || referencesTownFeedCurator(row.preview)) {
-      return []
-    }
-
-    return [{ ...row, preview: stripImportantPreviewBlock(row.preview) }]
-  })
 }
 
 const ACTIVE_KANBAN_COLUMNS = ['triage', 'todo', 'scheduled', 'ready', 'running', 'blocked', 'review'] as const
@@ -1876,6 +1824,17 @@ function SectionCard({
   )
 }
 
+const TWO_LINE_CLAMP: React.CSSProperties = { display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }
+
+// U13: a card header's freshness stamp only appears once the data is stale.
+function FreshnessStamp({ at, now }: { at: number | null; now: number }) {
+  if (at === null || !isStale(at, now)) {
+    return null
+  }
+  const age = relativeTime(at, now)
+  return <Badge size="xs" title={`Last refreshed ${age}`} variant="warn">{age}</Badge>
+}
+
 function CardEmptyState({
   action,
   description,
@@ -1954,6 +1913,9 @@ const COMPOSER_MODES: ReadonlyArray<{ id: ComposerMode; label: string }> = [
   { id: 'chat', label: 'Chat' }
 ]
 
+// U13: two rows at rest; the draft grows it (field-sizing) up to a cap, then it scrolls.
+const COMPOSER_TEXTAREA_STYLE: React.CSSProperties = { minHeight: 'calc(2lh + 0.75rem)', maxHeight: '15rem' }
+
 function composerTitle(prompt: string): string {
   return prompt.trim().split(/\r?\n/, 1)[0].trim().slice(0, 60)
 }
@@ -1980,6 +1942,7 @@ function TaskComposer() {
   const gateway = useValue(host.state.gateway)
   const composer = useValue($composer)
   const [sending, setSending] = useState(false)
+  const [focused, setFocused] = useState(false)
   const textareaRef = useRef<HTMLTextAreaElement | null>(null)
   const handledFocusRequestRef = useRef(composer.focusRequest)
   const sendingRef = useRef(sending)
@@ -2058,6 +2021,7 @@ function TaskComposer() {
 
   const disabled = sending || !composer.draft.trim() || gateway !== 'open'
   const gatewayOpen = gateway === 'open'
+  const showHint = !gatewayOpen || focused || composer.draft.length > 0
 
   return (
     <section
@@ -2065,16 +2029,20 @@ function TaskComposer() {
     >
       <Textarea
         aria-label="Task or chat prompt"
-        className="min-h-20 resize-y !rounded-none !border-0 !bg-transparent !shadow-none focus:!border-transparent focus:!shadow-none"
+        className="field-sizing-content min-h-0 resize-none !rounded-none !border-0 !bg-transparent !shadow-none focus:!border-transparent focus:!shadow-none"
+        onBlur={() => setFocused(false)}
         onChange={(event: { currentTarget: { value: string } }) => updateDraft(event.currentTarget.value)}
+        onFocus={() => setFocused(true)}
         onKeyDown={handleKeyDown}
         placeholder="Give Hermes a task…"
         ref={textareaRef}
+        rows={2}
+        style={COMPOSER_TEXTAREA_STYLE}
         value={composer.draft}
       />
       <div className="flex flex-wrap items-center justify-between gap-3 px-3 pb-3 pt-3">
         <span className="text-xs text-(--ui-text-tertiary)">
-          {gatewayOpen ? 'Enter to start · Shift+Enter for a new line' : 'Gateway offline — reconnecting…'}
+          {showHint ? (gatewayOpen ? 'Enter to start · Shift+Enter for a new line' : 'Gateway offline — reconnecting…') : null}
         </span>
         <div className="flex shrink-0 items-center gap-3">
           <SegmentedControl className="shrink-0" onChange={selectMode} options={COMPOSER_MODES} value={composer.mode} />
@@ -2166,11 +2134,13 @@ function KanbanTaskRow({ bridgeAvailable, column, completed, needsInputItem, onC
 
 function TasksCard({
   activeSessions,
+  cron,
   doneTaskWindowHours,
   sessions,
   waitingItems
 }: {
   activeSessions: RpcState<unknown>
+  cron: RpcState<unknown>
   doneTaskWindowHours: DoneTaskWindowHours
   sessions: RpcState<unknown>
   waitingItems: AttentionItem[]
@@ -2183,7 +2153,7 @@ function TasksCard({
   bridgeRef.current = bridge
   optimisticTaskIdsRef.current = optimisticTaskIds
   const sessionRows = normalizeSessions(sessions.data)
-  const fallbackRows = sessionFallbackRows(sessionRows)
+  const fallbackRows = tasksFallbackSessions(sessionRows, normalizeCronRows(cron.data))
   const showSessionsFallback = !bridge || !kanban || kanban.unavailable || Boolean(kanban.error)
   const waitingItemAliases = new Map<string, AttentionItem>()
   for (const item of waitingItems) {
@@ -2291,25 +2261,30 @@ function TasksCard({
                 />
               ) : (
                 <div>
-                  {fallbackRows.slice(0, 5).map(session => (
-                    <button
-                      aria-label={`Open session ${session.title}`}
-                      className="-mx-2 block w-full min-w-0 cursor-pointer rounded-lg px-2 py-2.5 text-left transition-colors duration-150 hover:bg-(--ui-row-hover-background)"
-                      key={session.id}
-                      onClick={() => host.navigate(`/${encodeURIComponent(session.id)}`)}
-                      type="button"
-                    >
-                      <div className="flex min-w-0 items-center gap-3">
-                        <div className="min-w-0 flex-1 truncate text-sm font-medium" title={session.title}>
+                  {fallbackRows.slice(0, 5).map(session => {
+                    const origin = sessionSource(session.source)
+                    return (
+                      <button
+                        aria-label={`Open session ${session.title}`}
+                        className="-mx-2 flex w-full min-w-0 cursor-pointer items-center gap-3 rounded-lg px-2 py-2.5 text-left transition-colors duration-150 hover:bg-(--ui-row-hover-background)"
+                        key={session.id}
+                        onClick={() => host.navigate(`/${encodeURIComponent(session.id)}`)}
+                        type="button"
+                      >
+                        <span className="min-w-0 flex-1 truncate text-sm font-medium" title={session.title}>
                           {session.title}
-                        </div>
-                        <Badge variant="muted">{session.source || 'Session'}</Badge>
-                      </div>
-                      <div className="mt-1 min-w-0 truncate text-xs text-(--ui-text-tertiary)">
-                        {formatSessionAge(session.startedAt, now)}{session.preview ? ` · ${session.preview}` : ''}
-                      </div>
-                    </button>
-                  ))}
+                        </span>
+                        {session.startedAt === null ? null : (
+                          <span className="shrink-0 text-xs text-(--ui-text-tertiary)">{relativeTime(session.startedAt, now)}</span>
+                        )}
+                        <Tip label={origin.label}>
+                          <span aria-label={`Source: ${origin.label}`} className="flex shrink-0 text-(--ui-text-tertiary)" role="img">
+                            <Codicon name={origin.icon} size="0.75rem" />
+                          </span>
+                        </Tip>
+                      </button>
+                    )
+                  })}
                 </div>
               )}
             </div>
@@ -2511,9 +2486,11 @@ function NeedToKnowCard({ cron }: { cron: RpcState<unknown> }) {
   const recentlyDismissed = useValue($recentlyDismissed)
   const bridgeRef = useRef(bridge)
   const feedRef = useRef(feed)
+  const cronRef = useRef(cron)
   const dismissalTimersRef = useRef(new Map<string, ReturnType<typeof setTimeout>>())
   bridgeRef.current = bridge
   feedRef.current = feed
+  cronRef.current = cron
 
   useEffect(() => () => {
     for (const timer of dismissalTimersRef.current.values()) {
@@ -2613,6 +2590,13 @@ function NeedToKnowCard({ cron }: { cron: RpcState<unknown> }) {
     const gmail = gmailSourceFromSource(source)
     if (gmail) {
       window.open(gmailUrl(item?.account || gmail.account, gmail.messageId), '_blank', 'noopener,noreferrer')
+      return
+    }
+    const jobId = cronJobIdFromSource(source)
+    if (jobId) {
+      const job = normalizeCronRows(cronRef.current.data).find(row => row.id === jobId)
+      $runHistoryTarget.set({ id: jobId, name: job?.name || 'Routine' })
+      $runHistoryDialogOpen.set(true)
     }
   }
 
@@ -2628,7 +2612,6 @@ function NeedToKnowCard({ cron }: { cron: RpcState<unknown> }) {
   const visibleItems = feed.items.slice(0, 3)
   const liveDismissals = recentlyDismissed.filter(entry => entry.expiresAt > now)
   const moreCount = Math.max(0, feed.items.length - visibleItems.length)
-  const cronRows = normalizeCronRows(cron.data)
 
   return (
     <SectionCard
@@ -2636,7 +2619,7 @@ function NeedToKnowCard({ cron }: { cron: RpcState<unknown> }) {
         <div className="flex items-center gap-1 text-xs text-(--ui-text-tertiary)">
           {feed.curating
             ? <span>Refreshing…</span>
-            : feed.curatedAt === null ? null : <span>{relativeTime(feed.curatedAt, now)}</span>}
+            : <FreshnessStamp at={feed.curatedAt} now={now} />}
           <Tip label={feed.curating ? 'Refreshing Need to Know' : 'Refresh Need to Know'}>
             <Button
               aria-label="Refresh Need to Know"
@@ -2686,106 +2669,76 @@ function NeedToKnowCard({ cron }: { cron: RpcState<unknown> }) {
             <RecentlyDismissedStrip entry={entry} key={entry.id} onUndo={undoDismiss} />
           ))}
           {visibleItems.map(item => {
-            const sessionId = sessionIdFromSource(item.source)
-            const gmail = gmailSourceFromSource(item.source)
-            const cronJobId = cronJobIdFromSource(item.source)
-            const cronJob = cronJobId ? cronRows.find(row => row.id === cronJobId) : null
-            const sourceReference = townFeedSourceReference(item, cronRows)
+            const action = sourceAction(item.source, { runs: true })
             const summary = item.summary || 'No additional summary is available.'
-            const created = item.createdAt === null ? 'Time unavailable' : relativeTime(item.createdAt, now)
+            const age = compactAge(item.createdAt, now)
 
             return (
               <article
                 className="group -mx-2 rounded-lg px-2 py-2.5 transition-colors duration-150 hover:bg-(--ui-row-hover-background)"
                 key={item.id}
               >
-                <h3 className="text-sm font-medium leading-5 text-(--ui-text-primary)">{item.headline}</h3>
-                <p
-                  className="mt-1 text-xs leading-4 text-(--ui-text-secondary)"
-                  style={{ display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}
-                  title={summary}
-                >
-                  {summary}
-                </p>
-                {item.actionHint ? (
-                  <p className="mt-1 truncate text-xs font-medium text-(--ui-accent)" title={item.actionHint}>{item.actionHint}</p>
-                ) : null}
-                <div className="mt-1 flex min-w-0 items-center gap-2 text-xs text-(--ui-text-tertiary)">
-                  {sessionId || gmail ? (
-                    <button
-                      aria-label={`${gmail ? 'Open in Gmail' : 'Open session'} for ${item.headline}`}
-                      className="inline-flex h-5 min-w-0 cursor-pointer items-center gap-1 rounded-full border border-(--ui-stroke-secondary) px-2 text-(--ui-text-secondary) transition-colors duration-150 hover:bg-(--chrome-action-hover) focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-(--ui-accent)"
-                      onClick={() => openSource(item.id)}
-                      type="button"
-                    >
-                      <span
-                        className="flex size-4 shrink-0 items-center justify-center rounded-full text-(--ui-accent) leading-none"
-                        style={{ background: 'var(--town-tint)' }}
+                <h3 className="text-sm font-medium leading-5 text-(--ui-text-primary)" style={TWO_LINE_CLAMP} title={item.headline}>
+                  {item.headline}
+                </h3>
+                <p className="mt-0.5 truncate text-xs leading-4 text-(--ui-text-secondary)" title={summary}>{summary}</p>
+                <div className="mt-1 flex min-w-0 items-center gap-1 text-xs">
+                  <div className="min-w-0 flex-1">
+                    {item.actionHint && action ? (
+                      <button
+                        className="block max-w-full cursor-pointer truncate text-left font-medium text-(--ui-accent) transition-colors duration-150 hover:text-(--ui-text-primary)"
+                        onClick={() => openSource(item.id)}
+                        title={`${item.actionHint} · ${action.label}`}
+                        type="button"
                       >
-                        <Codicon name={sourceReference.icon} size="0.6875rem" />
-                      </span>
-                      <span className="truncate">{sourceReference.label}</span>
-                    </button>
-                  ) : (
-                    <span className="inline-flex h-5 min-w-0 items-center gap-1 rounded-full border border-(--ui-stroke-secondary) px-2 text-(--ui-text-secondary)">
-                      <span
-                        className="flex size-4 shrink-0 items-center justify-center rounded-full text-(--ui-accent) leading-none"
-                        style={{ background: 'var(--town-tint)' }}
-                      >
-                        <Codicon name={sourceReference.icon} size="0.6875rem" />
-                      </span>
-                      <span className="truncate">{sourceReference.label}</span>
-                    </span>
-                  )}
-                  <span className="shrink-0">{created}</span>
-                </div>
-                <div className="mt-2 flex flex-wrap items-center justify-between gap-x-3 gap-y-2">
-                  <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+                        {item.actionHint}
+                      </button>
+                    ) : item.actionHint ? (
+                      <p className="truncate font-medium text-(--ui-accent)" title={item.actionHint}>{item.actionHint}</p>
+                    ) : null}
+                  </div>
+                  <Tip label="Dismiss">
                     <Button
+                      aria-label={`Dismiss ${item.headline}`}
                       className="opacity-0 transition-opacity duration-150 group-hover:opacity-100 focus-visible:opacity-100"
-                      size="inline"
+                      size="icon-xs"
                       type="button"
-                      variant="text"
+                      variant="ghost"
                       onClick={() => runAction(item.id, 'dismiss')}
                     >
-                      Dismiss
+                      <Codicon name="close" size="0.75rem" />
                     </Button>
+                  </Tip>
+                  <Tip label="Turn into task">
                     <Button
+                      aria-label={`Turn ${item.headline} into a task`}
                       className="opacity-0 transition-opacity duration-150 group-hover:opacity-100 focus-visible:opacity-100"
-                      size="inline"
+                      size="icon-xs"
                       type="button"
-                      variant="text"
+                      variant="ghost"
                       onClick={() => runAction(item.id, 'promote')}
                     >
-                      Turn into task
+                      <Codicon name="tasklist" size="0.75rem" />
                     </Button>
-                  </div>
-                  {gmail ? (
-                    <Button
-                      aria-label={`Open in Gmail for ${item.headline}`}
-                      className="h-6 shrink-0 gap-1.5 px-2 text-xs"
-                      size="inline"
-                      type="button"
-                      variant="outline"
-                      onClick={() => openSource(item.id)}
-                    >
-                      <Codicon name="mail" size="0.75rem" />
-                      <span>Open in Gmail</span>
-                    </Button>
-                  ) : cronJobId ? (
-                    <Button
-                      aria-label={`View run for ${item.headline}`}
-                      className="h-6 shrink-0 gap-1.5 px-2 text-xs"
-                      data-job-id={cronJobId}
-                      data-job-name={cronJob?.name || sourceReference.label}
-                      size="inline"
-                      type="button"
-                      variant="outline"
-                      onClick={openRunHistory}
-                    >
-                      <Codicon name="clock" size="0.75rem" />
-                      <span>View run</span>
-                    </Button>
+                  </Tip>
+                  {age !== null && item.createdAt !== null ? (
+                    <span className="shrink-0 px-1 tabular-nums text-(--ui-text-tertiary)" title={relativeTime(item.createdAt, now)}>
+                      {age}
+                    </span>
+                  ) : null}
+                  {action ? (
+                    <Tip label={action.label}>
+                      <Button
+                        aria-label={`${action.label} for ${item.headline}`}
+                        className="shrink-0 text-(--ui-text-secondary)"
+                        size="icon-xs"
+                        type="button"
+                        variant="ghost"
+                        onClick={() => openSource(item.id)}
+                      >
+                        <Codicon name={action.icon} size="0.75rem" />
+                      </Button>
+                    </Tip>
                   ) : null}
                 </div>
               </article>
@@ -2821,27 +2774,6 @@ function dayBriefCalloutIcon(kind: string): string {
     default:
       return 'info'
   }
-}
-
-function personInitials(person: string | null): string | null {
-  const initials = (person ?? '')
-    .trim()
-    .split(/\s+/)
-    .slice(0, 2)
-    .map(word => Array.from(word)[0] ?? '')
-    .join('')
-    .toUpperCase()
-  return initials || null
-}
-
-function suggestionIcon(kind: TownSuggestionKind): string {
-  if (kind === 'followup') {
-    return 'person'
-  }
-  if (kind === 'digest') {
-    return 'mail-read'
-  }
-  return 'tools'
 }
 
 function SuggestionsCard() {
@@ -2885,7 +2817,7 @@ function SuggestionsCard() {
         <div className="flex items-center gap-1 text-xs text-(--ui-text-tertiary)">
           {feed?.curating
             ? <span>Refreshing…</span>
-            : suggestionsGeneratedAt === null ? null : <span>{relativeTime(suggestionsGeneratedAt, now)}</span>}
+            : <FreshnessStamp at={suggestionsGeneratedAt} now={now} />}
           <Tip label={feed?.curating ? 'Refreshing suggestions' : 'Refresh suggestions'}>
             <Button
               aria-label="Refresh suggestions"
@@ -2939,37 +2871,27 @@ function SuggestionsCard() {
         />
       ) : (
         <div>
-          {suggestions.map(suggestion => {
-            const initials = personInitials(suggestion.person)
-
-            return (
-              <button
-                aria-label={`Prefill composer with ${suggestion.label}`}
-                className="group -mx-2 flex w-full cursor-pointer items-start gap-3 rounded-lg px-2 py-2.5 text-left transition-colors duration-150 hover:bg-(--ui-row-hover-background) focus-visible:bg-(--ui-row-hover-background) focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-(--ui-accent)"
-                data-suggestion-id={suggestion.id}
-                key={suggestion.id}
-                type="button"
-                onClick={selectSuggestion}
+          {suggestions.map(suggestion => (
+            <button
+              aria-label={`Prefill composer with ${suggestion.label}`}
+              className="group -mx-2 flex w-full cursor-pointer items-center gap-3 rounded-lg px-2 py-2.5 text-left transition-colors duration-150 hover:bg-(--ui-row-hover-background) focus-visible:bg-(--ui-row-hover-background) focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-(--ui-accent)"
+              data-suggestion-id={suggestion.id}
+              key={suggestion.id}
+              type="button"
+              onClick={selectSuggestion}
+            >
+              <span className="min-w-0 flex-1 text-sm text-(--ui-text-primary)">
+                {suggestion.label}
+              </span>
+              <span
+                aria-hidden="true"
+                className="flex size-6 shrink-0 items-center justify-center rounded-md text-(--ui-text-tertiary) opacity-0 transition-all duration-150 group-hover:bg-(--ui-control-hover-background) group-hover:opacity-100 group-focus-visible:opacity-100"
+                title="Prefill"
               >
-                <span
-                  className={`flex size-6 shrink-0 items-center justify-center rounded-full text-xs font-medium leading-none ${initials ? 'text-(--ui-text-secondary)' : 'text-(--ui-accent)'}`}
-                  style={{ background: 'var(--town-tint)' }}
-                >
-                  {initials || <Codicon name={suggestionIcon(suggestion.kind)} size="0.75rem" />}
-                </span>
-                <span className="min-w-0 flex-1 text-sm text-(--ui-text-primary)">
-                  {suggestion.label}
-                </span>
-                <span
-                  aria-hidden="true"
-                  className="flex size-6 shrink-0 items-center justify-center rounded-md text-(--ui-text-tertiary) opacity-0 transition-all duration-150 group-hover:bg-(--ui-control-hover-background) group-hover:opacity-100 group-focus-visible:opacity-100"
-                  title="Prefill"
-                >
-                  <Codicon name="edit" size="0.75rem" />
-                </span>
-              </button>
-            )
-          })}
+                <Codicon name="edit" size="0.75rem" />
+              </span>
+            </button>
+          ))}
         </div>
       )}
       <div className="mt-3 flex flex-wrap gap-2 border-t border-(--ui-stroke-secondary) pt-3">
@@ -3500,6 +3422,7 @@ function TownHomeCard({
       return (
         <TasksCard
           activeSessions={activeSessions}
+          cron={cron}
           doneTaskWindowHours={doneTaskWindowHours}
           sessions={sessions}
           waitingItems={waitingItems}
@@ -3566,7 +3489,8 @@ function TownHome() {
     nextRoutine: nextRoutine && nextRoutine.nextRunAt !== null ? { name: nextRoutine.name, nextRunAt: nextRoutine.nextRunAt } : null,
     relative: at => relativeTime(at, nowTimestamp)
   })?.text ?? null
-  const locationChip = locationChipLabel(where, dayBrief?.trip)
+  const locationChip = shouldShowLocationChip(where) ? locationChipLabel(where, dayBrief?.trip) : null
+  const callouts = dayBrief ? visibleCallouts(dayBrief.callouts, where) : []
   const accentColor = profileColor(profile)
   const gatewayOffline = gateway !== 'open'
   const gatewayTone = gateway === 'connecting' ? 'warn' : 'muted'
@@ -3625,9 +3549,9 @@ function TownHome() {
                   {greeting}
                 </h1>
                 {contextLine ? <p className="mt-2 truncate text-sm text-(--ui-text-tertiary)" title={contextLine}>{contextLine}</p> : null}
-                {dayBrief && dayBrief.callouts.length > 0 ? (
+                {callouts.length > 0 ? (
                   <div className="mt-3 flex flex-col gap-1.5">
-                    {dayBrief.callouts.slice(0, 3).map((callout, index) => (
+                    {callouts.map((callout, index) => (
                       <button
                         className="flex min-w-0 cursor-pointer items-start gap-2 text-left text-xs text-(--ui-text-secondary) transition-colors duration-150 hover:text-(--ui-text-primary)"
                         key={`${callout.kind}-${index}`}
@@ -3671,7 +3595,7 @@ function TownHome() {
               <UpNext
                 result={upNext}
                 onOpenSchedule={openScheduleDialog}
-                renderPeople={event => <MeetingPeople event={event} prep={dayBrief?.prep} now={nowTimestamp} />}
+                renderPeople={event => <MeetingPeople event={event} prep={dayBrief?.prep} />}
               />
             ) : null}
 

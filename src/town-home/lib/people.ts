@@ -1,6 +1,6 @@
-// How Town shows people (S2): attendee rows for MeetingPeople and the
-// Schedule dialog. Names first — never a full raw email as the primary text —
-// with the relationship humanized and the true attendee total behind "+N".
+// How Town shows people (S2, reshaped by U13): the people line under an Up
+// next meeting and the Schedule dialog. Names first — never a full raw email
+// as the primary text — with the true attendee total behind "+N".
 
 import type { AttendeeDetail, MeetingPrep, Relationship } from '../../shared/people.ts'
 
@@ -130,53 +130,97 @@ export function prepForEvent(
   return prep.find(entry => entry.eventKey === eventKey) ?? null
 }
 
-export interface MeetingPersonRow {
+export interface MeetingPersonEntry {
   key: string
   name: string
-  detail: string
+  /** "— Acme Capital", "(first meeting)", or both; null when nothing is known. */
+  detail: string | null
   text: string
   prepLine: string | null
 }
 
-export interface MeetingPeopleView {
-  rows: MeetingPersonRow[]
+export interface MeetingPeopleSummary {
+  /** Non-colleagues listed by name (at most three), people with prep first. */
+  people: MeetingPersonEntry[]
+  /** One muted phrase per org: "8 Example Co colleagues". */
+  colleagues: string[]
+  /** Unlisted non-colleagues plus attendees beyond the scanner's cap. */
   overflow: number
   talkingPoint: string | null
+  /** The whole people line; empty when there is nobody to show. */
+  text: string
+}
+
+const MAX_LISTED_PEOPLE = 3
+
+/** "8 Example Co colleagues" / "1 Example Co colleague" / "3 colleagues". */
+export function colleaguePhrase(count: number, org: string | null | undefined): string {
+  const noun = count === 1 ? 'colleague' : 'colleagues'
+  const name = org?.trim()
+  return name ? `${count} ${name} ${noun}` : `${count} ${noun}`
+}
+
+function personEntry(person: PersonLike, index: number, prepLine: string | null): MeetingPersonEntry {
+  const name = attendeeDisplayName(person)
+  const org = person.org?.trim()
+  const parts = [org ? `— ${org}` : null, person.relationship === 'new' ? '(first meeting)' : null]
+  const detail = parts.filter((part): part is string => Boolean(part)).join(' ') || null
+  return {
+    key: person.email ?? `${name}-${index}`,
+    name,
+    detail,
+    text: detail ? `${name} ${detail}` : name,
+    prepLine
+  }
 }
 
 /**
- * Up to ``limit`` non-self attendees — people with a prep line first,
- * declined last — plus "+N more" from the true total and the talking point.
+ * Who is in a meeting, in one line (U13): colleagues collapse into one phrase
+ * per org, up to three other people are named ("Name (first meeting)",
+ * "Name — Org"), then "+N more". Declined attendees are left out entirely;
+ * prep lines belong only to the people named.
  */
-export function meetingPeopleView(
+export function meetingPeopleSummary(
   details: readonly PersonLike[],
   attendeeCount: number | null | undefined,
   prep: MeetingPrep | null,
-  now: number,
-  limit = 5
-): MeetingPeopleView {
+  limit = MAX_LISTED_PEOPLE
+): MeetingPeopleSummary {
   const lines = new Map((prep?.people ?? []).map(person => [person.email, person.line]))
   const lineFor = (person: PersonLike): string | null => (person.email ? lines.get(person.email) ?? null : null)
   const others = details.filter(person => person.self !== true)
-  const declined = (person: PersonLike) => person.response === 'declined'
-  const ordered = [
-    ...others.filter(person => !declined(person) && lineFor(person)),
-    ...others.filter(person => !declined(person) && !lineFor(person)),
-    ...others.filter(declined)
-  ]
-  const rows = ordered.slice(0, limit).map((person, index) => {
-    const { name, detail } = personRowParts(person, now)
-    return {
-      key: person.email ?? `${name}-${index}`,
-      name,
-      detail,
-      text: detail ? `${name} — ${detail}` : name,
-      prepLine: lineFor(person)
+  const attending = others.filter(person => person.response !== 'declined')
+  const individuals = attending.filter(person => person.relationship !== 'colleague')
+  const listed = [
+    ...individuals.filter(person => lineFor(person)),
+    ...individuals.filter(person => !lineFor(person))
+  ].slice(0, limit)
+
+  const groups = new Map<string, { org: string | null; count: number }>()
+  for (const person of attending) {
+    if (person.relationship !== 'colleague') {
+      continue
     }
-  })
-  return {
-    rows,
-    overflow: attendeeOverflow(otherAttendeeTotal(details, attendeeCount), rows.length),
-    talkingPoint: prep?.talkingPoint ?? null
+    const org = person.org?.trim() || null
+    const key = org?.toLowerCase() ?? ''
+    const group = groups.get(key) ?? { org, count: 0 }
+    group.count += 1
+    groups.set(key, group)
   }
+  const colleagues = [...groups.values()]
+    .sort((a, b) => b.count - a.count)
+    .map(group => colleaguePhrase(group.count, group.org))
+
+  const people = listed.map((person, index) => personEntry(person, index, lineFor(person)))
+  if (people.length === 0 && colleagues.length === 0) {
+    return { people, colleagues, overflow: 0, talkingPoint: null, text: '' }
+  }
+  // Attendees past the scanner's cap are unknown (maybe colleagues, maybe
+  // not), so they only ever count toward "+N more".
+  const beyondCap = Math.max(0, otherAttendeeTotal(details, attendeeCount) - others.length)
+  const overflow = individuals.length - listed.length + beyondCap
+  const text = [...people.map(person => person.text), ...colleagues, overflow > 0 ? `+${overflow} more` : null]
+    .filter((part): part is string => Boolean(part))
+    .join(' · ')
+  return { people, colleagues, overflow, talkingPoint: prep?.talkingPoint ?? null, text }
 }

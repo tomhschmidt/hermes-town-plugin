@@ -15,6 +15,7 @@ import {
 } from '@hermes/plugin-sdk'
 import { useEffect } from 'react'
 
+import { compactAge } from '../shared/age.ts'
 import {
   normalizeAttendeeDetails,
   normalizeMeetingPrep,
@@ -30,7 +31,7 @@ import {
   type TownScheduleContext,
   type TownWhere
 } from '../shared/situation.ts'
-import { gmailUrl, telegramChipLabel } from '../shared/sources.ts'
+import { gmailUrl, sourceAction } from '../shared/sources.ts'
 import { waitForCuration } from './lib/refresh.ts'
 
 const FEED_POLL_INTERVAL_MS = 60_000
@@ -1029,54 +1030,6 @@ function gmailSourceFromSource(source: string): { account: string; messageId: st
   return account && messageId ? { account, messageId } : null
 }
 
-interface FeedSourcePillDetails {
-  icon: string
-  label: string
-  opensSource: boolean
-}
-
-function sourceSuffix(source: string, kind: string): string {
-  const match = source.trim().match(new RegExp(`^${kind}:(.+)$`, 'i'))
-  return match?.[1]?.trim() || ''
-}
-
-function cronJobLabel(item: FeedItem, jobId: string): string {
-  const cronName = item.headline.match(/^Cron:\s*(.+)$/i)?.[1]?.trim()
-  const failingName = item.headline.match(/^(.+?)\s+failing\s+[\u2014-]/i)?.[1]?.trim()
-  return cronName || failingName || jobId
-}
-
-function genericSourceLabel(source: string): string {
-  const family = source.trim().split(':', 1)[0] || 'Hermes'
-  return family.charAt(0).toUpperCase() + family.slice(1)
-}
-
-function feedSourcePillDetails(item: FeedItem): FeedSourcePillDetails {
-  if (sessionIdFromSource(item.source)) {
-    return { icon: 'comment-discussion', label: 'Session', opensSource: true }
-  }
-
-  const gmail = gmailSourceFromSource(item.source)
-  if (gmail) {
-    return { icon: 'mail', label: gmail.account.split('@', 1)[0] || gmail.account, opensSource: true }
-  }
-
-  if (sourceSuffix(item.source, 'telegram')) {
-    return { icon: 'send', label: telegramChipLabel(item), opensSource: false }
-  }
-
-  const cronJobId = sourceSuffix(item.source, 'cron')
-  if (cronJobId) {
-    return { icon: 'clock', label: cronJobLabel(item, cronJobId), opensSource: false }
-  }
-
-  if (sourceSuffix(item.source, 'calendar')) {
-    return { icon: 'calendar', label: 'Calendar', opensSource: false }
-  }
-
-  return { icon: 'symbol-misc', label: genericSourceLabel(item.source), opensSource: false }
-}
-
 function currentFeedItem(itemId: string): FeedItem | null {
   return $feed.get().items.find(item => item.id === itemId) ?? null
 }
@@ -1117,30 +1070,6 @@ function undoFeedDismissal(itemId: string): void {
 
 function truncatedHeadline(headline: string): string {
   return headline.length > 48 ? `${headline.slice(0, 47).trimEnd()}…` : headline
-}
-
-function FeedSourcePill({ item }: { item: FeedItem }) {
-  const source = feedSourcePillDetails(item)
-  const className = 'inline-flex items-center gap-1 rounded-full border border-(--ui-stroke-secondary) px-2 py-0.5 text-xs text-(--ui-text-tertiary) transition-colors duration-150 hover:border-(--ui-stroke-primary) hover:bg-(--ui-control-hover-background) hover:text-(--ui-text-secondary)'
-  const content = (
-    <>
-      <Codicon name={source.icon} size="0.6875rem" />
-      <span>{source.label}</span>
-    </>
-  )
-
-  return source.opensSource ? (
-    <button
-      aria-label={`${source.icon === 'mail' ? 'Open in Gmail' : 'Open session'} for ${item.headline}`}
-      className={`${className} cursor-pointer outline-none focus-visible:border-(--ui-stroke-primary) focus-visible:bg-(--ui-control-hover-background)`}
-      onClick={() => openFeedSource(item.id)}
-      type="button"
-    >
-      {content}
-    </button>
-  ) : (
-    <span className={className}>{content}</span>
-  )
 }
 
 function FeedHeader({ feed }: { feed: FeedState }) {
@@ -1224,7 +1153,8 @@ function NeedToKnowPane() {
             ) : null}
             {feed.items.map(item => {
               const summary = item.summary || 'No additional summary is available.'
-              const created = item.createdAt === null ? 'Time unavailable' : relativeTime(item.createdAt, now)
+              const action = sourceAction(item.source)
+              const age = compactAge(item.createdAt, now)
 
               return (
                 <article className="group -mx-2 rounded-lg px-2 py-2.5 transition-colors duration-150 hover:bg-(--ui-row-hover-background)" key={item.id}>
@@ -1236,20 +1166,64 @@ function NeedToKnowPane() {
                   >
                     {summary}
                   </p>
-                  <div className="mt-1 flex flex-wrap items-center gap-1.5">
-                    {item.actionHint ? (
-                      <span className="text-xs font-medium text-(--ui-accent)">{item.actionHint}</span>
+                  <div className="mt-1 flex min-w-0 items-center gap-1 text-xs">
+                    <div className="min-w-0 flex-1">
+                      {item.actionHint && action ? (
+                        <button
+                          className="block max-w-full cursor-pointer truncate text-left font-medium text-(--ui-accent) transition-colors duration-150 hover:text-(--ui-text-primary)"
+                          onClick={() => openFeedSource(item.id)}
+                          title={`${item.actionHint} · ${action.label}`}
+                          type="button"
+                        >
+                          {item.actionHint}
+                        </button>
+                      ) : item.actionHint ? (
+                        <p className="truncate font-medium text-(--ui-accent)" title={item.actionHint}>{item.actionHint}</p>
+                      ) : null}
+                    </div>
+                    <Tip label="Dismiss">
+                      <Button
+                        aria-label={`Dismiss ${item.headline}`}
+                        className="opacity-0 transition-opacity duration-150 group-hover:opacity-100 focus-visible:opacity-100"
+                        size="icon-xs"
+                        type="button"
+                        variant="ghost"
+                        onClick={() => runFeedAction(item.id, 'dismiss')}
+                      >
+                        <Codicon name="close" size="0.75rem" />
+                      </Button>
+                    </Tip>
+                    <Tip label="Turn into task">
+                      <Button
+                        aria-label={`Turn ${item.headline} into a task`}
+                        className="opacity-0 transition-opacity duration-150 group-hover:opacity-100 focus-visible:opacity-100"
+                        size="icon-xs"
+                        type="button"
+                        variant="ghost"
+                        onClick={() => runFeedAction(item.id, 'promote')}
+                      >
+                        <Codicon name="tasklist" size="0.75rem" />
+                      </Button>
+                    </Tip>
+                    {age !== null && item.createdAt !== null ? (
+                      <span className="shrink-0 px-1 tabular-nums text-(--ui-text-tertiary)" title={relativeTime(item.createdAt, now)}>
+                        {age}
+                      </span>
                     ) : null}
-                    <FeedSourcePill item={item} />
-                    <span className="text-xs text-(--ui-text-tertiary)">{created}</span>
-                  </div>
-                  <div className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-2">
-                    <Button className="opacity-0 transition-opacity duration-150 group-hover:opacity-100 focus-visible:opacity-100" size="inline" type="button" variant="text" onClick={() => runFeedAction(item.id, 'dismiss')}>
-                      Dismiss
-                    </Button>
-                    <Button className="opacity-0 transition-opacity duration-150 group-hover:opacity-100 focus-visible:opacity-100" size="inline" type="button" variant="text" onClick={() => runFeedAction(item.id, 'promote')}>
-                      Turn into task
-                    </Button>
+                    {action ? (
+                      <Tip label={action.label}>
+                        <Button
+                          aria-label={`${action.label} for ${item.headline}`}
+                          className="shrink-0 text-(--ui-text-secondary)"
+                          size="icon-xs"
+                          type="button"
+                          variant="ghost"
+                          onClick={() => openFeedSource(item.id)}
+                        >
+                          <Codicon name={action.icon} size="0.75rem" />
+                        </Button>
+                      </Tip>
+                    ) : null}
                   </div>
                 </article>
               )

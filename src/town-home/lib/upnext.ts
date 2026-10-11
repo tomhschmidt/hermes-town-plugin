@@ -88,6 +88,11 @@ export function eventHint(event: UpNextEvent): string | null {
   return location ? 'Video call' : null
 }
 
+/** "in 8h · Zoom": the relative time and place, shown inline after the title (U13). */
+export function upNextRowMeta(row: Pick<UpNextRow, 'relative' | 'hint'>): string {
+  return [row.relative, row.hint].filter((part): part is string => Boolean(part)).join(' · ')
+}
+
 function inConflict(event: UpNextEvent, context: TownScheduleContext | null | undefined): boolean {
   if (!context) {
     return false

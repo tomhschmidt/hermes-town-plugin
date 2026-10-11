@@ -71,6 +71,31 @@ export function locationChipLabel(where: TownWhere | null | undefined, trip: Tri
   return trip?.label ? `${trip.label}${tripDays(trip)}` : null
 }
 
+// U13: home and just-back are what the opener already says, so the chip is
+// only for being somewhere else; home-zone conversions are noise at home.
+const LOCATION_CHIP_STATUSES: ReadonlySet<string> = new Set(['away', 'traveling_today'])
+const HOME_STATUSES: ReadonlySet<string> = new Set(['home', 'just_returned'])
+export const MAX_VISIBLE_CALLOUTS = 2
+
+/**
+ * Whether the header shows a location chip: only while away or traveling
+ * today. Without ``where`` (a gateway that predates S1) the trip-badge
+ * fallback in ``locationChipLabel`` decides.
+ */
+export function shouldShowLocationChip(where: Pick<TownWhere, 'status'> | null | undefined): boolean {
+  return !where || LOCATION_CHIP_STATUSES.has(where.status)
+}
+
+/** The day-brief callouts the header renders: no time-zone callout at home, at most two. */
+export function visibleCallouts<C extends { kind: string }>(
+  callouts: readonly C[],
+  where: Pick<TownWhere, 'status'> | null | undefined,
+  limit = MAX_VISIBLE_CALLOUTS
+): C[] {
+  const home = Boolean(where && HOME_STATUSES.has(where.status))
+  return callouts.filter(callout => !(home && callout.kind === 'timezone')).slice(0, limit)
+}
+
 /** "Good morning" / "Happy Monday" / "Good afternoon" / "Good evening" in ``timeZone``. */
 export function greetingBase(now: number, timeZone: string): string {
   const { hour, weekday } = zonedParts(now, timeZone)
