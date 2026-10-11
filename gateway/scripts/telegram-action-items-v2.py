@@ -141,6 +141,38 @@ def persist_summary(summary: str, delivered_note: str) -> None:
 
 # ── Daemon helpers ───────────────────────────────────────────────────────────
 
+# Per-message cap in the prompt. 500 cut off asks at the end of long messages.
+MAX_MESSAGE_CHARS = 1000
+
+
+def _load_common():
+    """Load town_telegram_common.py, deployed next to this script."""
+    import importlib.util
+
+    path = Path(__file__).resolve().with_name("town_telegram_common.py")
+    spec = importlib.util.spec_from_file_location("town_telegram_common", path)
+    if spec is None or spec.loader is None or not path.is_file():
+        raise ImportError(f"missing {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+tg = _load_common()
+
+
+def get_me():
+    """The session owner from the daemon's /me, or None (fallback identity)."""
+    try:
+        with urllib.request.urlopen(f"{DAEMON_URL}/me", timeout=15) as resp:
+            payload = json.load(resp)
+        if isinstance(payload, dict) and not payload.get("error"):
+            return payload
+    except Exception as e:
+        print(f"Warning: couldn't fetch /me: {e}", file=sys.stderr)
+    return None
+
+
 def get_muted_chats() -> set:
     global _muted_chat_ids
     if _muted_chat_ids is not None:
@@ -160,11 +192,11 @@ def get_chats() -> dict:
     if _chat_cache is None:
         muted = get_muted_chats()
         with urllib.request.urlopen(f"{DAEMON_URL}/chats", timeout=30) as resp:
-            raw = {c["id"]: c["title"] for c in json.load(resp).get("chats", [])}
+            raw = {c["id"]: c for c in json.load(resp).get("chats", [])}
             _chat_cache = {
-                cid: name for cid, name in raw.items()
+                cid: chat for cid, chat in raw.items()
                 if cid not in muted and cid not in SELF_CHAT_IDS
-                and name not in SKIP_CHAT_NAMES
+                and chat.get("title") not in SKIP_CHAT_NAMES
             }
     return _chat_cache
 
@@ -176,30 +208,80 @@ def get_messages(chat_id: int, limit: int = 100, cutoff_ts: int = 0) -> list:
         return json.load(resp).get("messages", [])
 
 
-def fmt_date(ts) -> str:
-    if isinstance(ts, int):
-        return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
-    return str(ts)
+def collect_threads(chats: dict, fetch_messages, operator, cutoff_ts: int) -> tuple:
+    """(eligible chat threads keyed by chat id, count of collected messages).
+
+    Groups nobody addressed to the operator are dropped here, before the LLM.
+    """
+    threads, collected = [], 0
+    for chat_id, chat in chats.items():
+        try:
+            raw = fetch_messages(chat_id)
+        except Exception as e:
+            print(f"Error fetching {(chat or {}).get('title', chat_id)}: {e}", file=sys.stderr)
+            continue
+        thread = tg.analyze_chat(chat_id, chat, raw, operator, cutoff_ts)
+        if thread is None:
+            continue
+        collected += len(thread["messages"])
+        if thread["eligible"]:
+            threads.append(thread)
+    return threads, collected
 
 
-# ── LLM ─────────────────────────────────────────────────────────────────────
+def chat_header(thread: dict) -> str:
+    kind = f"[DM with {thread['counterpart']}]" if thread["kind"] == "dm" else "[group]"
+    resolved = " [operator replied after last ask]" if thread["operator_replied_after_ask"] else ""
+    return f"=== {thread['title']} {kind}{resolved} ==="
 
-def get_llm_summary(messages_text: str) -> str:
-    prompt = f"""You are helping Tom Schmidt track action items from his Telegram messages.
 
-Identify ONLY items that require Tom's attention:
-1. Direct requests or questions TO Tom by name or clearly addressed to him
-2. Promises Tom made that are still pending ("I'll do X", "will send", "will check")
-3. One-on-one conversations where someone is clearly waiting on Tom's reply
+def render_sections(threads: list, tz=None) -> str:
+    """One section per chat id (same-title chats stay separate), most active first."""
+    ordered = sorted(
+        threads,
+        key=lambda t: (t["messages"][-1]["date"], t["messages"][-1]["id"]),
+        reverse=True,
+    )
+    return "\n\n".join(
+        chat_header(thread) + "\n" + "\n".join(
+            tg.render_message(m, tz=tz, limit=MAX_MESSAGE_CHARS) for m in thread["messages"]
+        )
+        for thread in ordered
+    )
+
+
+def build_prompt(messages_text: str, operator, now: datetime, tz=None) -> str:
+    you = operator.call_name
+    handle = f"@{operator.username}" if operator.username else "no @username"
+    user_id = operator.user_id if operator.user_id is not None else "unknown"
+    return f"""You are helping {operator.name} track action items from their Telegram messages.
+
+The operator: {operator.name} ({handle}, Telegram user id {user_id}). "You" in the markers below means {you}.
+Current local time: {tg.describe_now(now, tz)}. Message times are in this timezone.
+
+Identify ONLY items that require {you}'s attention:
+1. Requests or questions to {you}: in a DM, or in a group only when the message replies to {you} (↩ you) or mentions or names {you} (@you)
+2. Promises {you} made ([YOU] lines such as "I'll do X", "will send", "will check") that are still pending
+3. DMs where the other person is clearly waiting on {you}'s reply
+
+Rules:
+- Only asks and promises involving {you} count. A message addressed to someone else (for example a reply to another member, "↩ Bob") is never {you}'s item, even if {you} is in the chat.
+- Asks that {you} already answered, or that were resolved or superseded later in the chat, are not items. A chat marked [operator replied after last ask] is NOT an action item unless {you}'s own later message makes a promise that is still open.
+- A time-boxed ask ("in the next hour", "by 5pm", "tonight") whose window has passed by the current local time is dropped or flagged as missed — never presented as current.
+- Quote the ask briefly.
 
 IGNORE:
-- Group chat banter, memes, or general discussion not directed at Tom
-- FYIs, announcements, news, links shared without asking Tom anything
-- Messages where Tom has already replied and the thread is resolved
+- Group chat banter, memes, or general discussion not directed at {you}
+- FYIs, announcements, news, links shared without asking {you} anything
 - Broadcast channels or one-way info feeds
 
-Messages are grouped by chat. Each chat section starts with === Chat Name === followed by messages in chronological order formatted as: [date] Sender Name: message text
-Use the sender name and conversation flow to determine if Tom has an open action item.
+Marker legend:
+- [YOU] — a message {you} sent
+- ↩ <name> — a reply to <name>'s message; ↩ you — a reply to {you}'s message
+- @you — the message mentions {you} (@username) or names them
+- [photo], [voice], [sticker], … — a media message, followed by its caption when present
+
+Messages are grouped by chat. Each chat section starts with a header, === <chat title> [DM with <name>] === or === <chat title> [group] ===, marked [operator replied after last ask] when {you} spoke after the latest message addressed to them. Messages follow in chronological order formatted as: [YYYY-MM-DD HH:MM] Sender Name: message text (the operator's own lines: [YYYY-MM-DD HH:MM] [YOU] message text).
 
 Format your response as a clean, Telegram-friendly Markdown bullet list (no intro sentence):
 🔵 *Chat Name* — _Sender_: brief description of what needs attention
@@ -213,6 +295,10 @@ Messages:
 {messages_text}
 ---"""
 
+
+# ── LLM ─────────────────────────────────────────────────────────────────────
+
+def get_llm_summary(prompt: str) -> str:
     # Explicit timeout: task='monitor' falls back to _DEFAULT_AUX_TIMEOUT (60s), which
     # a ~330-message prompt exceeds — 2026-09-15 run delivered "LLM error: Request
     # timed out." Pass a generous timeout so large message volumes still summarize.
@@ -290,56 +376,42 @@ def main():
     args = parser.parse_args()
     cutoff_ts = int((datetime.now(timezone.utc) - timedelta(days=1)).timestamp())
 
+    operator = tg.resolve_operator(get_me(), os.environ.get("TOWN_OWNER_NAME", ""))
     chats = get_chats()
-    all_messages = []
+    threads, collected = collect_threads(
+        chats,
+        lambda chat_id: get_messages(chat_id, limit=100, cutoff_ts=cutoff_ts),
+        operator,
+        cutoff_ts,
+    )
+    eligible_messages = sum(len(thread["messages"]) for thread in threads)
 
-    for chat_id, chat_name in chats.items():
-        try:
-            for m in get_messages(chat_id, limit=100, cutoff_ts=cutoff_ts):
-                date = m.get("date", 0)
-                text = m.get("text", "")
-                if date >= cutoff_ts and text and len(text) > 5:
-                    all_messages.append({
-                        "chat": chat_name,
-                        "date": fmt_date(date),
-                        "sender": m.get("sender_name", "Unknown"),
-                        "text": text[:500],
-                    })
-        except Exception as e:
-            print(f"Error fetching {chat_name}: {e}", file=sys.stderr)
+    print(
+        f"Collected {collected} messages from {len(chats)} non-muted chats; "
+        f"{eligible_messages} in {len(threads)} chat(s) involving the operator.",
+        file=sys.stderr,
+    )
 
-    print(f"Collected {len(all_messages)} messages from {len(chats)} non-muted chats.", file=sys.stderr)
-
-    if not all_messages:
+    if not collected:
         ok = False if args.no_send else send_telegram("📋 *Action items* _24h_\n\n✅ _No messages found._")
         persist_summary("✅ No messages found.", delivery_note(args.no_send, ok))
         if not args.no_send and not ok:
             raise RuntimeError("Telegram delivery failed")
         return
 
-    # Group by chat, sort each chat chronologically (oldest → newest)
-    from collections import defaultdict
-    by_chat = defaultdict(list)
-    for m in all_messages:
-        by_chat[m["chat"]].append(m)
+    if threads:
+        # One section per chat id, oldest → newest within a chat, most active first.
+        prompt = build_prompt(render_sections(threads), operator, datetime.now(timezone.utc))
+        summary = get_llm_summary(prompt)
 
-    # Sort chats by their most recent message (most active first)
-    sorted_chats = sorted(by_chat.keys(), key=lambda c: max(m["date"] for m in by_chat[c]), reverse=True)
-
-    sections = []
-    for chat_name in sorted_chats:
-        msgs = sorted(by_chat[chat_name], key=lambda m: m["date"])  # oldest → newest within chat
-        lines = [f"[{m['date']}] {m['sender']}: {m['text']}" for m in msgs]
-        sections.append(f"=== {chat_name} ===\n" + "\n".join(lines))
-
-    messages_text = "\n\n".join(sections)
-
-    summary = get_llm_summary(messages_text)
-
-    # Retry once if LLM says no action items but we analyzed a lot of messages
-    if ("No action items" in summary or "no action items" in summary.lower()) and len(all_messages) >= 100:
-        print(f"LLM returned no action items despite {len(all_messages)} messages — retrying…", file=sys.stderr)
-        summary = get_llm_summary(messages_text)
+        # Retry once if LLM says no action items but we analyzed a lot of messages
+        if ("No action items" in summary or "no action items" in summary.lower()) and eligible_messages >= 100:
+            print(f"LLM returned no action items despite {eligible_messages} messages — retrying…", file=sys.stderr)
+            summary = get_llm_summary(prompt)
+    else:
+        # Nothing involves the operator (no DMs, no group addressed them):
+        # the no-items sentinel, without an LLM call.
+        summary = "✅ No action items."
 
     date_str = datetime.now(timezone.utc).strftime("%b %d")
     if args.no_send:

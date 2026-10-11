@@ -11,6 +11,7 @@ Exit codes mirror the Town Gmail scanner where applicable:
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -32,8 +33,8 @@ CHAT_ID = 372430020
 LOOKBACK = timedelta(hours=48)
 MAX_CANDIDATES = 15
 STATE_VERSION = 1
-# The operator's display name as Telegram renders it; used to attribute
-# "you spoke last" (mirrors the hardcoded owner in telegram-action-items-v2).
+# Fallback operator name, used only when the daemon's /me is unavailable.
+# Attribution is by Telegram user id (/me), never by display name.
 OWNER_NAME = os.environ.get("TOWN_OWNER_NAME", "Tom Schmidt").strip()
 MAX_BODY_MESSAGES = 12
 MAX_BODY_CHARS = 1200
@@ -62,6 +63,25 @@ class ConfigError(RuntimeError):
 
 class TelegramAPIError(RuntimeError):
     """The local Telegram daemon could not complete a scan."""
+
+
+def _load_common() -> Any:
+    """Load town_telegram_common.py, deployed next to this script."""
+    path = Path(__file__).resolve().with_name("town_telegram_common.py")
+    spec = importlib.util.spec_from_file_location("town_telegram_common", path)
+    if spec is None or spec.loader is None or not path.is_file():
+        raise ImportError(f"missing {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+try:
+    tg: Any = _load_common()
+    _COMMON_ERROR: ImportError | None = None
+except ImportError as _exc:  # surfaced as exit 3 by _run()
+    tg = None
+    _COMMON_ERROR = _exc
 
 
 def _eprint(*args: Any) -> None:
@@ -182,10 +202,20 @@ def get_muted_chats() -> set[int]:
     }
 
 
-def get_chats(bot_user_id: int) -> dict[int, str]:
+def get_me() -> dict[str, Any] | None:
+    """The session owner from the daemon's /me, or None (fallback identity)."""
+    try:
+        return _get_json(f"{DAEMON_URL}/me", timeout=15)
+    except TelegramAPIError as exc:
+        _eprint(f"town-telegram-scan: /me unavailable, using fallback identity: {exc}")
+        return None
+
+
+def get_chats(bot_user_id: int) -> dict[int, dict[str, Any]]:
+    """Daemon /chats entries by id (title stripped), minus muted/self/skipped."""
     muted = get_muted_chats()
     payload = _get_json(f"{DAEMON_URL}/chats", timeout=30)
-    chats: dict[int, str] = {}
+    chats: dict[int, dict[str, Any]] = {}
     for item in payload.get("chats", []):
         if not isinstance(item, dict):
             continue
@@ -199,7 +229,7 @@ def get_chats(bot_user_id: int) -> dict[int, str]:
             or title in SKIP_CHAT_NAMES
         ):
             continue
-        chats[chat_id] = title
+        chats[chat_id] = {**item, "title": title}
     return chats
 
 
@@ -214,10 +244,6 @@ def get_messages(chat_id: int, cutoff_ts: int) -> list[dict[str, Any]]:
     )
     payload = _get_json(f"{DAEMON_URL}/messages?{query}", timeout=60)
     return [item for item in payload.get("messages", []) if isinstance(item, dict)]
-
-
-def _message_id(message: dict[str, Any]) -> str:
-    return str(message.get("id") or message.get("message_id") or "").strip()
 
 
 def _gist(text: Any, limit: int | None = None) -> str:
@@ -240,60 +266,54 @@ def _iso_timestamp(timestamp: int) -> str:
     )
 
 
-def _thread_body(chat_name: str, messages: list[dict[str, Any]]) -> tuple[str, list[str]]:
+def _thread_body(thread: dict[str, Any], operator: Any) -> str:
     """Bounded conversation context for the curator's judgment layer.
 
     " | " separates messages because the curator's whitespace compaction
-    collapses newlines; the separator must survive it.
+    collapses newlines; the separator must survive it. Lines carry the
+    addressing markers ([YOU], ↩ <name>/you, @you). When the newest message
+    addressed to the operator is older than the tail, it leads the body.
     """
-    lines: list[str] = []
-    senders: list[str] = []
-    for message in messages[-MAX_BODY_MESSAGES:]:
-        gist = _gist(message.get("text"), 180)
-        if not gist:
-            continue
-        sender = _gist(message.get("sender_name") or "Unknown", 40)
-        if sender not in senders:
-            senders.append(sender)
-        lines.append(f"{sender}: {gist}")
-    while lines and len(" | ".join(lines)) > MAX_BODY_CHARS:
+    messages = thread["messages"]
+    tail = messages[-MAX_BODY_MESSAGES:]
+    anchor = thread.get("last_addressed")
+    lead: list[str] = []
+    if anchor is not None and all(anchor is not message for message in tail):
+        lead = [tg.render_message(anchor, with_time=False, limit=180), "…"]
+    lines = [tg.render_message(message, with_time=False, limit=180) for message in tail]
+    while lines and len(" | ".join(lead + lines)) > MAX_BODY_CHARS:
         lines.pop(0)
     if not lines:
-        return "", senders
-    header = (
-        f"[chat: {chat_name}; participants: {', '.join(senders[:6])}; "
-        f"the user is: {OWNER_NAME}]"
-    )
-    return f"{header} {' | '.join(lines)}", senders
+        return ""
+    kind = "DM" if thread["kind"] == "dm" else "group"
+    header = f"[chat: {thread['title']} ({kind}); you are {operator.name}]"
+    return f"{header} {' | '.join(lead + lines)}"
 
 
-def _candidate(
-    chat_id: int, chat_name: str, messages: list[dict[str, Any]]
-) -> dict[str, Any] | None:
+def _candidate(chat_id: int, thread: dict[str, Any], operator: Any) -> dict[str, Any] | None:
+    chat_name = thread["title"]
+    messages = thread["messages"]
     newest = messages[-1]
-    last_message_id = _message_id(newest)
-    last_timestamp = newest.get("date")
-    last_gist = _gist(newest.get("text"), 60)
-    if not last_message_id or not isinstance(last_timestamp, int) or not last_gist:
+    last_message_id = str(newest["id"])
+    last_timestamp = newest["date"]
+    last_gist = _gist(newest["content"], 60)
+    if not last_message_id or not last_gist:
         return None
 
-    recent_gists: list[str] = []
-    for message in messages[-3:]:
-        gist = _gist(message.get("text"))
-        if not gist:
-            continue
-        sender = _gist(message.get("sender_name") or "Unknown")
-        recent_gists.append(f"{sender}: {gist}")
+    recent_gists = [
+        f"{'You' if message['own'] else _gist(message['sender'])}: {_gist(message['content'])}"
+        for message in messages[-3:]
+    ]
 
-    last_sender = _gist(newest.get("sender_name") or "Unknown", 40)
-    user_spoke_last = bool(OWNER_NAME) and last_sender.casefold() == OWNER_NAME.casefold()
-    # Attribute the actual speaker: "Hunter Horsley: I'm free tomorrow" when
-    # Tom wrote it misattributes the quote to the chat's namesake.
-    if last_sender and last_sender.casefold() != chat_name.casefold():
-        headline = f"{chat_name} — {last_sender}: {last_gist}"
+    last_sender = _gist(newest["sender"], 40)
+    # Attribute the actual speaker: "Bob: I'm free tomorrow" when the
+    # operator wrote it misattributes the quote to the chat's namesake.
+    speaker = "You" if newest["own"] else last_sender
+    if speaker and speaker.casefold() != chat_name.casefold():
+        headline = f"{chat_name} — {speaker}: {last_gist}"
     else:
         headline = f"{chat_name}: {last_gist}"
-    body, _senders = _thread_body(chat_name, messages)
+    body = _thread_body(thread, operator)
 
     candidate: dict[str, Any] = {
         "headline": headline,
@@ -302,55 +322,63 @@ def _candidate(
         "created_at": _iso_timestamp(last_timestamp),
         "content_hash": _content_hash(chat_id, last_message_id),
         "chat_name": chat_name,
+        "chat_type": thread["kind"],
         "last_sender": last_sender,
-        "user_spoke_last": user_spoke_last,
+        "user_spoke_last": bool(newest["own"]),
+        "addressed_to_user": bool(thread["addressed"]),
+        "operator_replied_after_ask": bool(thread["operator_replied_after_ask"]),
     }
     if body:
         candidate["body"] = body
     return candidate
 
 
-def _scan() -> tuple[list[dict[str, Any]], dict[str, str]]:
+def _scan(
+    now: datetime | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, str], dict[str, str]]:
+    """(eligible candidates newest first, their newest message ids, newest
+    message ids of chats that were scanned but are not eligible)."""
+    if tg is None:
+        raise ImportError(f"town_telegram_common unavailable: {_COMMON_ERROR}")
     token = get_bot_token()
     try:
         bot_user_id = int(token.split(":", 1)[0])
     except (TypeError, ValueError) as exc:
         raise ConfigError("TELEGRAM_BOT_TOKEN has an invalid bot user ID") from exc
 
-    cutoff_ts = int((datetime.now(timezone.utc) - LOOKBACK).timestamp())
+    now = now or datetime.now(timezone.utc)
+    cutoff_ts = int((now - LOOKBACK).timestamp())
+    operator = tg.resolve_operator(get_me(), OWNER_NAME)
     chats = get_chats(bot_user_id)
-    active: list[tuple[int, int, str, dict[str, Any]]] = []
+    active: list[tuple[int, int, dict[str, Any]]] = []
     newest_by_chat: dict[str, str] = {}
+    ineligible: dict[str, str] = {}
 
-    for chat_id, chat_name in chats.items():
-        messages = [
-            message
-            for message in get_messages(chat_id, cutoff_ts)
-            if isinstance(message.get("date"), int)
-            and message["date"] >= cutoff_ts
-            and _message_id(message)
-            and _gist(message.get("text"))
-            and len(_gist(message.get("text"))) > 5
-        ]
-        messages.sort(key=lambda message: (message["date"], _message_id(message)))
-        if not messages:
+    for chat_id, chat in chats.items():
+        thread = tg.analyze_chat(
+            chat_id, chat, get_messages(chat_id, cutoff_ts), operator, cutoff_ts
+        )
+        if thread is None:
             continue
-        candidate = _candidate(chat_id, chat_name, messages)
+        newest = thread["messages"][-1]
+        if not thread["eligible"]:
+            ineligible[str(chat_id)] = str(newest["id"])
+            continue
+        candidate = _candidate(chat_id, thread, operator)
         if candidate is None:
             continue
-        newest = messages[-1]
-        newest_by_chat[str(chat_id)] = _message_id(newest)
-        active.append((newest["date"], chat_id, chat_name, candidate))
+        newest_by_chat[str(chat_id)] = str(newest["id"])
+        active.append((newest["date"], chat_id, candidate))
 
     active.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    return [item[3] for item in active], newest_by_chat
+    return [item[2] for item in active], newest_by_chat, ineligible
 
 
-def _run() -> tuple[int, list[dict[str, Any]]]:
+def _run(now: datetime | None = None) -> tuple[int, list[dict[str, Any]]]:
     try:
         with _state_lock():
             state = _load_state()
-            candidates, newest_by_chat = _scan()
+            candidates, newest_by_chat, ineligible = _scan(now)
             watermarks = state["watermarks"]
             reportable = [
                 candidate
@@ -358,7 +386,13 @@ def _run() -> tuple[int, list[dict[str, Any]]]:
                 if watermarks.get(candidate["source"].split(":", 1)[1])
                 != newest_by_chat[candidate["source"].split(":", 1)[1]]
             ][:MAX_CANDIDATES]
-            watermarks.update(newest_by_chat)
+            # Advance only what this run reported (plus ineligible chats): a
+            # chat cut by MAX_CANDIDATES keeps its watermark and is reported
+            # next run.
+            for candidate in reportable:
+                chat_key = candidate["source"].split(":", 1)[1]
+                watermarks[chat_key] = newest_by_chat[chat_key]
+            watermarks.update(ineligible)
             try:
                 _save_state(state)
             except Exception as exc:
